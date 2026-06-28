@@ -7,10 +7,10 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
+use libretether_protocol::frame::{read_frame, write_frame};
+use libretether_protocol::relay::{RelayAck, RelayHello, RelayRole};
+use libretether_protocol::{tls, Challenge, ControlRequest, Hello, HelloAck, StreamOpen, PROTOCOL_VERSION};
 use quinn::{Endpoint, RecvStream, SendStream};
-use tether_protocol::frame::{read_frame, write_frame};
-use tether_protocol::relay::{RelayAck, RelayHello, RelayRole};
-use tether_protocol::{tls, Challenge, ControlRequest, Hello, HelloAck, StreamOpen, PROTOCOL_VERSION};
 
 use crate::config::AgentConfig;
 use crate::{handlers, host, session};
@@ -23,7 +23,7 @@ const RECONNECT_MAX_SECS: u64 = 5;
 const CONNECT_TIMEOUT_SECS: u64 = 8;
 
 pub fn log(msg: &str) {
-	eprintln!("[tether-agent] {msg}");
+	eprintln!("[libretether-agent] {msg}");
 }
 
 /// Load config and run the connect/serve loop forever.

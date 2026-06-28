@@ -9,7 +9,7 @@
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 use std::process::Command;
 
-use tether_protocol::RdpInfo;
+use libretether_protocol::RdpInfo;
 
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 const RDP_PORT: u16 = 3389;
@@ -37,7 +37,7 @@ fn has(bin: &str) -> bool {
 
 #[cfg(target_os = "linux")]
 fn enable_linux() -> Result<RdpInfo, String> {
-	use tether_protocol::crypto::random_alnum;
+	use libretether_protocol::crypto::random_alnum;
 
 	if !has("grdctl") {
 		return Err(
@@ -46,7 +46,7 @@ fn enable_linux() -> Result<RdpInfo, String> {
 		);
 	}
 
-	let username = "tether".to_string();
+	let username = "libretether".to_string();
 	let password = random_alnum(16);
 
 	ensure_tls_cert();
@@ -87,7 +87,7 @@ fn grd(args: &[&str]) -> Result<(), String> {
 /// RDP without one). Best-effort self-signed cert via openssl.
 #[cfg(target_os = "linux")]
 fn ensure_tls_cert() {
-	let Some(dir) = dirs::data_dir().map(|d| d.join("tether-agent")) else {
+	let Some(dir) = dirs::data_dir().map(|d| d.join("libretether-agent")) else {
 		return;
 	};
 	let cert = dir.join("rdp-cert.pem");
@@ -104,7 +104,7 @@ fn ensure_tls_cert() {
 				"-days",
 				"3650",
 				"-subj",
-				"/CN=tether-agent",
+				"/CN=libretether-agent",
 				"-keyout",
 				&key.to_string_lossy(),
 				"-out",

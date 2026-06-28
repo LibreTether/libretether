@@ -6,32 +6,32 @@
 FROM rust:1.94.1-bookworm AS build
 WORKDIR /build
 
-# Only the Cargo workspace is needed: the relay (`tether-server`) is a pure-Rust
-# QUIC server with no system dependencies, and `cargo build -p tether-server`
-# compiles just it and `tether-protocol` — never the Tauri controller crate.
+# Only the Cargo workspace is needed: the relay (`libretether-relay`) is a pure-Rust
+# QUIC server with no system dependencies, and `cargo build -p libretether-relay`
+# compiles just it and `libretether-protocol` — never the Tauri controller crate.
 COPY src-tauri ./src-tauri
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/build/src-tauri/target \
-    cargo build --manifest-path src-tauri/Cargo.toml -p tether-server --release \
- && cp src-tauri/target/release/tether-server /usr/local/bin/tether-server
+    cargo build --manifest-path src-tauri/Cargo.toml -p libretether-relay --release \
+ && cp src-tauri/target/release/libretether-relay /usr/local/bin/libretether-relay
 
 # ---- runtime -----------------------------------------------------------------
 FROM debian:bookworm-slim AS runtime
-LABEL org.opencontainers.image.title="tether-server"
-LABEL org.opencontainers.image.description="Tether relay — routes QUIC streams between a controller and its agents"
+LABEL org.opencontainers.image.title="libretether-relay"
+LABEL org.opencontainers.image.description="LibreTether relay — routes QUIC streams between a controller and its agents"
 
 # Unprivileged user. /data holds the generated config (owner/agent secrets + TLS
 # cert); mount a volume there so the secrets survive restarts.
-RUN useradd --system --uid 10001 --user-group --no-create-home tether \
- && mkdir -p /data && chown tether:tether /data
-COPY --from=build /usr/local/bin/tether-server /usr/local/bin/tether-server
+RUN useradd --system --uid 10001 --user-group --no-create-home libretether \
+ && mkdir -p /data && chown libretether:libretether /data
+COPY --from=build /usr/local/bin/libretether-relay /usr/local/bin/libretether-relay
 
-USER tether
+USER libretether
 VOLUME ["/data"]
 # QUIC runs over UDP.
 EXPOSE 47600/udp
 
 # `--config` is a global flag, so it applies to both `run` (the default below)
 # and `info`. Override the command, e.g. `docker run … info`, to read secrets.
-ENTRYPOINT ["tether-server", "--config", "/data/config.json"]
+ENTRYPOINT ["libretether-relay", "--config", "/data/config.json"]
 CMD ["run"]

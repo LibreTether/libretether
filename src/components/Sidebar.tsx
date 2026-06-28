@@ -20,9 +20,9 @@ export function Sidebar({
 	return (
 		<aside className="flex w-60 shrink-0 flex-col border-r border-border bg-surface/40">
 			<div className="drag flex items-center gap-2.5 px-5 pb-4 pt-6">
-				<img alt="" className="h-8 w-8 rounded-lg" src="/tether.svg" />
+				<img alt="" className="h-8 w-8 rounded-lg" src="/libretether.svg" />
 				<div className="leading-tight">
-					<div className="text-sm font-bold text-text">Tether</div>
+					<div className="text-sm font-bold text-text">LibreTether</div>
 					<div className="text-[0.7rem] text-subtle">remote control</div>
 				</div>
 			</div>

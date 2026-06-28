@@ -7,10 +7,10 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
+use libretether_protocol::crypto::Identity;
+use libretether_protocol::{tls, AgentStatus, SessionClient, DEFAULT_PORT};
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter};
-use tether_protocol::crypto::Identity;
-use tether_protocol::{tls, AgentStatus, SessionClient, DEFAULT_PORT};
 use uuid::Uuid;
 
 use crate::error::{AppError, AppResult};
@@ -45,7 +45,7 @@ pub struct ControllerConfig {
 	/// "xterm -e". Empty = auto-detect.
 	#[serde(default)]
 	pub terminal: Option<String>,
-	/// Relay (`tether-server`) address. When set, the controller dials the relay
+	/// Relay (`libretether-relay`) address. When set, the controller dials the relay
 	/// instead of listening, and agents reach it through the relay.
 	#[serde(default)]
 	pub relay_addr: Option<String>,

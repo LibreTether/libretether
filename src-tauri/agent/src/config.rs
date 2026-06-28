@@ -4,9 +4,9 @@
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
+use libretether_protocol::crypto::Identity;
+use libretether_protocol::DEFAULT_PORT;
 use serde::{Deserialize, Serialize};
-use tether_protocol::crypto::Identity;
-use tether_protocol::DEFAULT_PORT;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct AgentConfig {
@@ -14,7 +14,7 @@ pub struct AgentConfig {
 	/// when using relay mode.
 	#[serde(default)]
 	pub controller_addr: String,
-	/// `host:port` of the relay (`tether-server`) for relay mode. When set, the
+	/// `host:port` of the relay (`libretether-relay`) for relay mode. When set, the
 	/// agent dials the relay instead of the controller.
 	#[serde(default)]
 	pub relay_addr: Option<String>,
@@ -35,7 +35,7 @@ pub struct AgentConfig {
 }
 
 fn default_server_name() -> String {
-	"tether.local".to_string()
+	"libretether.local".to_string()
 }
 
 impl AgentConfig {
@@ -64,11 +64,11 @@ impl AgentConfig {
 	}
 }
 
-/// Default config path: `<config dir>/tether-agent/config.json`.
+/// Default config path: `<config dir>/libretether-agent/config.json`.
 pub fn default_config_path() -> PathBuf {
 	dirs::config_dir()
 		.unwrap_or_else(|| PathBuf::from("."))
-		.join("tether-agent")
+		.join("libretether-agent")
 		.join("config.json")
 }
 

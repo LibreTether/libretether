@@ -1,4 +1,4 @@
-//! Framing for the optional relay server (`tether-server`).
+//! Framing for the optional relay server (`libretether-relay`).
 //!
 //! In relay mode neither the controller nor the agents are reachable, so both
 //! dial *out* to the relay. The relay authenticates each side (owner secret for

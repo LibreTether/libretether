@@ -2,7 +2,7 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use tether_protocol::HostInfo;
+use libretether_protocol::HostInfo;
 
 pub fn host_info() -> HostInfo {
 	HostInfo {

@@ -1,9 +1,9 @@
-//! Tether relay (`tether-server`).
+//! LibreTether relay (`libretether-relay`).
 //!
 //! Run this on a public cloud host. The controller and the agents all dial out
 //! to it; it authenticates each side (owner secret vs agent secret), tracks
 //! agents by Ed25519 public key, and pipes streams between the controller and
-//! the addressed agent. It never inspects stream contents — the Tether handshake,
+//! the addressed agent. It never inspects stream contents — the LibreTether handshake,
 //! control RPCs, live session and TCP tunnels are all end-to-end.
 
 use std::collections::HashMap;
@@ -15,12 +15,12 @@ use anyhow::{Context, Result};
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
 use clap::{Parser, Subcommand};
+use libretether_protocol::crypto::random_alnum;
+use libretether_protocol::frame::{read_frame, write_frame};
+use libretether_protocol::relay::{RelayAck, RelayEvent, RelayHello, RelayRole, RouteTo};
+use libretether_protocol::{tls, DEFAULT_PORT};
 use quinn::{Endpoint, RecvStream, SendStream};
 use serde::{Deserialize, Serialize};
-use tether_protocol::crypto::random_alnum;
-use tether_protocol::frame::{read_frame, write_frame};
-use tether_protocol::relay::{RelayAck, RelayEvent, RelayHello, RelayRole, RouteTo};
-use tether_protocol::{tls, DEFAULT_PORT};
 use tokio::sync::mpsc::UnboundedSender;
 
 #[derive(Serialize, Deserialize)]
@@ -53,7 +53,7 @@ fn config_path(arg: Option<PathBuf>) -> PathBuf {
 	arg.unwrap_or_else(|| {
 		dirs::config_dir()
 			.unwrap_or_else(|| PathBuf::from("."))
-			.join("tether-server")
+			.join("libretether-relay")
 			.join("config.json")
 	})
 }
@@ -94,7 +94,7 @@ impl Relay {
 }
 
 #[derive(Parser)]
-#[command(name = "tether-server", version, about = "Tether relay server")]
+#[command(name = "libretether-relay", version, about = "LibreTether relay server")]
 struct Cli {
 	/// Path to the server config file.
 	#[arg(long, global = true)]
@@ -149,7 +149,7 @@ async fn run(cfg: ServerConfig) -> Result<()> {
 	let (cert, key) = cfg.cert_key()?;
 	let addr: SocketAddr = cfg.listen_addr.parse().context("invalid listen address")?;
 	let endpoint = Endpoint::server(tls::server_config(cert, key), addr)?;
-	eprintln!("[tether-server] relay listening on udp/{addr}");
+	eprintln!("[libretether-relay] relay listening on udp/{addr}");
 	print_credentials(&cfg);
 
 	let relay = Relay::default();
@@ -160,7 +160,7 @@ async fn run(cfg: ServerConfig) -> Result<()> {
 		let secrets = secrets.clone();
 		tokio::spawn(async move {
 			if let Err(e) = handle(relay, incoming, &secrets).await {
-				eprintln!("[tether-server] connection error: {e}");
+				eprintln!("[libretether-relay] connection error: {e}");
 			}
 		});
 	}
@@ -196,7 +196,7 @@ async fn handle(relay: Relay, incoming: quinn::Incoming, secrets: &(String, Stri
 	)
 	.await?;
 	eprintln!(
-		"[tether-server] {role_ok} connected ({}…)",
+		"[libretether-relay] {role_ok} connected ({}…)",
 		&hello.public_key.chars().take(8).collect::<String>()
 	);
 

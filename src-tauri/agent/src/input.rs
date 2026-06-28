@@ -8,7 +8,7 @@
 use std::sync::mpsc::{Receiver, Sender};
 
 use enigo::{Axis, Button, Coordinate, Direction, Enigo, Key, Keyboard, Mouse, Settings};
-use tether_protocol::{InputEvent, MouseButton};
+use libretether_protocol::{InputEvent, MouseButton};
 
 /// A command sent to the injector thread.
 pub enum InjectCmd {
@@ -29,7 +29,7 @@ fn run(rx: Receiver<InjectCmd>) {
 	let mut enigo = match Enigo::new(&Settings::default()) {
 		Ok(e) => e,
 		Err(e) => {
-			eprintln!("[tether-agent] input injection unavailable: {e}");
+			eprintln!("[libretether-agent] input injection unavailable: {e}");
 			// Drain so senders don't block, but do nothing.
 			while let Ok(cmd) = rx.recv() {
 				if matches!(cmd, InjectCmd::Stop) {
@@ -50,7 +50,7 @@ fn run(rx: Receiver<InjectCmd>) {
 			InjectCmd::Stop => break,
 			InjectCmd::Event(ev) => {
 				if let Err(e) = inject(&mut enigo, ev, w, h) {
-					eprintln!("[tether-agent] inject error: {e}");
+					eprintln!("[libretether-agent] inject error: {e}");
 				}
 			}
 		}

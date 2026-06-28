@@ -1,10 +1,10 @@
 //! Tauri commands — the surface the React UI calls into.
 
-use serde::Serialize;
-use tauri::State;
-use tether_protocol::{
+use libretether_protocol::{
 	AgentStatus, ControlRequest, ControlResponse, ExecResult, InputEvent, ScreenshotResult, SessionConfig, DEFAULT_PORT,
 };
+use serde::Serialize;
+use tauri::State;
 use uuid::Uuid;
 
 use crate::error::{AppError, AppResult};

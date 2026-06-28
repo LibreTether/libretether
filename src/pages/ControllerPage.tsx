@@ -62,7 +62,7 @@ export function ControllerPage() {
 				tailscaleAuthKey: authKey || null,
 				terminal: terminal || null
 			})
-			toast.success("Saved", relayAddr ? "Relay mode set — restart Tether to apply." : "Settings updated.")
+			toast.success("Saved", relayAddr ? "Relay mode set — restart LibreTether to apply." : "Settings updated.")
 			load()
 		} catch (e) {
 			toast.error("Couldn't save", api.errString(e))
@@ -148,13 +148,13 @@ export function ControllerPage() {
 							{relayAddr ? <Badge tone="primary">active</Badge> : <Badge>off</Badge>}
 						</div>
 						<p className="text-xs text-muted">
-							Run <code>tether-server</code> on a public cloud host, then paste its address and secrets
-							here. The controller and all clients dial out to it — nothing else needs to be exposed.
-							Leave the address blank to use Tailscale/Direct instead. Changing this needs a Tether
-							restart.
+							Run <code>libretether-relay</code> on a public cloud host, then paste its address and
+							secrets here. The controller and all clients dial out to it — nothing else needs to be
+							exposed. Leave the address blank to use Tailscale/Direct instead. Changing this needs a
+							LibreTether restart.
 						</p>
 
-						<Field hint="host:port of your tether-server (its public IP/DNS)." label="Relay address">
+						<Field hint="host:port of your libretether-relay (its public IP/DNS)." label="Relay address">
 							<Input
 								onChange={(e) => setRelayAddr(e.target.value)}
 								placeholder="e.g. relay.example.com:47600"
@@ -162,13 +162,13 @@ export function ControllerPage() {
 							/>
 						</Field>
 						<Field
-							hint="From `tether-server info` — authenticates this controller as the owner."
+							hint="From `libretether-relay info` — authenticates this controller as the owner."
 							label="Owner secret"
 						>
 							<Input onChange={(e) => setRelayOwner(e.target.value)} type="password" value={relayOwner} />
 						</Field>
 						<Field
-							hint="From `tether-server info` — embedded in relay-mode deploy scripts."
+							hint="From `libretether-relay info` — embedded in relay-mode deploy scripts."
 							label="Agent secret"
 						>
 							<Input onChange={(e) => setRelayAgent(e.target.value)} type="password" value={relayAgent} />

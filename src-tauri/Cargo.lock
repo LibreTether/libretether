@@ -2355,6 +2355,81 @@ dependencies = [
 ]
 
 [[package]]
+name = "libretether"
+version = "0.2.0"
+dependencies = [
+ "base64 0.22.1",
+ "dirs",
+ "libretether-protocol",
+ "quinn",
+ "serde",
+ "serde_json",
+ "tauri",
+ "tauri-build",
+ "tauri-plugin-clipboard-manager",
+ "tauri-plugin-dialog",
+ "tauri-plugin-notification",
+ "tauri-plugin-opener",
+ "tauri-plugin-os",
+ "thiserror 2.0.18",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
+name = "libretether-agent"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "ashpd",
+ "base64 0.22.1",
+ "clap",
+ "dirs",
+ "enigo",
+ "image",
+ "libretether-protocol",
+ "libspa",
+ "pipewire",
+ "quinn",
+ "serde",
+ "serde_json",
+ "tokio",
+ "whoami",
+ "xcap",
+]
+
+[[package]]
+name = "libretether-protocol"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "ed25519-dalek",
+ "getrandom 0.2.17",
+ "quinn",
+ "rcgen",
+ "rustls",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+]
+
+[[package]]
+name = "libretether-relay"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64 0.22.1",
+ "clap",
+ "dirs",
+ "libretether-protocol",
+ "quinn",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "libspa"
 version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4730,81 +4805,6 @@ checksum = "c4790fc369d5a530f4b544b094e31388b9b3a37c0f4652ade4505945f5660d24"
 dependencies = [
  "new_debug_unreachable",
  "utf-8",
-]
-
-[[package]]
-name = "tether"
-version = "0.2.0"
-dependencies = [
- "base64 0.22.1",
- "dirs",
- "quinn",
- "serde",
- "serde_json",
- "tauri",
- "tauri-build",
- "tauri-plugin-clipboard-manager",
- "tauri-plugin-dialog",
- "tauri-plugin-notification",
- "tauri-plugin-opener",
- "tauri-plugin-os",
- "tether-protocol",
- "thiserror 2.0.18",
- "tokio",
- "uuid",
-]
-
-[[package]]
-name = "tether-agent"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "ashpd",
- "base64 0.22.1",
- "clap",
- "dirs",
- "enigo",
- "image",
- "libspa",
- "pipewire",
- "quinn",
- "serde",
- "serde_json",
- "tether-protocol",
- "tokio",
- "whoami",
- "xcap",
-]
-
-[[package]]
-name = "tether-protocol"
-version = "0.1.0"
-dependencies = [
- "base64 0.22.1",
- "ed25519-dalek",
- "getrandom 0.2.17",
- "quinn",
- "rcgen",
- "rustls",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
- "tokio",
-]
-
-[[package]]
-name = "tether-server"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "base64 0.22.1",
- "clap",
- "dirs",
- "quinn",
- "serde",
- "serde_json",
- "tether-protocol",
- "tokio",
 ]
 
 [[package]]

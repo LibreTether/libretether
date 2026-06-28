@@ -1,12 +1,12 @@
 [package]
-name = "tether-protocol"
+name = "libretether-protocol"
 version = "0.1.0"
-description = "Shared wire protocol, transport and identity for Tether"
+description = "Shared wire protocol, transport and identity for LibreTether"
 edition = "2021"
 license = "MIT"
 
 [lib]
-name = "tether_protocol"
+name = "libretether_protocol"
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }

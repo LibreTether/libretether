@@ -6,11 +6,13 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
+use libretether_protocol::crypto::{self, Identity};
+use libretether_protocol::frame::{read_frame, write_frame};
+use libretether_protocol::relay::{RelayAck, RelayEvent, RelayHello, RelayRole};
+use libretether_protocol::{
+	tls, Challenge, ControlRequest, ControlResponse, Hello, HelloAck, StreamOpen, PROTOCOL_VERSION,
+};
 use quinn::Endpoint;
-use tether_protocol::crypto::{self, Identity};
-use tether_protocol::frame::{read_frame, write_frame};
-use tether_protocol::relay::{RelayAck, RelayEvent, RelayHello, RelayRole};
-use tether_protocol::{tls, Challenge, ControlRequest, ControlResponse, Hello, HelloAck, StreamOpen, PROTOCOL_VERSION};
 use uuid::Uuid;
 
 use crate::error::{AppError, AppResult};
@@ -18,7 +20,7 @@ use crate::link::AgentLink;
 use crate::state::{AppState, LiveConn};
 
 fn log(msg: &str) {
-	eprintln!("[tether] {msg}");
+	eprintln!("[libretether] {msg}");
 }
 
 // ---------------------------------------------------------------- direct mode
@@ -121,7 +123,7 @@ async fn relay_session(
 	let addr = resolve(relay_addr).await?;
 	log(&format!("dialing relay at {addr}"));
 	let conn = endpoint
-		.connect(addr, "tether.local")
+		.connect(addr, "libretether.local")
 		.map_err(|e| AppError::msg(e.to_string()))?
 		.await
 		.map_err(|e| AppError::msg(format!("relay handshake: {e}")))?;

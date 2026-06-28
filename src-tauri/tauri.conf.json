@@ -15,7 +15,7 @@
 				"minWidth": 960,
 				"resizable": true,
 				"theme": null,
-				"title": "Tether",
+				"title": "LibreTether",
 				"titleBarStyle": "Overlay",
 				"width": 1200
 			}
@@ -38,11 +38,11 @@
 			"icons/icon.icns",
 			"icons/icon.ico"
 		],
-		"longDescription": "Tether is a self-hosted remote desktop controller. Enrol your machines with a one-click deployment script, reach them over your own private Tailscale mesh, check their status, run commands, take screenshots, and take over the screen with full mouse and keyboard control.",
+		"longDescription": "LibreTether is a self-hosted remote desktop controller. Enrol your machines with a one-click deployment script, reach them over your own private Tailscale mesh, check their status, run commands, take screenshots, and take over the screen with full mouse and keyboard control.",
 		"shortDescription": "Self-hosted remote desktop control over a private mesh",
 		"targets": "all"
 	},
-	"identifier": "com.tether.desktop",
-	"productName": "Tether",
+	"identifier": "com.libretether.desktop",
+	"productName": "LibreTether",
 	"version": "0.2.0"
 }

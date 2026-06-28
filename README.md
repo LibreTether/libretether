@@ -1,12 +1,12 @@
 <div align="center">
 
-<img src="public/tether.svg" alt="Tether" width="120" />
+<img src="public/libretether.svg" alt="LibreTether" width="120" />
 
-# Tether
+# LibreTether
 
 **A self-hosted remote desktop controller that reaches your machines over your own private mesh.**
 
-Enrol a machine with a one-click script, and Tether keeps it reachable for as long as
+Enrol a machine with a one-click script, and LibreTether keeps it reachable for as long as
 it's on — check its status, run commands, take screenshots, and take over the screen
 with full mouse and keyboard control. No cloud service in the middle, no account to
 sign up for.
@@ -17,11 +17,11 @@ sign up for.
 
 ## How it works
 
-Tether is two programs that talk over [QUIC](https://en.wikipedia.org/wiki/QUIC):
+LibreTether is two programs that talk over [QUIC](https://en.wikipedia.org/wiki/QUIC):
 
 - **The controller** — this Tauri desktop app. It manages your machines and is the one
   fixed point in the system: it *listens*, and agents dial in to it.
-- **The agent** (`tether-agent`) — a small headless daemon that runs on each machine you
+- **The agent** (`libretether-agent`) — a small headless daemon that runs on each machine you
   want to control. It dials the controller and holds the connection open, so the machine
   stays reachable even behind NAT/firewalls (outbound connections "just work").
 
@@ -45,21 +45,21 @@ of the modes require the client to log in:
 - **Direct** — no Tailscale. Agents dial the controller's advertise address, which must be
   reachable (LAN, an existing VPN, or a port-forward on the controller). Zero third-party
   dependency.
-- **Relay (server-backed)** — run **`tether-server`** on a public cloud host. The controller
+- **Relay (server-backed)** — run **`libretether-relay`** on a public cloud host. The controller
   **and** every client dial *out* to it, so nothing on either side needs to be exposed — the
   relay routes between them. It carries everything: the control plane, the live session, and
   RDP/SSH (tunneled). This is the option for fleets where neither end is reachable.
 
-### Relay setup (`tether-server`)
+### Relay setup (`libretether-relay`)
 
-1. On a cloud host with a public IP, build/copy `tether-server` (`run build:server`) and run
-   `tether-server run`. First run generates a config and prints an **owner secret** and an
+1. On a cloud host with a public IP, build/copy `libretether-relay` (`run build:relay`) and run
+   `libretether-relay run`. First run generates a config and prints an **owner secret** and an
    **agent secret**:
    ```
-   tether-server info       # prints listen address + the two secrets
+   libretether-relay info       # prints listen address + the two secrets
    ```
 2. On the **Controller** page → **Relay**, enter the relay's `host:port` and the two secrets,
-   save, and restart Tether. The controller now dials the relay instead of listening.
+   save, and restart LibreTether. The controller now dials the relay instead of listening.
 3. Add machines as usual — their deploy scripts now enrol against the relay (no Tailscale,
    no exposure). Open UDP 47600 on the cloud host's firewall.
 
@@ -69,30 +69,30 @@ A multi-arch image (`linux/amd64`, `linux/arm64`) is published to GHCR on every 
 
 ```bash
 # Generate config + print the secrets (one-time), then run the relay.
-docker run --rm -v tether:/data ghcr.io/joaaoverona/tether-server:latest info
-docker run -d --name tether-server -p 47600:47600/udp \
-  -v tether:/data --restart unless-stopped \
-  ghcr.io/joaaoverona/tether-server:latest
+docker run --rm -v libretether:/data ghcr.io/libretether/libretether-relay:latest info
+docker run -d --name libretether-relay -p 47600:47600/udp \
+  -v libretether:/data --restart unless-stopped \
+  ghcr.io/libretether/libretether-relay:latest
 ```
 
 The named volume (`/data`) keeps the generated config — the owner/agent secrets and the
 TLS cert — stable across restarts. QUIC is UDP, hence `-p 47600:47600/udp`. Build it
-yourself with `run docker:build` (or `docker build -t tether-server .`).
+yourself with `run docker:build` (or `docker build -t libretether-relay .`).
 
 Authentication is layered: the secrets gate access to the relay, and the agent still proves
 its identity to the controller end-to-end with Ed25519 — the relay only forwards bytes.
 
 ### The background agent
 
-The deploy script installs `tether-agent` as a **per-user** background service so the
+The deploy script installs `libretether-agent` as a **per-user** background service so the
 machine is reachable on every boot. Per-user (not a system daemon) matters because screen
 capture and input injection must run inside the graphical session:
 
 | OS | Service | Notes |
 |----|---------|-------|
-| Linux | systemd **user** unit (`tether-agent.service`) | Needs the graphical session; X11 and Wayland are both supported (see below) |
-| macOS | **LaunchAgent** (`com.tether.agent`) | Requires Screen Recording + Accessibility permissions (granted once in System Settings) |
-| Windows | logon **scheduled task** (`TetherAgent`) | Runs in the interactive console session |
+| Linux | systemd **user** unit (`libretether-agent.service`) | Needs the graphical session; X11 and Wayland are both supported (see below) |
+| macOS | **LaunchAgent** (`com.libretether.agent`) | Requires Screen Recording + Accessibility permissions (granted once in System Settings) |
+| Windows | logon **scheduled task** (`LibreTetherAgent`) | Runs in the interactive console session |
 
 ### X11 and Wayland
 
@@ -111,7 +111,7 @@ The agent detects the session at runtime and picks a backend:
 Every method rides Tailscale straight to the client's private IP — no extra tunneling.
 
 - **Live control (in-app)** — the controller streams frames and injects input over its own
-  QUIC session, rendered inside the Tether window. On Wayland this uses the portals (one
+  QUIC session, rendered inside the LibreTether window. On Wayland this uses the portals (one
   consent prompt per connect).
 - **RDP** — the **Connect via RDP** button enables an RDP server on the client and launches
   your host's RDP viewer at the client's tailnet IP. On Linux it drives
@@ -146,14 +146,14 @@ This is an early build. What works today:
 - ✅ **Wayland support** via XDG portals (X11 still supported too)
 - ✅ **RDP connect** — one-click into gnome-remote-desktop / Windows RDP, your choice of viewer
 - ✅ **SSH connect** — one-click terminal session to the client over the tailnet
-- ✅ **Relay mode** — `tether-server` on a cloud host routes between controller and clients (control plane + RDP/SSH tunneled), so neither end is exposed
+- ✅ **Relay mode** — `libretether-relay` on a cloud host routes between controller and clients (control plane + RDP/SSH tunneled), so neither end is exposed
 
-Releases publish the `tether-agent` and `tether-server` binaries for every platform
+Releases publish the `libretether-agent` and `libretether-relay` binaries for every platform
 (`-linux-x86_64`, `-linux-aarch64`, `-macos-universal`, `-windows-x86_64.exe`) — point the
-deploy script's `TETHER_AGENT_URL` at the agent asset (or use a local build via
-`TETHER_AGENT_BIN`), and grab `tether-server-linux-x86_64` for your relay host. The relay is
+deploy script's `LIBRETETHER_AGENT_URL` at the agent asset (or use a local build via
+`LIBRETETHER_AGENT_BIN`), and grab `libretether-relay-linux-x86_64` for your relay host. The relay is
 also published as a multi-arch container image at
-`ghcr.io/joaaoverona/tether-server` (see [Run the relay with Docker](#run-the-relay-with-docker)).
+`ghcr.io/libretether/libretether-relay` (see [Run the relay with Docker](#run-the-relay-with-docker)).
 
 Rough edges & next up: frame streaming is JPEG-over-QUIC (no delta/codec yet), input
 mapping is tuned for the primary display, and the Wayland PipeWire capture
@@ -175,11 +175,11 @@ run dev
 run build
 
 # 4. Build the headless agent binary (ship this to the machines you control)
-run build:agent     # -> src-tauri/target/release/tether-agent
+run build:agent     # -> src-tauri/target/release/libretether-agent
 ```
 
 > Without Runfile: `pnpm install`, then `pnpm exec tauri dev` / `pnpm exec tauri build`,
-> and `cargo build --manifest-path src-tauri/Cargo.toml -p tether-agent --release`.
+> and `cargo build --manifest-path src-tauri/Cargo.toml -p libretether-agent --release`.
 
 ### Enrolling a machine
 
@@ -189,15 +189,15 @@ run build:agent     # -> src-tauri/target/release/tether-agent
 
    ```bash
    # On the client machine, with the built agent next to you:
-   TETHER_AGENT_BIN=/path/to/tether-agent bash tether-deploy-<name>.sh
+   LIBRETETHER_AGENT_BIN=/path/to/libretether-agent bash libretether-deploy-<name>.sh
    ```
 
 3. The script joins the machine to Tailscale, installs the agent, enrols it, and starts
    the background service. It shows up as **online** in the controller within seconds.
 
 > Trying it on one machine? You can skip the script: run
-> `tether-agent enroll --controller <addr> --token <token>` then `tether-agent run`
-> (or `tether-agent install`) by hand.
+> `libretether-agent enroll --controller <addr> --token <token>` then `libretether-agent run`
+> (or `libretether-agent install`) by hand.
 
 ## Development
 
@@ -215,8 +215,8 @@ src/                     React UI (Vite + Tailwind v4)
 src-tauri/               Cargo workspace
   src/                   controller app — QUIC server, registry, deploy scripts, commands
   protocol/              shared wire protocol, QUIC transport, Ed25519 identity
-  agent/                 headless tether-agent daemon (capture, input, service install)
-  server/                tether-server relay (optional, for relay mode)
+  agent/                 headless libretether-agent daemon (capture, input, service install)
+  server/                libretether-relay relay (optional, for relay mode)
 ```
 
 ## License

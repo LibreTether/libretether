@@ -3,8 +3,8 @@
 //! [`AgentLink`] stream; the agent connects to its own `127.0.0.1:remote_port`
 //! and pipes. The launched RDP/SSH client just points at the local port.
 
-use tether_protocol::frame::write_frame;
-use tether_protocol::StreamOpen;
+use libretether_protocol::frame::write_frame;
+use libretether_protocol::StreamOpen;
 use tokio::net::{TcpListener, TcpStream};
 
 use crate::error::{AppError, AppResult};
@@ -23,7 +23,7 @@ pub async fn open(link: AgentLink, remote_port: u16) -> AppResult<u16> {
 			let link = link.clone();
 			tauri::async_runtime::spawn(async move {
 				if let Err(e) = forward(link, remote_port, tcp).await {
-					eprintln!("[tether] tunnel forward error: {e}");
+					eprintln!("[libretether] tunnel forward error: {e}");
 				}
 			});
 		}

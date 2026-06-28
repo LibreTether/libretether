@@ -15,16 +15,12 @@
 			"description": "Build the production controller bundle for the current OS"
 		},
 		"build:agent": {
-			"commands": "cargo build --manifest-path src-tauri/Cargo.toml -p tether-agent --release {{ ARGS }}",
-			"description": "Build the headless tether-agent daemon (release). On Linux this includes Wayland/PipeWire support (run `run setup` for libpipewire-0.3-dev)"
+			"commands": "cargo build --manifest-path src-tauri/Cargo.toml -p libretether-agent --release {{ ARGS }}",
+			"description": "Build the headless libretether-agent daemon (release). On Linux this includes Wayland/PipeWire support (run `run setup` for libpipewire-0.3-dev)"
 		},
-		"build:server": {
-			"commands": "cargo build --manifest-path src-tauri/Cargo.toml -p tether-server --release {{ ARGS }}",
-			"description": "Build the tether-server relay (release) to deploy on a public cloud host for relay mode"
-		},
-		"docker:build": {
-			"commands": "docker build -t tether-server:latest {{ ARGS }} .",
-			"description": "Build the tether-server relay Docker image locally (published to ghcr.io/<owner>/tether-server on release)"
+		"build:relay": {
+			"commands": "cargo build --manifest-path src-tauri/Cargo.toml -p libretether-relay --release {{ ARGS }}",
+			"description": "Build the libretether-relay relay (release) to deploy on a public cloud host for relay mode"
 		},
 		"build:universal": {
 			"commands": "tauri build --target universal-apple-darwin {{ ARGS }}",
@@ -49,15 +45,19 @@
 		},
 		"dev": {
 			"commands": "tauri dev {{ ARGS }}",
-			"description": "Run the full Tether controller (Rust backend + Vite frontend) with hot reload"
+			"description": "Run the full LibreTether controller (Rust backend + Vite frontend) with hot reload"
 		},
 		"dev:agent": {
-			"commands": "cargo run --manifest-path src-tauri/Cargo.toml -p tether-agent -- {{ ARGS }}",
+			"commands": "cargo run --manifest-path src-tauri/Cargo.toml -p libretether-agent -- {{ ARGS }}",
 			"description": "Run the headless agent from source (pass subcommands after --, e.g. run / enroll / status)"
 		},
 		"dev:web": {
 			"commands": "vite",
 			"description": "Run only the Vite dev server (UI preview; Tauri APIs unavailable)"
+		},
+		"docker:build": {
+			"commands": "docker build -t libretether-relay:latest {{ ARGS }} .",
+			"description": "Build the libretether-relay relay Docker image locally (published to ghcr.io/<owner>/libretether-relay on release)"
 		},
 		"fix-appimage-icon": {
 			"commands": "bash scripts/fix-appimage.sh",

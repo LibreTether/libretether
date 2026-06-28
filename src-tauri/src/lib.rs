@@ -25,7 +25,9 @@ pub fn run() {
 		std::env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", "1");
 	}
 
-	let config_dir = dirs::config_dir().unwrap_or_else(|| PathBuf::from(".")).join("tether");
+	let config_dir = dirs::config_dir()
+		.unwrap_or_else(|| PathBuf::from("."))
+		.join("libretether");
 	let state = AppState::init(config_dir).expect("failed to initialise controller state");
 
 	tauri::Builder::default()
@@ -70,5 +72,5 @@ pub fn run() {
 			commands::set_controller_settings,
 		])
 		.run(tauri::generate_context!())
-		.expect("error while running Tether");
+		.expect("error while running LibreTether");
 }

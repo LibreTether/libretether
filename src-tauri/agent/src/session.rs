@@ -10,9 +10,9 @@ use std::time::Duration;
 
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
+use libretether_protocol::frame::{read_frame, write_frame};
+use libretether_protocol::{Frame, FrameEncoding, SessionClient, SessionConfig, SessionServer};
 use quinn::{RecvStream, SendStream};
-use tether_protocol::frame::{read_frame, write_frame};
-use tether_protocol::{Frame, FrameEncoding, SessionClient, SessionConfig, SessionServer};
 
 use crate::capture;
 use crate::input::{self, InjectCmd};
@@ -137,10 +137,10 @@ fn spawn_capture(cfg: SessionConfig, stop: Arc<AtomicBool>, tx: tokio::sync::mps
 							break;
 						}
 					}
-					Err(e) => eprintln!("[tether-agent] encode error: {e}"),
+					Err(e) => eprintln!("[libretether-agent] encode error: {e}"),
 				},
 				Err(e) => {
-					eprintln!("[tether-agent] capture error: {e}");
+					eprintln!("[libretether-agent] capture error: {e}");
 					std::thread::sleep(Duration::from_millis(500));
 				}
 			}

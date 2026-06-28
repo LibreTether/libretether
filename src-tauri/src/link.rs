@@ -4,9 +4,9 @@
 
 use std::net::SocketAddr;
 
+use libretether_protocol::frame::write_frame;
+use libretether_protocol::relay::RouteTo;
 use quinn::{Connection, RecvStream, SendStream};
-use tether_protocol::frame::write_frame;
-use tether_protocol::relay::RouteTo;
 
 use crate::error::{AppError, AppResult};
 

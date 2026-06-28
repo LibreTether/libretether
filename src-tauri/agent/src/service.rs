@@ -37,7 +37,7 @@ mod platform {
 	fn unit_path() -> Result<PathBuf> {
 		Ok(dirs::config_dir()
 			.ok_or_else(|| anyhow!("no config dir"))?
-			.join("systemd/user/tether-agent.service"))
+			.join("systemd/user/libretether-agent.service"))
 	}
 
 	pub fn install(exe: &Path, config: &Path) -> Result<()> {
@@ -47,7 +47,7 @@ mod platform {
 		}
 		let contents = format!(
 			"[Unit]\n\
-			 Description=Tether remote-control agent\n\
+			 Description=LibreTether remote-control agent\n\
 			 After=network-online.target graphical-session.target\n\
 			 Wants=network-online.target\n\n\
 			 [Service]\n\
@@ -64,27 +64,27 @@ mod platform {
 		std::fs::write(&unit, contents).with_context(|| format!("writing {}", unit.display()))?;
 
 		run(Command::new("systemctl").args(["--user", "daemon-reload"]))?;
-		run(Command::new("systemctl").args(["--user", "enable", "tether-agent.service"]))?;
+		run(Command::new("systemctl").args(["--user", "enable", "libretether-agent.service"]))?;
 		// `restart` (not `enable --now`) guarantees a re-deploy picks up the new
 		// binary — `--now` leaves an already-running old process in place.
-		run(Command::new("systemctl").args(["--user", "restart", "tether-agent.service"]))?;
+		run(Command::new("systemctl").args(["--user", "restart", "libretether-agent.service"]))?;
 		// Keep the service running without an active login session (needs privileges).
 		let _ = Command::new("loginctl")
 			.args(["enable-linger", &whoami::username()])
 			.status();
-		println!("Installed and (re)started systemd user service: tether-agent.service");
+		println!("Installed and (re)started systemd user service: libretether-agent.service");
 		Ok(())
 	}
 
 	pub fn uninstall() -> Result<()> {
 		let _ = Command::new("systemctl")
-			.args(["--user", "disable", "--now", "tether-agent.service"])
+			.args(["--user", "disable", "--now", "libretether-agent.service"])
 			.status();
 		if let Ok(unit) = unit_path() {
 			let _ = std::fs::remove_file(unit);
 		}
 		let _ = Command::new("systemctl").args(["--user", "daemon-reload"]).status();
-		println!("Removed systemd user service: tether-agent.service");
+		println!("Removed systemd user service: libretether-agent.service");
 		Ok(())
 	}
 }
@@ -93,7 +93,7 @@ mod platform {
 mod platform {
 	use super::*;
 
-	const LABEL: &str = "com.tether.agent";
+	const LABEL: &str = "com.libretether.agent";
 
 	fn plist_path() -> Result<PathBuf> {
 		Ok(dirs::home_dir()
@@ -143,7 +143,7 @@ mod platform {
 mod platform {
 	use super::*;
 
-	const TASK: &str = "TetherAgent";
+	const TASK: &str = "LibreTetherAgent";
 
 	pub fn install(exe: &Path, config: &Path) -> Result<()> {
 		// Run at logon in the interactive session so capture/input work.

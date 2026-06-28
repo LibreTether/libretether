@@ -9,9 +9,9 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use libretether_protocol::frame::{read_frame, write_frame};
+use libretether_protocol::{InputEvent, SessionClient, SessionConfig, SessionServer, StreamOpen};
 use tauri::{AppHandle, Emitter};
-use tether_protocol::frame::{read_frame, write_frame};
-use tether_protocol::{InputEvent, SessionClient, SessionConfig, SessionServer, StreamOpen};
 use uuid::Uuid;
 
 use crate::error::{AppError, AppResult};

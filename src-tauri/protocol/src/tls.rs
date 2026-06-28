@@ -21,7 +21,7 @@ pub fn install_crypto_provider() {
 
 /// Generate a self-signed certificate. Returns `(cert_der, pkcs8_key_der)`.
 pub fn self_signed() -> (Vec<u8>, Vec<u8>) {
-	let key = rcgen::generate_simple_self_signed(vec!["tether.local".to_string()]).expect("self-signed cert");
+	let key = rcgen::generate_simple_self_signed(vec!["libretether.local".to_string()]).expect("self-signed cert");
 	(key.cert.der().to_vec(), key.key_pair.serialize_der())
 }
 
@@ -74,7 +74,7 @@ mod danger {
 	use rustls::{DigitallySignedStruct, Error, SignatureScheme};
 
 	/// Accepts any certificate. See the module docs for why this is acceptable
-	/// in Tether's threat model.
+	/// in LibreTether's threat model.
 	#[derive(Debug)]
 	pub struct NoVerify;
 

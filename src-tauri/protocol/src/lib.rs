@@ -1,4 +1,4 @@
-//! Shared wire protocol between the Tether controller and its agents.
+//! Shared wire protocol between the LibreTether controller and its agents.
 //!
 //! Topology: the controller is the QUIC *server*; each agent *dials in* over
 //! the tailnet and holds the connection open. Authentication is a
@@ -21,7 +21,7 @@ pub mod tls;
 use serde::{Deserialize, Serialize};
 
 /// ALPN protocol identifier negotiated during the QUIC/TLS handshake.
-pub const ALPN: &[u8] = b"tether/1";
+pub const ALPN: &[u8] = b"libretether/1";
 
 /// Bumped whenever the wire format changes incompatibly.
 pub const PROTOCOL_VERSION: u32 = 1;

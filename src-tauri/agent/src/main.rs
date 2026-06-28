@@ -1,5 +1,5 @@
-//! Tether agent — a small headless daemon that keeps a machine reachable for
-//! the Tether controller. It dials the controller over the tailnet, proves its
+//! LibreTether agent — a small headless daemon that keeps a machine reachable for
+//! the LibreTether controller. It dials the controller over the tailnet, proves its
 //! identity, and then serves status, command-exec, screenshot and live
 //! screen-control requests.
 
@@ -24,10 +24,10 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use config::{default_config_path, normalize_addr, AgentConfig};
-use tether_protocol::crypto::Identity;
+use libretether_protocol::crypto::Identity;
 
 #[derive(Parser)]
-#[command(name = "tether-agent", version, about = "Tether remote-control agent")]
+#[command(name = "libretether-agent", version, about = "LibreTether remote-control agent")]
 struct Cli {
 	/// Path to the agent config file.
 	#[arg(long, global = true)]
@@ -53,8 +53,8 @@ enum Command {
 		/// One-time enrollment token from the controller.
 		#[arg(long)]
 		token: String,
-		/// TLS server name to expect (advanced; defaults to tether.local).
-		#[arg(long, default_value = "tether.local")]
+		/// TLS server name to expect (advanced; defaults to libretether.local).
+		#[arg(long, default_value = "libretether.local")]
 		server_name: String,
 	},
 	/// Run the agent in the foreground (what the service executes).
@@ -99,7 +99,7 @@ async fn main() -> Result<()> {
 			cfg.save(&cfg_path)?;
 			println!("Enrolled. Config written to {}", cfg_path.display());
 			println!("Public key: {}", identity.public_b64());
-			println!("Next: `tether-agent install` to run it in the background, or `tether-agent run`.");
+			println!("Next: `libretether-agent install` to run it in the background, or `libretether-agent run`.");
 			Ok(())
 		}
 		Command::Run => net::run(cfg_path).await,
@@ -141,7 +141,7 @@ async fn main() -> Result<()> {
 			Ok(())
 		}
 		Command::Install => {
-			AgentConfig::load(&cfg_path).context("no config found — run `tether-agent enroll` first")?;
+			AgentConfig::load(&cfg_path).context("no config found — run `libretether-agent enroll` first")?;
 			service::install(&cfg_path)
 		}
 		Command::Uninstall => service::uninstall(),

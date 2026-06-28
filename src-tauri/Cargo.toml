@@ -1,26 +1,26 @@
 [package]
-name = "tether"
+name = "libretether"
 version = "0.2.0"
-description = "Tether — a self-hosted remote desktop controller"
-authors = ["Tether contributors"]
+description = "LibreTether — a self-hosted remote desktop controller"
+authors = ["LibreTether contributors"]
 license = "MIT"
-repository = ""
+repository = "https://github.com/LibreTether/libretether"
 edition = "2021"
 rust-version = "1.77.2"
 
 # The library is what Tauri's mobile tooling expects; the binary just calls into it.
 [lib]
-name = "tether_lib"
+name = "libretether_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [workspace]
-members = ["agent", "protocol", "server"]
+members = ["agent", "protocol", "relay"]
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tether-protocol = { path = "protocol" }
+libretether-protocol = { path = "protocol" }
 
 tauri = { version = "2", features = [] }
 tauri-plugin-dialog = "2"

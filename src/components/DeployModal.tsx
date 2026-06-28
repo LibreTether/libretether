@@ -9,10 +9,10 @@ import type { ClientOs } from "../lib/types"
 import { Button, Modal } from "./ui"
 
 const RUN_HINT: Record<ClientOs, string> = {
-	linux: "On the client machine, save this script and run:  bash tether-deploy.sh",
-	macos: "On the client Mac, save this script and run:  bash tether-deploy.sh",
+	linux: "On the client machine, save this script and run:  bash libretether-deploy.sh",
+	macos: "On the client Mac, save this script and run:  bash libretether-deploy.sh",
 	windows:
-		"On the client PC, save this script, then in an Administrator PowerShell run:  powershell -ExecutionPolicy Bypass -File .\\tether-deploy.ps1"
+		"On the client PC, save this script, then in an Administrator PowerShell run:  powershell -ExecutionPolicy Bypass -File .\\libretether-deploy.ps1"
 }
 
 export function DeployModal({
@@ -44,7 +44,7 @@ export function DeployModal({
 	const download = async () => {
 		const ext = os === "windows" ? "ps1" : "sh"
 		try {
-			const path = await save({ defaultPath: `tether-deploy-${slug(name)}.${ext}` })
+			const path = await save({ defaultPath: `libretether-deploy-${slug(name)}.${ext}` })
 			if (!path) return
 			await api.saveTextFile(path, script)
 			toast.success("Script saved", path)
@@ -96,9 +96,9 @@ export function DeployModal({
 
 				<p className="text-xs text-subtle">
 					Before running, point the script at the agent binary on the client: set
-					<code className="mx-1 rounded bg-surface-3 px-1 py-0.5">TETHER_AGENT_BIN</code>
+					<code className="mx-1 rounded bg-surface-3 px-1 py-0.5">LIBRETETHER_AGENT_BIN</code>
 					to a local path or
-					<code className="mx-1 rounded bg-surface-3 px-1 py-0.5">TETHER_AGENT_URL</code>
+					<code className="mx-1 rounded bg-surface-3 px-1 py-0.5">LIBRETETHER_AGENT_URL</code>
 					to a download URL.
 				</p>
 			</div>

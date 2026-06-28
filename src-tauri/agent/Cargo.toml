@@ -1,16 +1,16 @@
 [package]
-name = "tether-agent"
+name = "libretether-agent"
 version = "0.1.0"
-description = "Tether headless agent — keeps a machine reachable for remote control"
+description = "LibreTether headless agent — keeps a machine reachable for remote control"
 edition = "2021"
 license = "MIT"
 
 [[bin]]
-name = "tether-agent"
+name = "libretether-agent"
 path = "src/main.rs"
 
 [dependencies]
-tether-protocol = { path = "../protocol" }
+libretether-protocol = { path = "../protocol" }
 
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "time", "io-util", "net", "sync", "signal"] }
 quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring", "log"] }

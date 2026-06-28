@@ -35,7 +35,7 @@ struct UserData {
 pub fn spawn(fd: OwnedFd, node_id: u32, quality: u8, max_fps: u8, stop: Arc<AtomicBool>, tx: Sender<Encoded>) {
 	std::thread::spawn(move || {
 		if let Err(e) = run(fd, node_id, quality, max_fps, stop, tx) {
-			eprintln!("[tether-agent] pipewire capture ended: {e}");
+			eprintln!("[libretether-agent] pipewire capture ended: {e}");
 		}
 	});
 }
@@ -65,7 +65,7 @@ fn run(
 
 	let stream = pw::stream::StreamBox::new(
 		&core,
-		"tether-capture",
+		"libretether-capture",
 		properties! {
 			*pw::keys::MEDIA_TYPE => "Video",
 			*pw::keys::MEDIA_CATEGORY => "Capture",

@@ -5,11 +5,11 @@
 //! Three connection modes, none of which requires the client to log in:
 //! - **Tailscale auth key** — the script joins the tailnet non-interactively.
 //! - **Direct** — the agent dials the controller's reachable address.
-//! - **Relay** — the agent dials out to a `tether-server` relay; nothing on the
+//! - **Relay** — the agent dials out to a `libretether-relay` relay; nothing on the
 //!   client (or controller) needs to be exposed.
 //!
 //! We do not host the agent binary, so the script takes it from
-//! `TETHER_AGENT_BIN` (a local path) or `TETHER_AGENT_URL` (a release asset).
+//! `LIBRETETHER_AGENT_BIN` (a local path) or `LIBRETETHER_AGENT_URL` (a release asset).
 
 use crate::registry::ClientOs;
 
@@ -17,7 +17,7 @@ use crate::registry::ClientOs;
 pub enum DeployTarget {
 	/// Dial the controller directly (optionally joining Tailscale first).
 	Controller { address: String, auth_key: Option<String> },
-	/// Dial the relay (`tether-server`) with an agent secret.
+	/// Dial the relay (`libretether-relay`) with an agent secret.
 	Relay { address: String, agent_secret: String },
 }
 
@@ -93,16 +93,16 @@ fn enroll_cmd(os: ClientOs, target: &DeployTarget) -> String {
 }
 
 const LINUX: &str = r#"#!/usr/bin/env bash
-# Tether agent deployment — __NAME__ (linux)
+# LibreTether agent deployment — __NAME__ (linux)
 # Run this on the CLIENT machine you want to control.
 set -euo pipefail
 
 CONTROLLER="__CONTROLLER__"
 TOKEN="__TOKEN__"
 BIN_DIR="$HOME/.local/bin"
-BIN="$BIN_DIR/tether-agent"
+BIN="$BIN_DIR/libretether-agent"
 
-echo "==> Tether setup for __NAME__"
+echo "==> LibreTether setup for __NAME__"
 
 __CONNECT_BLOCK__
 
@@ -121,15 +121,15 @@ else
 fi
 
 # 3. Install the agent binary.
-#    Provide it via TETHER_AGENT_BIN=/path/to/tether-agent or TETHER_AGENT_URL=https://...
+#    Provide it via LIBRETETHER_AGENT_BIN=/path/to/libretether-agent or LIBRETETHER_AGENT_URL=https://...
 mkdir -p "$BIN_DIR"
-if [ -n "${TETHER_AGENT_BIN:-}" ]; then
-  install -m 0755 "$TETHER_AGENT_BIN" "$BIN"
-elif [ -n "${TETHER_AGENT_URL:-}" ]; then
-  echo "==> Downloading agent from $TETHER_AGENT_URL"
-  curl -fsSL "$TETHER_AGENT_URL" -o "$BIN" && chmod +x "$BIN"
+if [ -n "${LIBRETETHER_AGENT_BIN:-}" ]; then
+  install -m 0755 "$LIBRETETHER_AGENT_BIN" "$BIN"
+elif [ -n "${LIBRETETHER_AGENT_URL:-}" ]; then
+  echo "==> Downloading agent from $LIBRETETHER_AGENT_URL"
+  curl -fsSL "$LIBRETETHER_AGENT_URL" -o "$BIN" && chmod +x "$BIN"
 else
-  echo "!! No agent binary source. Set TETHER_AGENT_BIN or TETHER_AGENT_URL and re-run." >&2
+  echo "!! No agent binary source. Set LIBRETETHER_AGENT_BIN or LIBRETETHER_AGENT_URL and re-run." >&2
   exit 1
 fi
 
@@ -137,32 +137,32 @@ fi
 __ENROLL__
 "$BIN" install
 
-echo "==> Done. __NAME__ is now reachable from your Tether controller."
+echo "==> Done. __NAME__ is now reachable from your LibreTether controller."
 "#;
 
 const MACOS: &str = r#"#!/usr/bin/env bash
-# Tether agent deployment — __NAME__ (macOS)
+# LibreTether agent deployment — __NAME__ (macOS)
 # Run this on the CLIENT Mac you want to control.
 set -euo pipefail
 
 CONTROLLER="__CONTROLLER__"
 TOKEN="__TOKEN__"
 BIN_DIR="$HOME/.local/bin"
-BIN="$BIN_DIR/tether-agent"
+BIN="$BIN_DIR/libretether-agent"
 
-echo "==> Tether setup for __NAME__"
+echo "==> LibreTether setup for __NAME__"
 
 __CONNECT_BLOCK__
 
-# 2. Install the agent binary (set TETHER_AGENT_BIN or TETHER_AGENT_URL).
+# 2. Install the agent binary (set LIBRETETHER_AGENT_BIN or LIBRETETHER_AGENT_URL).
 mkdir -p "$BIN_DIR"
-if [ -n "${TETHER_AGENT_BIN:-}" ]; then
-  install -m 0755 "$TETHER_AGENT_BIN" "$BIN"
-elif [ -n "${TETHER_AGENT_URL:-}" ]; then
-  echo "==> Downloading agent from $TETHER_AGENT_URL"
-  curl -fsSL "$TETHER_AGENT_URL" -o "$BIN" && chmod +x "$BIN"
+if [ -n "${LIBRETETHER_AGENT_BIN:-}" ]; then
+  install -m 0755 "$LIBRETETHER_AGENT_BIN" "$BIN"
+elif [ -n "${LIBRETETHER_AGENT_URL:-}" ]; then
+  echo "==> Downloading agent from $LIBRETETHER_AGENT_URL"
+  curl -fsSL "$LIBRETETHER_AGENT_URL" -o "$BIN" && chmod +x "$BIN"
 else
-  echo "!! No agent binary source. Set TETHER_AGENT_BIN or TETHER_AGENT_URL and re-run." >&2
+  echo "!! No agent binary source. Set LIBRETETHER_AGENT_BIN or LIBRETETHER_AGENT_URL and re-run." >&2
   exit 1
 fi
 
@@ -170,10 +170,10 @@ fi
 __ENROLL__
 "$BIN" install
 
-echo "==> Done. Grant Screen Recording + Accessibility to tether-agent in System Settings > Privacy."
+echo "==> Done. Grant Screen Recording + Accessibility to libretether-agent in System Settings > Privacy."
 "#;
 
-const WINDOWS: &str = r#"# Tether agent deployment — __NAME__ (windows)
+const WINDOWS: &str = r#"# LibreTether agent deployment — __NAME__ (windows)
 # Run this on the CLIENT machine in an Administrator PowerShell. If you get a
 # "running scripts is disabled" error, launch it with:
 #   powershell -ExecutionPolicy Bypass -File .\this-script.ps1
@@ -181,22 +181,22 @@ $ErrorActionPreference = "Stop"
 
 $Controller = "__CONTROLLER__"
 $Token = "__TOKEN__"
-$BinDir = Join-Path $env:LOCALAPPDATA "Tether"
-$Bin = Join-Path $BinDir "tether-agent.exe"
+$BinDir = Join-Path $env:LOCALAPPDATA "LibreTether"
+$Bin = Join-Path $BinDir "libretether-agent.exe"
 
-Write-Host "==> Tether setup for __NAME__"
+Write-Host "==> LibreTether setup for __NAME__"
 
 __CONNECT_BLOCK__
 
-# 2. Install the agent binary (set TETHER_AGENT_BIN or TETHER_AGENT_URL).
+# 2. Install the agent binary (set LIBRETETHER_AGENT_BIN or LIBRETETHER_AGENT_URL).
 New-Item -ItemType Directory -Force -Path $BinDir | Out-Null
-if ($env:TETHER_AGENT_BIN) {
-  Copy-Item $env:TETHER_AGENT_BIN $Bin -Force
-} elseif ($env:TETHER_AGENT_URL) {
-  Write-Host "==> Downloading agent from $env:TETHER_AGENT_URL"
-  Invoke-WebRequest -Uri $env:TETHER_AGENT_URL -OutFile $Bin
+if ($env:LIBRETETHER_AGENT_BIN) {
+  Copy-Item $env:LIBRETETHER_AGENT_BIN $Bin -Force
+} elseif ($env:LIBRETETHER_AGENT_URL) {
+  Write-Host "==> Downloading agent from $env:LIBRETETHER_AGENT_URL"
+  Invoke-WebRequest -Uri $env:LIBRETETHER_AGENT_URL -OutFile $Bin
 } else {
-  Write-Error "Set TETHER_AGENT_BIN or TETHER_AGENT_URL to the agent binary and re-run."
+  Write-Error "Set LIBRETETHER_AGENT_BIN or LIBRETETHER_AGENT_URL to the agent binary and re-run."
   exit 1
 }
 
@@ -204,5 +204,5 @@ if ($env:TETHER_AGENT_BIN) {
 __ENROLL__
 & $Bin install
 
-Write-Host "==> Done. __NAME__ is now reachable from your Tether controller."
+Write-Host "==> Done. __NAME__ is now reachable from your LibreTether controller."
 "#;

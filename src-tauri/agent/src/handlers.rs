@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
-use tether_protocol::{AgentStatus, ControlRequest, ControlResponse, ExecResult, ScreenshotResult};
+use libretether_protocol::{AgentStatus, ControlRequest, ControlResponse, ExecResult, ScreenshotResult};
 use tokio::process::Command;
 
 use crate::capture;

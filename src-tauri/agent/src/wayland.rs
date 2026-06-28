@@ -10,9 +10,9 @@ use ashpd::desktop::remote_desktop::{Axis, DeviceType, KeyState, RemoteDesktop, 
 use ashpd::desktop::screencast::{CursorMode, Screencast, SelectSourcesOptions, SourceType};
 use ashpd::desktop::{PersistMode, Session};
 use ashpd::enumflags2::BitFlags;
+use libretether_protocol::frame::{read_frame, write_frame};
+use libretether_protocol::{InputEvent, MouseButton, SessionClient, SessionConfig, SessionServer};
 use quinn::{RecvStream, SendStream};
-use tether_protocol::frame::{read_frame, write_frame};
-use tether_protocol::{InputEvent, MouseButton, SessionClient, SessionConfig, SessionServer};
 
 // Linux evdev button codes (see <linux/input-event-codes.h>).
 const BTN_LEFT: i32 = 0x110;
@@ -32,7 +32,7 @@ struct Portal {
 /// Entry point used by `session::run` when on Wayland.
 pub async fn run_session(cfg: SessionConfig, send: SendStream, recv: RecvStream) -> std::io::Result<()> {
 	if let Err(e) = serve(cfg, send, recv).await {
-		eprintln!("[tether-agent] wayland session: {e:#}");
+		eprintln!("[libretether-agent] wayland session: {e:#}");
 	}
 	Ok(())
 }
