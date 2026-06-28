@@ -90,7 +90,7 @@ async fn exec(program: String, args: Vec<String>, timeout_secs: Option<u64>) -> 
 async fn screenshot(display: u32) -> Result<ScreenshotResult, String> {
 	// On Wayland, go through the Screenshot portal (the X11 grab would be black
 	// for native Wayland windows).
-	#[cfg(feature = "wayland")]
+	#[cfg(target_os = "linux")]
 	if crate::platform::is_wayland() {
 		let (png, width, height) = crate::wayland::screenshot().await.map_err(|e| e.to_string())?;
 		return Ok(ScreenshotResult {

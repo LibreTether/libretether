@@ -9,13 +9,14 @@ mod handlers;
 mod host;
 mod input;
 mod net;
+#[cfg(target_os = "linux")]
 mod platform;
-#[cfg(feature = "wayland-capture")]
+#[cfg(target_os = "linux")]
 mod pwstream;
 mod rdp;
 mod service;
 mod session;
-#[cfg(feature = "wayland")]
+#[cfg(target_os = "linux")]
 mod wayland;
 
 use std::path::PathBuf;
@@ -90,16 +91,16 @@ async fn main() -> Result<()> {
 			let info = host::host_info();
 			println!("host:      {} ({}, {})", info.hostname, info.os, info.arch);
 			println!("user:      {}", info.username);
-			println!("session:   {}", if platform::is_wayland() { "wayland" } else { "x11" });
-			println!("displays:  {}", capture::display_count());
+			#[cfg(target_os = "linux")]
 			println!(
-				"wayland live capture: {}",
-				if cfg!(feature = "wayland-capture") {
-					"enabled (pipewire)"
+				"session:   {}",
+				if platform::is_wayland() {
+					"wayland (portals + pipewire)"
 				} else {
-					"DISABLED — rebuild with `run build:agent`"
+					"x11"
 				}
 			);
+			println!("displays:  {}", capture::display_count());
 			match AgentConfig::load(&cfg_path) {
 				Ok(cfg) => {
 					println!("config:    {}", cfg_path.display());

@@ -22,7 +22,6 @@ const BTN_MIDDLE: i32 = 0x112;
 /// A negotiated portal session: input control + a screen-cast stream.
 struct Portal {
 	rd: RemoteDesktop,
-	#[cfg_attr(not(feature = "wayland-capture"), allow(dead_code))]
 	screencast: Screencast,
 	session: Session<RemoteDesktop>,
 	node_id: u32,
@@ -63,28 +62,14 @@ async fn serve(cfg: SessionConfig, mut send: SendStream, recv: RecvStream) -> Re
 	)
 	.await;
 
-	// Live capture (feature-gated — needs libpipewire).
-	#[cfg(feature = "wayland-capture")]
-	let (stop, mut frame_rx) = {
-		use std::sync::atomic::AtomicBool;
-		use std::sync::Arc;
-		let fd = portal
-			.screencast
-			.open_pipe_wire_remote(&portal.session, Default::default())
-			.await?;
-		let stop = Arc::new(AtomicBool::new(false));
-		let (tx, rx) = tokio::sync::mpsc::channel::<crate::session::Encoded>(4);
-		crate::pwstream::spawn(fd, portal.node_id, cfg.quality, cfg.max_fps, stop.clone(), tx);
-		(stop, rx)
-	};
-	#[cfg(not(feature = "wayland-capture"))]
-	let _ = write_frame(
-		&mut send,
-		&SessionServer::Error {
-			message: "agent built without `wayland-capture` — input works but live frames are off".into(),
-		},
-	)
-	.await;
+	// Start the PipeWire capture thread.
+	let fd = portal
+		.screencast
+		.open_pipe_wire_remote(&portal.session, Default::default())
+		.await?;
+	let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+	let (frame_tx, mut frame_rx) = tokio::sync::mpsc::channel::<crate::session::Encoded>(4);
+	crate::pwstream::spawn(fd, portal.node_id, cfg.quality, cfg.max_fps, stop.clone(), frame_tx);
 
 	// Read input on a dedicated task so the framed read is never cancelled
 	// mid-message by the writer's select! loop.
@@ -104,11 +89,7 @@ async fn serve(cfg: SessionConfig, mut send: SendStream, recv: RecvStream) -> Re
 		}
 	});
 
-	// The no-capture build collapses this to a single-arm receive; the capture
-	// build needs the `loop`/`select!` form, so keep the loop either way.
-	#[allow(clippy::while_let_loop)]
 	loop {
-		#[cfg(feature = "wayland-capture")]
 		tokio::select! {
 			ev = input_rx.recv() => match ev {
 				Some(ev) => inject(&portal, ev).await,
@@ -123,15 +104,8 @@ async fn serve(cfg: SessionConfig, mut send: SendStream, recv: RecvStream) -> Re
 				None => break,
 			},
 		}
-
-		#[cfg(not(feature = "wayland-capture"))]
-		match input_rx.recv().await {
-			Some(ev) => inject(&portal, ev).await,
-			None => break,
-		}
 	}
 
-	#[cfg(feature = "wayland-capture")]
 	stop.store(true, std::sync::atomic::Ordering::Relaxed);
 	reader.abort();
 	let _ = portal.session.close().await;

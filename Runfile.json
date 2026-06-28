@@ -15,12 +15,8 @@
 			"description": "Build the production controller bundle for the current OS"
 		},
 		"build:agent": {
-			"commands": "cargo build --manifest-path src-tauri/Cargo.toml -p tether-agent --release --features wayland-capture {{ ARGS }}",
-			"description": "Build the headless tether-agent daemon (release) with X11 + Wayland support (needs libpipewire-0.3-dev — run `run setup` first)"
-		},
-		"build:agent:x11": {
 			"commands": "cargo build --manifest-path src-tauri/Cargo.toml -p tether-agent --release {{ ARGS }}",
-			"description": "Build the agent without Wayland live capture (X11 + Wayland input only; no libpipewire needed)"
+			"description": "Build the headless tether-agent daemon (release). On Linux this includes Wayland/PipeWire support (run `run setup` for libpipewire-0.3-dev)"
 		},
 		"build:universal": {
 			"commands": "tauri build --target universal-apple-darwin {{ ARGS }}",

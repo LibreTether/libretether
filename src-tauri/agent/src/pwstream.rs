@@ -1,9 +1,9 @@
 //! PipeWire consumer for the ScreenCast portal's video stream.
 //!
-//! Only compiled with the `wayland-capture` feature (needs `libpipewire-0.3-dev`
-//! at build time). Runs the PipeWire main loop on a dedicated thread, pulls
-//! frames from the portal's node, converts them to RGBA, JPEG-encodes them, and
-//! forwards them to the session writer.
+//! Linux-only (needs `libpipewire-0.3-dev` at build time). Runs the PipeWire
+//! main loop on a dedicated thread, pulls frames from the portal's node,
+//! converts them to RGBA, JPEG-encodes them, and forwards them to the session
+//! writer.
 
 use std::os::fd::OwnedFd;
 use std::sync::atomic::{AtomicBool, Ordering};

@@ -43,7 +43,7 @@ pub async fn run(mut send: SendStream, mut recv: RecvStream) -> std::io::Result<
 		}
 	};
 
-	#[cfg(feature = "wayland")]
+	#[cfg(target_os = "linux")]
 	if crate::platform::is_wayland() {
 		return crate::wayland::run_session(cfg, send, recv).await;
 	}

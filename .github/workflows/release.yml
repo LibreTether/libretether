@@ -21,9 +21,8 @@ jobs:
       tag: ${{ inputs.tag || github.ref_name }}
 
   # Build the headless tether-agent for every supported platform and attach the
-  # binaries to the same release. Linux gets the Wayland/PipeWire capture path;
-  # macOS/Windows use the native xcap/enigo path (no portals), so they build with
-  # --no-default-features.
+  # binaries to the same release. Wayland/PipeWire support is a Linux-target
+  # dependency, so the same `cargo build` is correct on every platform.
   agent:
     name: Agent (${{ matrix.key }})
     needs: release
@@ -35,20 +34,16 @@ jobs:
         include:
           - key: linux-x86_64
             runner: ubuntu-24.04
-            features: --features wayland-capture
             ext: ""
           - key: linux-aarch64
             runner: ubuntu-24.04-arm
-            features: --features wayland-capture
             ext: ""
           - key: macos-universal
             runner: macos-latest
-            features: --no-default-features
             ext: ""
             universal: true
           - key: windows-x86_64
             runner: windows-latest
-            features: --no-default-features
             ext: ".exe"
     runs-on: ${{ matrix.runner }}
     steps:
@@ -66,7 +61,7 @@ jobs:
         if: ${{ !matrix.universal }}
         shell: bash
         run: |
-          cargo build --manifest-path src-tauri/Cargo.toml -p tether-agent --release ${{ matrix.features }}
+          cargo build --manifest-path src-tauri/Cargo.toml -p tether-agent --release
           cp "src-tauri/target/release/tether-agent${{ matrix.ext }}" "tether-agent-${{ matrix.key }}${{ matrix.ext }}"
 
       - name: Build agent (universal macOS)
@@ -74,8 +69,8 @@ jobs:
         shell: bash
         run: |
           rustup target add x86_64-apple-darwin aarch64-apple-darwin
-          cargo build --manifest-path src-tauri/Cargo.toml -p tether-agent --release ${{ matrix.features }} --target x86_64-apple-darwin
-          cargo build --manifest-path src-tauri/Cargo.toml -p tether-agent --release ${{ matrix.features }} --target aarch64-apple-darwin
+          cargo build --manifest-path src-tauri/Cargo.toml -p tether-agent --release --target x86_64-apple-darwin
+          cargo build --manifest-path src-tauri/Cargo.toml -p tether-agent --release --target aarch64-apple-darwin
           lipo -create -output "tether-agent-${{ matrix.key }}" \
             src-tauri/target/x86_64-apple-darwin/release/tether-agent \
             src-tauri/target/aarch64-apple-darwin/release/tether-agent

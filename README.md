@@ -71,9 +71,9 @@ The agent detects the session at runtime and picks a backend:
 - **Wayland** — capture via the **ScreenCast** portal (a PipeWire stream), input via the
   **RemoteDesktop** portal, and one-shot screenshots via the **Screenshot** portal. Both
   live portals share a single session, so the user approves **one** "share your screen"
-  prompt per session. Building the live-capture path needs `libpipewire-0.3-dev` (installed
-  by `run setup`); `run build:agent` enables it via the `wayland-capture` feature. Without
-  that feature the agent still does Wayland input + screenshots, just no live frames.
+  prompt per session. This is always built into the Linux agent (it's a Linux-target
+  dependency, not a feature flag), so Linux builds need `libpipewire-0.3-dev` (installed by
+  `run setup`). macOS/Windows agents have no portals and use the `xcap`/`enigo` path.
 
 ### Ways to connect
 
