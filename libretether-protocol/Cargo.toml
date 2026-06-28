@@ -3,7 +3,7 @@ name = "libretether-protocol"
 version = "0.1.0"
 description = "Shared wire protocol, transport and identity for LibreTether"
 edition = "2021"
-license = "MIT"
+license = "AGPL-3.0-only"
 
 [lib]
 name = "libretether_protocol"

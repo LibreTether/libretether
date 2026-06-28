@@ -224,4 +224,10 @@ libretether-relay/       libretether-relay relay (optional, for relay mode)
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+GNU Affero General Public License v3.0 — see [LICENSE](LICENSE).
+
+Copyright (C) 2026 LibreTether contributors. This program is free software:
+you can redistribute it and/or modify it under the terms of the AGPL as
+published by the Free Software Foundation, either version 3 of the License.
+Because LibreTether runs as a network service, the AGPL's section 13 applies:
+if you offer a modified version over a network, you must also offer its source.
