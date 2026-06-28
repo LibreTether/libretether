@@ -1,6 +1,6 @@
 [package]
 name = "tether"
-version = "0.1.4"
+version = "0.2.0"
 description = "Tether — a self-hosted remote desktop controller"
 authors = ["Tether contributors"]
 license = "MIT"
