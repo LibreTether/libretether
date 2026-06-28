@@ -22,7 +22,9 @@ pub fn launch(pref: Option<&str>, host: &str, port: u16, username: &str, passwor
 	}
 	#[cfg(target_os = "macos")]
 	{
-		let _ = pref;
+		// macOS launches via the `open rdp://…` URL scheme, which takes no
+		// password (entered interactively / via Keychain).
+		let _ = (pref, password);
 		launch_macos(host, port, username)
 	}
 }
