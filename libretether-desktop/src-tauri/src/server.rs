@@ -89,17 +89,9 @@ pub async fn serve_relay(state: AppState) {
 		(addr, cfg.relay_owner_secret.clone().unwrap_or_default(), pubkey)
 	};
 
-	let endpoint = match make_client_endpoint() {
-		Ok(ep) => ep,
-		Err(e) => {
-			log(&format!("could not create relay client: {e}"));
-			return;
-		}
-	};
-
 	let mut backoff = 1u64;
 	loop {
-		match relay_session(&state, &endpoint, &relay_addr, &owner_secret, &pubkey).await {
+		match relay_session(&state, &relay_addr, &owner_secret, &pubkey).await {
 			Ok(()) => backoff = 1,
 			Err(e) => log(&format!("relay error: {e:#}")),
 		}
@@ -113,15 +105,10 @@ pub async fn serve_relay(state: AppState) {
 	}
 }
 
-async fn relay_session(
-	state: &AppState,
-	endpoint: &Endpoint,
-	relay_addr: &str,
-	owner_secret: &str,
-	pubkey: &str,
-) -> AppResult<()> {
+async fn relay_session(state: &AppState, relay_addr: &str, owner_secret: &str, pubkey: &str) -> AppResult<()> {
 	let addr = resolve(relay_addr).await?;
 	log(&format!("dialing relay at {addr}"));
+	let endpoint = make_client_endpoint(addr)?;
 	let conn = endpoint
 		.connect(addr, "libretether.local")
 		.map_err(|e| AppError::msg(e.to_string()))?
@@ -175,9 +162,16 @@ async fn relay_session(
 	}
 }
 
-fn make_client_endpoint() -> AppResult<Endpoint> {
-	let mut endpoint =
-		Endpoint::client("0.0.0.0:0".parse().unwrap()).map_err(|e| AppError::msg(format!("bind client: {e}")))?;
+fn make_client_endpoint(target: SocketAddr) -> AppResult<Endpoint> {
+	// Bind the client socket to the relay's address family: quinn rejects dialing
+	// an IPv6 peer from an IPv4 socket (and vice versa) with "invalid remote
+	// address", so an IPv6 relay needs a [::] client and an IPv4 relay a 0.0.0.0 one.
+	let bind: SocketAddr = if target.is_ipv6() {
+		(std::net::Ipv6Addr::UNSPECIFIED, 0).into()
+	} else {
+		(std::net::Ipv4Addr::UNSPECIFIED, 0).into()
+	};
+	let mut endpoint = Endpoint::client(bind).map_err(|e| AppError::msg(format!("bind client: {e}")))?;
 	endpoint.set_default_client_config(tls::client_config());
 	Ok(endpoint)
 }

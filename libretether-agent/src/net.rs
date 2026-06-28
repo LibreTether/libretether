@@ -30,7 +30,6 @@ pub fn log(msg: &str) {
 pub async fn run(cfg_path: PathBuf) -> Result<()> {
 	let mut cfg = AgentConfig::load(&cfg_path)?;
 	handlers::mark_start();
-	let endpoint = make_endpoint()?;
 	let target = match cfg.relay() {
 		Some(relay) => format!("relay {relay}"),
 		None => format!("controller {}", cfg.controller_addr),
@@ -39,7 +38,7 @@ pub async fn run(cfg_path: PathBuf) -> Result<()> {
 
 	let mut backoff = 1u64;
 	loop {
-		match connect_once(&endpoint, &mut cfg, &cfg_path).await {
+		match connect_once(&mut cfg, &cfg_path).await {
 			Ok(()) => {
 				log("controller connection closed");
 				backoff = 1;
@@ -53,31 +52,40 @@ pub async fn run(cfg_path: PathBuf) -> Result<()> {
 	}
 }
 
-fn make_endpoint() -> Result<Endpoint> {
-	let mut endpoint = Endpoint::client("0.0.0.0:0".parse().unwrap()).context("binding client socket")?;
+fn make_endpoint(target: SocketAddr) -> Result<Endpoint> {
+	// Bind the client socket to the target's address family: quinn rejects dialing
+	// an IPv6 peer from an IPv4 socket (and vice versa) with "invalid remote
+	// address", so an IPv6 relay/controller needs a [::] client, an IPv4 one 0.0.0.0.
+	let bind: SocketAddr = if target.is_ipv6() {
+		(std::net::Ipv6Addr::UNSPECIFIED, 0).into()
+	} else {
+		(std::net::Ipv4Addr::UNSPECIFIED, 0).into()
+	};
+	let mut endpoint = Endpoint::client(bind).context("binding client socket")?;
 	endpoint.set_default_client_config(tls::client_config());
 	Ok(endpoint)
 }
 
-async fn connect_once(endpoint: &Endpoint, cfg: &mut AgentConfig, cfg_path: &PathBuf) -> Result<()> {
-	let conn = match cfg.relay() {
-		Some(relay) => connect_relay(endpoint, cfg, relay).await?,
-		None => connect_direct(endpoint, cfg).await?,
+async fn connect_once(cfg: &mut AgentConfig, cfg_path: &PathBuf) -> Result<()> {
+	// Resolve the peer first so the client endpoint can match its address family.
+	let (addr, is_relay) = match cfg.relay() {
+		Some(relay) => (resolve(relay).await?, true),
+		None => (resolve(&cfg.controller_addr).await?, false),
+	};
+	let endpoint = make_endpoint(addr)?;
+	let conn = if is_relay {
+		log(&format!("dialing relay at {addr}"));
+		connect_relay(&endpoint, addr, cfg).await?
+	} else {
+		log(&format!("dialing controller at {addr}"));
+		dial(&endpoint, addr, &cfg.server_name).await?
 	};
 	serve(conn, cfg, cfg_path).await
 }
 
-async fn connect_direct(endpoint: &Endpoint, cfg: &AgentConfig) -> Result<quinn::Connection> {
-	let addr = resolve(&cfg.controller_addr).await?;
-	log(&format!("dialing controller at {addr}"));
-	dial(endpoint, addr, &cfg.server_name).await
-}
-
 /// Dial the relay and register as an agent; the controller's streams will then
 /// arrive piped through it.
-async fn connect_relay(endpoint: &Endpoint, cfg: &AgentConfig, relay: &str) -> Result<quinn::Connection> {
-	let addr = resolve(relay).await?;
-	log(&format!("dialing relay at {addr}"));
+async fn connect_relay(endpoint: &Endpoint, addr: SocketAddr, cfg: &AgentConfig) -> Result<quinn::Connection> {
 	let conn = dial(endpoint, addr, &cfg.server_name).await?;
 
 	let identity = cfg.identity()?;
