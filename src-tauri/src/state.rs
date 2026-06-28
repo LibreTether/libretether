@@ -79,10 +79,12 @@ pub struct LiveConn {
 }
 
 /// A running screen-control session: a channel that pushes input/control into
-/// the session writer task, plus the task handle for teardown.
+/// the session writer task, the task handle for teardown, and a generation
+/// token so a session that's been replaced can't emit events for the live one.
 pub struct SessionHandle {
 	pub input_tx: tokio::sync::mpsc::UnboundedSender<SessionClient>,
 	pub task: tauri::async_runtime::JoinHandle<()>,
+	pub token: u64,
 }
 
 pub struct Inner {

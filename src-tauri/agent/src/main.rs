@@ -89,7 +89,16 @@ async fn main() -> Result<()> {
 			let info = host::host_info();
 			println!("host:      {} ({}, {})", info.hostname, info.os, info.arch);
 			println!("user:      {}", info.username);
+			println!("session:   {}", if platform::is_wayland() { "wayland" } else { "x11" });
 			println!("displays:  {}", capture::display_count());
+			println!(
+				"wayland live capture: {}",
+				if cfg!(feature = "wayland-capture") {
+					"enabled (pipewire)"
+				} else {
+					"DISABLED — rebuild with `run build:agent`"
+				}
+			);
 			match AgentConfig::load(&cfg_path) {
 				Ok(cfg) => {
 					println!("config:    {}", cfg_path.display());

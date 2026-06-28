@@ -36,14 +36,23 @@ export function ControlOverlay({ client, onClose }: { client: ClientDto; onClose
 				setFrames((n) => n + 1)
 			}),
 			api.onSessionError(client.id, (msg) => alive && setError(msg)),
-			api.onSessionClosed(client.id, () => alive && setError("The session ended."))
+			api.onSessionClosed(client.id, () => alive && setError((prev) => prev ?? "The session ended."))
 		]
 
-		api.startControl(client.id, { maxFps: 20, quality: 70 }).catch((e) => alive && setError(api.errString(e)))
+		// Defer the start by a tick so React StrictMode's throwaway mount (which
+		// unmounts immediately) never actually opens a session — avoids a second
+		// portal consent dialog on the client.
+		const startTimer = setTimeout(() => {
+			if (alive)
+				api.startControl(client.id, { maxFps: 20, quality: 70 }).catch(
+					(e) => alive && setError(api.errString(e))
+				)
+		}, 0)
 		surfaceRef.current?.focus()
 
 		return () => {
 			alive = false
+			clearTimeout(startTimer)
 			api.stopControl(client.id).catch(() => {})
 			for (const u of unlisteners) u.then((fn) => fn())
 		}

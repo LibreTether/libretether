@@ -64,12 +64,15 @@ mod platform {
 		std::fs::write(&unit, contents).with_context(|| format!("writing {}", unit.display()))?;
 
 		run(Command::new("systemctl").args(["--user", "daemon-reload"]))?;
-		run(Command::new("systemctl").args(["--user", "enable", "--now", "tether-agent.service"]))?;
+		run(Command::new("systemctl").args(["--user", "enable", "tether-agent.service"]))?;
+		// `restart` (not `enable --now`) guarantees a re-deploy picks up the new
+		// binary — `--now` leaves an already-running old process in place.
+		run(Command::new("systemctl").args(["--user", "restart", "tether-agent.service"]))?;
 		// Keep the service running without an active login session (needs privileges).
 		let _ = Command::new("loginctl")
 			.args(["enable-linger", &whoami::username()])
 			.status();
-		println!("Installed and started systemd user service: tether-agent.service");
+		println!("Installed and (re)started systemd user service: tether-agent.service");
 		Ok(())
 	}
 

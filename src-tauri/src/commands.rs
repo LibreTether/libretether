@@ -279,7 +279,8 @@ pub async fn start_control(
 		quality: quality.unwrap_or(defaults.quality),
 		max_fps: max_fps.unwrap_or(defaults.max_fps),
 	};
-	session::start(state, id, cfg).await
+	session::start(state, id, cfg);
+	Ok(())
 }
 
 #[tauri::command]
