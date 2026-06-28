@@ -42,8 +42,8 @@
 			"description": "Repack built AppImages with a valid .DirIcon so file managers show the icon"
 		},
 		"icons": {
-			"commands": "tauri icon src-tauri/icons/source.png",
-			"description": "Regenerate app icons from src-tauri/icons/source.png"
+			"commands": "tauri icon public/libretether.png",
+			"description": "Regenerate app icons from public/libretether.png"
 		},
 		"typecheck": {
 			"commands": "tsc --noEmit",

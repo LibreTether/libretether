@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="libretether-desktop/public/libretether.svg" alt="LibreTether" width="120" />
+<img src="libretether-desktop/public/libretether.png" alt="LibreTether" width="120" />
 
 # LibreTether
 
