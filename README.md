@@ -132,10 +132,10 @@ This is an early build. What works today:
 - ✅ **SSH connect** — one-click terminal session to the client over the tailnet
 - ✅ **Relay mode** — `tether-server` on a cloud host routes between controller and clients (control plane + RDP/SSH tunneled), so neither end is exposed
 
-Releases publish the `tether-agent` binary for every platform
-(`tether-agent-linux-x86_64`, `-linux-aarch64`, `-macos-universal`,
-`-windows-x86_64.exe`) — point the deploy script's `TETHER_AGENT_URL` at the asset, or use
-a local build via `TETHER_AGENT_BIN`.
+Releases publish the `tether-agent` and `tether-server` binaries for every platform
+(`-linux-x86_64`, `-linux-aarch64`, `-macos-universal`, `-windows-x86_64.exe`) — point the
+deploy script's `TETHER_AGENT_URL` at the agent asset (or use a local build via
+`TETHER_AGENT_BIN`), and grab `tether-server-linux-x86_64` for your relay host.
 
 Rough edges & next up: frame streaming is JPEG-over-QUIC (no delta/codec yet), input
 mapping is tuned for the primary display, and the Wayland PipeWire capture

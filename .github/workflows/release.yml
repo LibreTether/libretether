@@ -20,11 +20,12 @@ jobs:
     with:
       tag: ${{ inputs.tag || github.ref_name }}
 
-  # Build the headless tether-agent for every supported platform and attach the
-  # binaries to the same release. Wayland/PipeWire support is a Linux-target
-  # dependency, so the same `cargo build` is correct on every platform.
-  agent:
-    name: Agent (${{ matrix.key }})
+  # Build the headless tether-agent and the tether-server relay for every
+  # supported platform and attach them to the same release. The agent's
+  # Wayland/PipeWire support is a Linux-target dependency, so the same
+  # `cargo build` is correct on every platform; the relay has no system deps.
+  binaries:
+    name: Binaries (${{ matrix.key }})
     needs: release
     permissions:
       contents: write
@@ -57,26 +58,32 @@ jobs:
 
       - uses: actions-rust-lang/setup-rust-toolchain@v1.16.1
 
-      - name: Build agent
+      - name: Build agent + relay
         if: ${{ !matrix.universal }}
         shell: bash
         run: |
-          cargo build --manifest-path src-tauri/Cargo.toml -p tether-agent --release
+          cargo build --manifest-path src-tauri/Cargo.toml -p tether-agent -p tether-server --release
           cp "src-tauri/target/release/tether-agent${{ matrix.ext }}" "tether-agent-${{ matrix.key }}${{ matrix.ext }}"
+          cp "src-tauri/target/release/tether-server${{ matrix.ext }}" "tether-server-${{ matrix.key }}${{ matrix.ext }}"
 
-      - name: Build agent (universal macOS)
+      - name: Build agent + relay (universal macOS)
         if: ${{ matrix.universal }}
         shell: bash
         run: |
           rustup target add x86_64-apple-darwin aarch64-apple-darwin
-          cargo build --manifest-path src-tauri/Cargo.toml -p tether-agent --release --target x86_64-apple-darwin
-          cargo build --manifest-path src-tauri/Cargo.toml -p tether-agent --release --target aarch64-apple-darwin
-          lipo -create -output "tether-agent-${{ matrix.key }}" \
-            src-tauri/target/x86_64-apple-darwin/release/tether-agent \
-            src-tauri/target/aarch64-apple-darwin/release/tether-agent
+          cargo build --manifest-path src-tauri/Cargo.toml -p tether-agent -p tether-server --release --target x86_64-apple-darwin
+          cargo build --manifest-path src-tauri/Cargo.toml -p tether-agent -p tether-server --release --target aarch64-apple-darwin
+          for bin in tether-agent tether-server; do
+            lipo -create -output "$bin-${{ matrix.key }}" \
+              "src-tauri/target/x86_64-apple-darwin/release/$bin" \
+              "src-tauri/target/aarch64-apple-darwin/release/$bin"
+          done
 
       - name: Upload to release
         env:
           GH_TOKEN: ${{ github.token }}
         shell: bash
-        run: gh release upload "${{ inputs.tag || github.ref_name }}" "tether-agent-${{ matrix.key }}${{ matrix.ext }}" --clobber
+        run: |
+          gh release upload "${{ inputs.tag || github.ref_name }}" \
+            "tether-agent-${{ matrix.key }}${{ matrix.ext }}" \
+            "tether-server-${{ matrix.key }}${{ matrix.ext }}" --clobber
