@@ -269,14 +269,22 @@ async fn serve_agent(relay: Relay, conn: quinn::Connection, public_key: String) 
 	Ok(())
 }
 
-/// Pipe a controller stream and an agent stream together until either closes.
+/// Pipe a controller stream and an agent stream together until both close.
+///
+/// Each direction is copied independently and only *its own* send side is
+/// finished when its source ends; then we wait for BOTH. Tearing both halves
+/// down as soon as one finishes (e.g. `select!`) truncates the reply on a
+/// request/response stream — the controller finishes its send half right after
+/// the request, so the agent's response would be cut off and surface as
+/// "early eof" — and ends live sessions the moment the input half closes.
 async fn pipe(mut c_recv: RecvStream, mut a_send: SendStream, mut a_recv: RecvStream, mut c_send: SendStream) {
-	let up = tokio::io::copy(&mut c_recv, &mut a_send);
-	let down = tokio::io::copy(&mut a_recv, &mut c_send);
-	tokio::select! {
-		_ = up => {}
-		_ = down => {}
-	}
-	let _ = a_send.finish();
-	let _ = c_send.finish();
+	let up = async {
+		let _ = tokio::io::copy(&mut c_recv, &mut a_send).await;
+		let _ = a_send.finish();
+	};
+	let down = async {
+		let _ = tokio::io::copy(&mut a_recv, &mut c_send).await;
+		let _ = c_send.finish();
+	};
+	tokio::join!(up, down);
 }
