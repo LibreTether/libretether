@@ -28,6 +28,7 @@ pub fn enable() -> Result<RdpInfo, String> {
 	}
 }
 
+#[cfg(target_os = "linux")]
 fn has(bin: &str) -> bool {
 	Command::new(bin).arg("--help").output().is_ok()
 }
