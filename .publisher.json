@@ -1,6 +1,8 @@
 {
-	"$schema": "https://raw.githubusercontent.com/Skiley/rust-binary-publish/v3.0.0/schema/publisher.schema.json",
+	"$schema": "https://raw.githubusercontent.com/Skiley/rust-binary-publish/v3.1.0/schema/publisher.schema.json",
 	"input": {
+		"cache-dependency-path": "pnpm-lock.yaml",
+		"package-manager": "pnpm",
 		"post-build": "bash $(git rev-parse --show-toplevel)/scripts/fix-appimage.sh",
 		"project-path": "libretether-desktop",
 		"targets": [

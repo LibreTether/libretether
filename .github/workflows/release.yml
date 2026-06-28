@@ -14,7 +14,7 @@ jobs:
   # publisher (configured in .publisher.json). This also creates the release the
   # agent job below uploads its binaries to.
   release:
-    uses: Skiley/rust-binary-publish/.github/workflows/release.yml@v3.0.0
+    uses: Skiley/rust-binary-publish/.github/workflows/release.yml@v3.1.0
     permissions:
       contents: write
     with:
