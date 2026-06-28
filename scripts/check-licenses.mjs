@@ -11,7 +11,7 @@
 // Tuning: add a compatible SPDX id to ALLOW, or — for a dep whose SPDX metadata
 // is missing/odd but you've manually verified — add it to ALLOW_PACKAGES.
 
-import { execSync } from "node:child_process";
+import { execSync } from "node:child_process"
 
 // SPDX ids accepted as compatible with an AGPL-3.0 outbound license:
 //   - permissive (MIT/BSD/ISC/Zlib/Apache-2.0/Boost/Unicode/public-domain), and
@@ -40,20 +40,20 @@ const ALLOW = new Set([
 	"GPL-3.0-only",
 	"GPL-3.0-or-later",
 	"AGPL-3.0-only",
-	"AGPL-3.0-or-later",
-]);
+	"AGPL-3.0-or-later"
+])
 
 // Escape hatch for individual deps verified by hand. Use "name" or "name@version".
-const ALLOW_PACKAGES = new Set([]);
+const ALLOW_PACKAGES = new Set([])
 
 // Evaluate an SPDX expression: it passes when every AND-clause offers at least
 // one allowed operand. Handles `/` as OR, parentheses, and `WITH <exception>`.
 function isAllowed(expr) {
 	if (!expr) {
-		return false;
+		return false
 	}
 
-	const normalized = expr.replace(/\//g, " OR ").replace(/[()]/g, " ");
+	const normalized = expr.replace(/\//g, " OR ").replace(/[()]/g, " ")
 
 	return normalized.split(/\s+AND\s+/i).every((clause) =>
 		clause
@@ -62,91 +62,91 @@ function isAllowed(expr) {
 				id
 					.trim()
 					.replace(/\s+WITH\s+.*/i, "")
-					.trim(),
+					.trim()
 			)
 			.filter(Boolean)
-			.some((id) => ALLOW.has(id)),
-	);
+			.some((id) => ALLOW.has(id))
+	)
 }
 
-const violations = [];
+const violations = []
 
 // ---- Rust workspace (cargo) -------------------------------------------------
 const meta = JSON.parse(
-	execSync("cargo metadata --format-version 1", { encoding: "utf8", maxBuffer: 256 * 1024 * 1024 }),
-);
-const ourCrates = new Set(meta.workspace_members);
+	execSync("cargo metadata --format-version 1", { encoding: "utf8", maxBuffer: 256 * 1024 * 1024 })
+)
+const ourCrates = new Set(meta.workspace_members)
 
 for (const pkg of meta.packages) {
 	if (ourCrates.has(pkg.id)) {
-		continue;
+		continue
 	}
 
-	const id = `${pkg.name}@${pkg.version}`;
+	const id = `${pkg.name}@${pkg.version}`
 
 	if (ALLOW_PACKAGES.has(pkg.name) || ALLOW_PACKAGES.has(id)) {
-		continue;
+		continue
 	}
 
 	if (!pkg.license) {
-		violations.push(["rust", id, pkg.license_file ? "(license file, no SPDX expression)" : "(no license)"]);
+		violations.push(["rust", id, pkg.license_file ? "(license file, no SPDX expression)" : "(no license)"])
 	} else if (!isAllowed(pkg.license)) {
-		violations.push(["rust", id, pkg.license]);
+		violations.push(["rust", id, pkg.license])
 	}
 }
 
 // ---- JS workspace (pnpm) ----------------------------------------------------
-let pnpmData = {};
+let pnpmData = {}
 
 try {
-	pnpmData = JSON.parse(execSync("pnpm licenses list --json", { encoding: "utf8", maxBuffer: 256 * 1024 * 1024 }));
+	pnpmData = JSON.parse(execSync("pnpm licenses list --json", { encoding: "utf8", maxBuffer: 256 * 1024 * 1024 }))
 } catch (err) {
 	// Some pnpm versions exit non-zero while still emitting the JSON on stdout.
 	if (err.stdout) {
-		pnpmData = JSON.parse(err.stdout.toString());
+		pnpmData = JSON.parse(err.stdout.toString())
 	} else {
-		throw err;
+		throw err
 	}
 }
 
 for (const [license, packages] of Object.entries(pnpmData)) {
 	if (isAllowed(license)) {
-		continue;
+		continue
 	}
 
 	for (const pkg of packages) {
-		const name = pkg.name || pkg.packageName || "?";
+		const name = pkg.name || pkg.packageName || "?"
 
 		if (ALLOW_PACKAGES.has(name)) {
-			continue;
+			continue
 		}
 
-		const versions = Array.isArray(pkg.versions) ? pkg.versions.join(",") : "";
+		const versions = Array.isArray(pkg.versions) ? pkg.versions.join(",") : ""
 
-		violations.push(["js", versions ? `${name}@${versions}` : name, license || "(unknown)"]);
+		violations.push(["js", versions ? `${name}@${versions}` : name, license || "(unknown)"])
 	}
 }
 
 // ---- Report -----------------------------------------------------------------
 if (violations.length === 0) {
-	const total = meta.packages.length - ourCrates.size;
+	const total = meta.packages.length - ourCrates.size
 
 	console.log(
-		`✓ license check passed — all dependencies are compatible with AGPL-3.0 (${total} crates + JS deps scanned)`,
-	);
-	process.exit(0);
+		`✓ license check passed — all dependencies are compatible with AGPL-3.0 (${total} crates + JS deps scanned)`
+	)
+	process.exit(0)
 }
 
 console.error(
-	`✗ license check FAILED — ${violations.length} dependency license(s) not on the AGPL-compatible allowlist:\n`,
-);
+	`✗ license check FAILED — ${violations.length} dependency license(s) not on the AGPL-compatible allowlist:\n`
+)
 
 for (const [ecosystem, id, license] of violations.sort((a, b) => a[2].localeCompare(b[2]))) {
-	console.error(`  [${ecosystem}] ${id} — ${license}`);
+	console.error(`  [${ecosystem}] ${id} — ${license}`)
 }
 
 console.error(
 	"\nIf a flagged license is in fact AGPL-3.0-compatible, add its SPDX id to ALLOW" +
-		"\n(or the specific package to ALLOW_PACKAGES) in scripts/check-licenses.mjs.",
-);
-process.exit(1);
+		"\n(or the specific package to ALLOW_PACKAGES) in scripts/check-licenses.mjs."
+)
+process.exit(1)
