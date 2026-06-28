@@ -63,6 +63,22 @@ of the modes require the client to log in:
 3. Add machines as usual — their deploy scripts now enrol against the relay (no Tailscale,
    no exposure). Open UDP 47600 on the cloud host's firewall.
 
+#### Run the relay with Docker
+
+A multi-arch image (`linux/amd64`, `linux/arm64`) is published to GHCR on every release:
+
+```bash
+# Generate config + print the secrets (one-time), then run the relay.
+docker run --rm -v tether:/data ghcr.io/joaaoverona/tether-server:latest info
+docker run -d --name tether-server -p 47600:47600/udp \
+  -v tether:/data --restart unless-stopped \
+  ghcr.io/joaaoverona/tether-server:latest
+```
+
+The named volume (`/data`) keeps the generated config — the owner/agent secrets and the
+TLS cert — stable across restarts. QUIC is UDP, hence `-p 47600:47600/udp`. Build it
+yourself with `run docker:build` (or `docker build -t tether-server .`).
+
 Authentication is layered: the secrets gate access to the relay, and the agent still proves
 its identity to the controller end-to-end with Ed25519 — the relay only forwards bytes.
 
@@ -135,7 +151,9 @@ This is an early build. What works today:
 Releases publish the `tether-agent` and `tether-server` binaries for every platform
 (`-linux-x86_64`, `-linux-aarch64`, `-macos-universal`, `-windows-x86_64.exe`) — point the
 deploy script's `TETHER_AGENT_URL` at the agent asset (or use a local build via
-`TETHER_AGENT_BIN`), and grab `tether-server-linux-x86_64` for your relay host.
+`TETHER_AGENT_BIN`), and grab `tether-server-linux-x86_64` for your relay host. The relay is
+also published as a multi-arch container image at
+`ghcr.io/joaaoverona/tether-server` (see [Run the relay with Docker](#run-the-relay-with-docker)).
 
 Rough edges & next up: frame streaming is JPEG-over-QUIC (no delta/codec yet), input
 mapping is tuned for the primary display, and the Wayland PipeWire capture

@@ -22,6 +22,10 @@
 			"commands": "cargo build --manifest-path src-tauri/Cargo.toml -p tether-server --release {{ ARGS }}",
 			"description": "Build the tether-server relay (release) to deploy on a public cloud host for relay mode"
 		},
+		"docker:build": {
+			"commands": "docker build -t tether-server:latest {{ ARGS }} .",
+			"description": "Build the tether-server relay Docker image locally (published to ghcr.io/<owner>/tether-server on release)"
+		},
 		"build:universal": {
 			"commands": "tauri build --target universal-apple-darwin {{ ARGS }}",
 			"description": "Build a universal (Intel + Apple Silicon) macOS bundle"

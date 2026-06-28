@@ -6,10 +6,12 @@
 //! Windows it enables the built-in Remote Desktop service (using the machine's
 //! existing account credentials). macOS has no built-in RDP server.
 
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 use std::process::Command;
 
 use tether_protocol::RdpInfo;
 
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 const RDP_PORT: u16 = 3389;
 
 /// Enable RDP and return how to reach it. Blocking — call via `spawn_blocking`.
