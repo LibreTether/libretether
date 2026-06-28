@@ -38,9 +38,14 @@
 				"biome check",
 				"pnpm -C libretether-desktop exec tsc --noEmit",
 				"cargo fmt --all -- --check",
-				"cargo clippy --workspace --all-targets -- -D warnings"
+				"cargo clippy --workspace --all-targets -- -D warnings",
+				"@check:licenses"
 			],
 			"description": "Verify the code is correctly formatted, linted and type-checks (frontend + Rust workspace)"
+		},
+		"check:licenses": {
+			"commands": "node scripts/check-licenses.mjs",
+			"description": "Verify every Rust + JS dependency license is compatible with the project's AGPL-3.0 license"
 		},
 		"clean": {
 			"commands": [
