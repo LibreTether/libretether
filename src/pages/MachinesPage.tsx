@@ -1,4 +1,4 @@
-import { MonitorSmartphone, MonitorUp, Plus, Rocket, SlidersHorizontal, Trash2 } from "lucide-react"
+import { MonitorSmartphone, MonitorUp, Plus, Rocket, ScreenShare, SlidersHorizontal, Trash2 } from "lucide-react"
 import { useState } from "react"
 import { ClientDetailModal } from "../components/ClientDetailModal"
 import { useConfirm } from "../components/confirm"
@@ -72,6 +72,15 @@ export function MachinesPage({
 		}
 	}
 
+	const rdp = async (client: ClientDto) => {
+		try {
+			await api.connectRdp(client.id)
+			toast.info("Launching RDP", `Opening an RDP session to ${client.name}…`)
+		} catch (e) {
+			toast.error("RDP failed", api.errString(e))
+		}
+	}
+
 	return (
 		<>
 			<header className="drag flex items-center justify-between border-b border-border px-7 py-5">
@@ -111,6 +120,7 @@ export function MachinesPage({
 								onControl={() => onControl(c)}
 								onDeploy={() => openDeploy(c)}
 								onDetail={() => setDetail(c)}
+								onRdp={() => rdp(c)}
 								onRemove={() => remove(c)}
 							/>
 						))}
@@ -146,12 +156,14 @@ function ClientCard({
 	onControl,
 	onDetail,
 	onDeploy,
+	onRdp,
 	onRemove
 }: {
 	client: ClientDto
 	onControl: () => void
 	onDetail: () => void
 	onDeploy: () => void
+	onRdp: () => void
 	onRemove: () => void
 }) {
 	const { status } = client
@@ -194,6 +206,14 @@ function ClientCard({
 				>
 					Control
 				</Button>
+				<Button
+					disabled={!client.online}
+					icon={<ScreenShare className="h-4 w-4" />}
+					onClick={onRdp}
+					size="icon-sm"
+					title="Connect via RDP"
+					variant="outline"
+				/>
 				<Button
 					disabled={!client.online}
 					icon={<SlidersHorizontal className="h-4 w-4" />}

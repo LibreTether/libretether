@@ -298,6 +298,26 @@ pub async fn stop_control(state: State<'_, AppState>, id: String) -> AppResult<(
 	Ok(())
 }
 
+/// Enable RDP on the client and launch the host's RDP viewer at its tailnet IP.
+#[tauri::command]
+pub async fn connect_rdp(state: State<'_, AppState>, id: String) -> AppResult<()> {
+	let state = state.inner().clone();
+	let id = parse_id(&id)?;
+	let conn = state.connection(id).ok_or(AppError::Offline)?;
+	let info = match control_request(&conn, &ControlRequest::EnableRdp).await? {
+		ControlResponse::Rdp(info) => info,
+		ControlResponse::Error { message } => return Err(AppError::Agent(message)),
+		_ => return Err(AppError::msg("unexpected response")),
+	};
+	// Prefer the agent's reported (IPv4 tailnet) address; fall back to the
+	// address it connected from.
+	let host = info
+		.address
+		.clone()
+		.unwrap_or_else(|| conn.remote_address().ip().to_string());
+	crate::rdp::launch(&host, info.port, &info.username, info.password.as_deref())
+}
+
 // ---------------------------------------------------------------- controller
 
 /// Write text to a path the user picked via the save dialog. Used to save a

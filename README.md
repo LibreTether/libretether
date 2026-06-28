@@ -75,6 +75,21 @@ The agent detects the session at runtime and picks a backend:
   by `run setup`); `run build:agent` enables it via the `wayland-capture` feature. Without
   that feature the agent still does Wayland input + screenshots, just no live frames.
 
+### Two ways to take control
+
+- **Live control (in-app)** — the controller streams frames and injects input over its own
+  QUIC session, rendered inside the Tether window. On Wayland this uses the portals (one
+  consent prompt per connect).
+- **RDP** — the **Connect via RDP** button enables an RDP server on the client and launches
+  your host's RDP viewer pointed at the client's tailnet IP. On Linux it drives
+  **gnome-remote-desktop** (`grdctl`) with generated credentials, so there's **no per-connect
+  consent prompt** and it sidesteps the Wayland portal entirely; on Windows it enables the
+  built-in Remote Desktop service (sign in with the PC's Windows account). Requirements: an
+  RDP client on the **controller** (FreeRDP — `freerdp3-x11`, installed by `run setup`) and
+  `gnome-remote-desktop` on **Linux clients** (installed by the deploy script). macOS has no
+  built-in RDP server. The connection rides Tailscale straight to the client's private IP —
+  no extra tunneling.
+
 ### Security
 
 - Each agent has its own **Ed25519** keypair; the private seed never leaves the machine.
@@ -94,6 +109,7 @@ This is an early build. What works today:
 - ✅ Live online status, uptime, remote command execution, screenshots
 - ✅ **Live screen control** — streamed frames with mouse + keyboard takeover
 - ✅ **Wayland support** via XDG portals (X11 still supported too)
+- ✅ **RDP connect** — one-click into gnome-remote-desktop / Windows RDP over the tailnet
 
 Rough edges & next up: frame streaming is JPEG-over-QUIC (no delta/codec yet), input
 mapping is tuned for the primary display, the agent binary isn't published as a release

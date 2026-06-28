@@ -53,6 +53,14 @@ pub fn random_nonce_b64() -> String {
 	B64.encode(nonce)
 }
 
+/// A random alphanumeric string of `len` characters (e.g. for RDP passwords).
+pub fn random_alnum(len: usize) -> String {
+	const CHARS: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz23456789";
+	let mut bytes = vec![0u8; len];
+	getrandom::getrandom(&mut bytes).expect("os rng");
+	bytes.iter().map(|b| CHARS[*b as usize % CHARS.len()] as char).collect()
+}
+
 /// Verify that `sig_b64` is a valid signature of `msg` under `public_b64`.
 pub fn verify_b64(public_b64: &str, msg: &[u8], sig_b64: &str) -> bool {
 	let Some(vk) = decode_pubkey(public_b64) else {

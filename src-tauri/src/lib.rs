@@ -1,6 +1,7 @@
 mod commands;
 mod deploy;
 mod error;
+mod rdp;
 mod registry;
 mod server;
 mod session;
@@ -54,6 +55,7 @@ pub fn run() {
 			commands::start_control,
 			commands::send_input,
 			commands::stop_control,
+			commands::connect_rdp,
 			commands::save_text_file,
 			commands::controller_info,
 			commands::set_controller_settings,

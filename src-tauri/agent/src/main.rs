@@ -12,6 +12,7 @@ mod net;
 mod platform;
 #[cfg(feature = "wayland-capture")]
 mod pwstream;
+mod rdp;
 mod service;
 mod session;
 #[cfg(feature = "wayland")]

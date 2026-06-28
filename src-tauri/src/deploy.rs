@@ -73,13 +73,14 @@ __CONNECT_BLOCK__
 
 # 2. Install the runtime libraries the agent links against: libxdo (X11 input),
 #    libxcb (X11 capture), and libpipewire (Wayland capture).
+#    gnome-remote-desktop is for the optional RDP connect path on Wayland.
 if command -v apt-get >/dev/null 2>&1; then
   sudo apt-get update -qq || true
-  sudo apt-get install -y libxdo3 libxcb1 libxcb-randr0 libxcb-shm0 libxcb-xfixes0 libpipewire-0.3-0 || true
+  sudo apt-get install -y libxdo3 libxcb1 libxcb-randr0 libxcb-shm0 libxcb-xfixes0 libpipewire-0.3-0 gnome-remote-desktop || true
 elif command -v dnf >/dev/null 2>&1; then
-  sudo dnf install -y libxdo libxcb pipewire-libs || true
+  sudo dnf install -y libxdo libxcb pipewire-libs gnome-remote-desktop || true
 elif command -v pacman >/dev/null 2>&1; then
-  sudo pacman -S --needed --noconfirm xdotool libxcb pipewire || true
+  sudo pacman -S --needed --noconfirm xdotool libxcb pipewire gnome-remote-desktop || true
 else
   echo "!! Couldn't auto-install runtime libs — ensure libxdo (libxdo.so.3) and libxcb are present." >&2
 fi

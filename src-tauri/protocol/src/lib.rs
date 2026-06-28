@@ -101,6 +101,8 @@ pub enum ControlRequest {
 	Screenshot {
 		display: Option<u32>,
 	},
+	/// Turn on an RDP server on the client and return how to reach it.
+	EnableRdp,
 }
 
 /// The matching response, written back on the same stream.
@@ -111,7 +113,25 @@ pub enum ControlResponse {
 	Status(AgentStatus),
 	Exec(ExecResult),
 	Screenshot(ScreenshotResult),
+	Rdp(RdpInfo),
 	Error { message: String },
+}
+
+/// How to reach the RDP server the agent just enabled.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RdpInfo {
+	/// Which server is backing RDP, e.g. "gnome-remote-desktop" or "windows".
+	pub backend: String,
+	/// Optional address override; when absent, the controller dials the address
+	/// the agent connected from (its tailnet IP).
+	pub address: Option<String>,
+	pub port: u16,
+	pub username: String,
+	/// Present when the agent manages its own credentials (gnome-remote-desktop);
+	/// absent when the client's existing OS credentials are used (Windows).
+	pub password: Option<String>,
+	/// A human-readable hint to surface if the connection needs attention.
+	pub note: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

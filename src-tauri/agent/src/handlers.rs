@@ -39,6 +39,13 @@ pub async fn handle(req: ControlRequest) -> ControlResponse {
 			Ok(r) => ControlResponse::Screenshot(r),
 			Err(e) => ControlResponse::Error { message: e },
 		},
+		ControlRequest::EnableRdp => match tokio::task::spawn_blocking(crate::rdp::enable).await {
+			Ok(Ok(info)) => ControlResponse::Rdp(info),
+			Ok(Err(e)) => ControlResponse::Error { message: e },
+			Err(e) => ControlResponse::Error {
+				message: format!("rdp task failed: {e}"),
+			},
+		},
 	}
 }
 

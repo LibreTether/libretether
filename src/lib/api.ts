@@ -38,6 +38,7 @@ export const startControl = (id: string, opts: SessionOpts = {}) =>
 	invoke<void>("start_control", { display: opts.display, id, maxFps: opts.maxFps, quality: opts.quality })
 export const sendInput = (id: string, event: InputEvent) => invoke<void>("send_input", { event, id })
 export const stopControl = (id: string) => invoke<void>("stop_control", { id })
+export const connectRdp = (id: string) => invoke<void>("connect_rdp", { id })
 
 // ---------------------------------------------------------------- controller
 export const controllerInfo = () => invoke<ControllerInfo>("controller_info")
