@@ -149,6 +149,9 @@ async fn setup_portal() -> Result<Portal> {
 		SelectDevicesOptions::default().set_devices(DeviceType::Keyboard | DeviceType::Pointer),
 	)
 	.await?;
+	// Persist the grant with a restore token so the consent dialog only appears
+	// the first time — later connects reuse the saved token silently.
+	let saved_token = load_restore_token();
 	screencast
 		.select_sources(
 			&session,
@@ -156,11 +159,15 @@ async fn setup_portal() -> Result<Portal> {
 				.set_cursor_mode(CursorMode::Embedded)
 				.set_sources(BitFlags::from(SourceType::Monitor))
 				.set_multiple(false)
-				.set_persist_mode(PersistMode::DoNot),
+				.set_persist_mode(PersistMode::ExplicitlyRevoked)
+				.set_restore_token(saved_token.as_deref()),
 		)
 		.await?;
 
 	let response = rd.start(&session, None, Default::default()).await?.response()?;
+	if let Some(token) = response.restore_token() {
+		save_restore_token(token);
+	}
 	let stream = response
 		.streams()
 		.first()
@@ -176,6 +183,29 @@ async fn setup_portal() -> Result<Portal> {
 		width: w as u32,
 		height: h as u32,
 	})
+}
+
+fn restore_token_path() -> Option<std::path::PathBuf> {
+	Some(dirs::config_dir()?.join("tether-agent").join("wayland.token"))
+}
+
+/// Load the saved ScreenCast restore token, if any.
+fn load_restore_token() -> Option<String> {
+	let path = restore_token_path()?;
+	std::fs::read_to_string(path)
+		.ok()
+		.map(|s| s.trim().to_string())
+		.filter(|s| !s.is_empty())
+}
+
+/// Persist the ScreenCast restore token returned by the portal.
+fn save_restore_token(token: &str) {
+	if let Some(path) = restore_token_path() {
+		if let Some(dir) = path.parent() {
+			let _ = std::fs::create_dir_all(dir);
+		}
+		let _ = std::fs::write(path, token);
+	}
 }
 
 async fn inject(portal: &Portal, ev: InputEvent) {

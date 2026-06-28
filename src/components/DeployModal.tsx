@@ -11,7 +11,8 @@ import { Button, Modal } from "./ui"
 const RUN_HINT: Record<ClientOs, string> = {
 	linux: "On the client machine, save this script and run:  bash tether-deploy.sh",
 	macos: "On the client Mac, save this script and run:  bash tether-deploy.sh",
-	windows: "On the client PC, save this script and run it in PowerShell:  .\\tether-deploy.ps1"
+	windows:
+		"On the client PC, save this script, then in an Administrator PowerShell run:  powershell -ExecutionPolicy Bypass -File .\\tether-deploy.ps1"
 }
 
 export function DeployModal({

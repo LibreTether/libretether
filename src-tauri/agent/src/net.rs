@@ -16,6 +16,11 @@ use crate::{handlers, host, session};
 
 const AGENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// Upper bound on the reconnect backoff, so a long-idle agent still retries often.
+const RECONNECT_MAX_SECS: u64 = 5;
+/// How long a single dial attempt may hang before we give up and retry.
+const CONNECT_TIMEOUT_SECS: u64 = 8;
+
 pub fn log(msg: &str) {
 	eprintln!("[tether-agent] {msg}");
 }
@@ -39,10 +44,10 @@ pub async fn run(cfg_path: PathBuf) -> Result<()> {
 			}
 			Err(e) => log(&format!("connection error: {e:#}")),
 		}
-		let wait = backoff.min(30);
+		let wait = backoff.min(RECONNECT_MAX_SECS);
 		log(&format!("reconnecting in {wait}s"));
 		tokio::time::sleep(Duration::from_secs(wait)).await;
-		backoff = (backoff * 2).min(30);
+		backoff = (backoff * 2).min(RECONNECT_MAX_SECS);
 	}
 }
 
@@ -55,9 +60,10 @@ fn make_endpoint() -> Result<Endpoint> {
 async fn connect_once(endpoint: &Endpoint, cfg: &mut AgentConfig, cfg_path: &PathBuf) -> Result<()> {
 	let addr = resolve(&cfg.controller_addr).await?;
 	log(&format!("dialing controller at {addr}"));
-	let conn = endpoint
-		.connect(addr, &cfg.server_name)?
+	let connecting = endpoint.connect(addr, &cfg.server_name)?;
+	let conn = tokio::time::timeout(Duration::from_secs(CONNECT_TIMEOUT_SECS), connecting)
 		.await
+		.map_err(|_| anyhow!("dial timed out after {CONNECT_TIMEOUT_SECS}s"))?
 		.context("quic handshake")?;
 	log("connected; awaiting challenge");
 

@@ -71,7 +71,20 @@ echo "==> Tether setup for __NAME__"
 
 __CONNECT_BLOCK__
 
-# 2. Install the agent binary.
+# 2. Install the runtime libraries the agent links against: libxdo (X11 input),
+#    libxcb (X11 capture), and libpipewire (Wayland capture).
+if command -v apt-get >/dev/null 2>&1; then
+  sudo apt-get update -qq || true
+  sudo apt-get install -y libxdo3 libxcb1 libxcb-randr0 libxcb-shm0 libxcb-xfixes0 libpipewire-0.3-0 || true
+elif command -v dnf >/dev/null 2>&1; then
+  sudo dnf install -y libxdo libxcb pipewire-libs || true
+elif command -v pacman >/dev/null 2>&1; then
+  sudo pacman -S --needed --noconfirm xdotool libxcb pipewire || true
+else
+  echo "!! Couldn't auto-install runtime libs — ensure libxdo (libxdo.so.3) and libxcb are present." >&2
+fi
+
+# 3. Install the agent binary.
 #    Provide it via TETHER_AGENT_BIN=/path/to/tether-agent or TETHER_AGENT_URL=https://...
 mkdir -p "$BIN_DIR"
 if [ -n "${TETHER_AGENT_BIN:-}" ]; then
@@ -84,7 +97,7 @@ else
   exit 1
 fi
 
-# 3. Enroll with the controller and install the always-on service.
+# 4. Enroll with the controller and install the always-on service.
 "$BIN" enroll --controller "$CONTROLLER" --token "$TOKEN"
 "$BIN" install
 
@@ -125,7 +138,9 @@ echo "==> Done. Grant Screen Recording + Accessibility to tether-agent in System
 "#;
 
 const WINDOWS: &str = r#"# Tether agent deployment — __NAME__ (windows)
-# Run this in PowerShell on the CLIENT machine you want to control.
+# Run this on the CLIENT machine in an Administrator PowerShell. If you get a
+# "running scripts is disabled" error, launch it with:
+#   powershell -ExecutionPolicy Bypass -File .\this-script.ps1
 $ErrorActionPreference = "Stop"
 
 $Controller = "__CONTROLLER__"

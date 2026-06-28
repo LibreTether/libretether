@@ -27,8 +27,10 @@ pub fn self_signed() -> (Vec<u8>, Vec<u8>) {
 
 fn transport() -> quinn::TransportConfig {
 	let mut t = quinn::TransportConfig::default();
-	t.max_idle_timeout(Some(Duration::from_secs(30).try_into().expect("idle timeout")));
-	t.keep_alive_interval(Some(Duration::from_secs(10)));
+	// Keep these short so a dead/restarted controller is noticed quickly and
+	// agents come back "online" within seconds rather than half a minute.
+	t.max_idle_timeout(Some(Duration::from_secs(12).try_into().expect("idle timeout")));
+	t.keep_alive_interval(Some(Duration::from_secs(4)));
 	t
 }
 
