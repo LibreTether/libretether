@@ -33,7 +33,7 @@ jobs:
       - uses: Skiley/runfile/.github/actions/setup@master
 
       - name: Install JS dependencies
-        run: run install
+        run: pnpm install
 
       - name: Check (format, lint, type-check)
         run: run check

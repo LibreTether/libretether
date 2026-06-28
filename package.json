@@ -8,5 +8,8 @@
 	"license": "AGPL-3.0-only",
 	"name": "libretether-workspace",
 	"packageManager": "pnpm@11.8.0",
-	"private": true
+	"private": true,
+	"scripts": {
+		"prepare": "husky"
+	}
 }

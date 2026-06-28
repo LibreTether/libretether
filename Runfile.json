@@ -38,10 +38,6 @@
 			"commands": "rm -rf target node_modules libretether-desktop/node_modules libretether-desktop/dist",
 			"description": "Remove build artifacts (Rust target, node_modules, dist)"
 		},
-		"install": {
-			"commands": ["pnpm install", "pnpm exec husky"],
-			"description": "Install JS dependencies and set up git hooks (husky)"
-		},
 		"lint": {
 			"commands": ["biome check --write", "cargo fmt --all"],
 			"description": "Auto-format & fix the whole workspace (Biome for JS/CSS/JSON, rustfmt for Rust)"
@@ -84,9 +80,9 @@
 					"default": "echo 'No system setup step for {{ RUN.os }} — install the Tauri prerequisites manually: https://tauri.app/start/prerequisites/'",
 					"match": "{{ RUN.os }}"
 				},
-				"@install"
+				"pnpm install"
 			],
-			"description": "Install system prerequisites (Tauri/WebKit deps) and JS dependencies"
+			"description": "Install system prerequisites (Tauri/WebKit deps) and JS dependencies (husky hooks are set up by the package.json prepare script)"
 		},
 		"test": {
 			"commands": "cargo test --workspace {{ ARGS }}",
