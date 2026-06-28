@@ -1,4 +1,13 @@
-import { MonitorSmartphone, MonitorUp, Plus, Rocket, ScreenShare, SlidersHorizontal, Trash2 } from "lucide-react"
+import {
+	MonitorSmartphone,
+	MonitorUp,
+	Plus,
+	Rocket,
+	ScreenShare,
+	SlidersHorizontal,
+	Terminal,
+	Trash2
+} from "lucide-react"
 import { useState } from "react"
 import { ClientDetailModal } from "../components/ClientDetailModal"
 import { useConfirm } from "../components/confirm"
@@ -81,6 +90,15 @@ export function MachinesPage({
 		}
 	}
 
+	const ssh = async (client: ClientDto) => {
+		try {
+			await api.connectSsh(client.id)
+			toast.info("Opening SSH", `Launching a terminal to ${client.name}…`)
+		} catch (e) {
+			toast.error("SSH failed", api.errString(e))
+		}
+	}
+
 	return (
 		<>
 			<header className="drag flex items-center justify-between border-b border-border px-7 py-5">
@@ -122,6 +140,7 @@ export function MachinesPage({
 								onDetail={() => setDetail(c)}
 								onRdp={() => rdp(c)}
 								onRemove={() => remove(c)}
+								onSsh={() => ssh(c)}
 							/>
 						))}
 					</div>
@@ -157,7 +176,8 @@ function ClientCard({
 	onDetail,
 	onDeploy,
 	onRdp,
-	onRemove
+	onRemove,
+	onSsh
 }: {
 	client: ClientDto
 	onControl: () => void
@@ -165,6 +185,7 @@ function ClientCard({
 	onDeploy: () => void
 	onRdp: () => void
 	onRemove: () => void
+	onSsh: () => void
 }) {
 	const { status } = client
 	return (
@@ -212,6 +233,14 @@ function ClientCard({
 					onClick={onRdp}
 					size="icon-sm"
 					title="Connect via RDP"
+					variant="outline"
+				/>
+				<Button
+					disabled={!client.online}
+					icon={<Terminal className="h-4 w-4" />}
+					onClick={onSsh}
+					size="icon-sm"
+					title="Connect via SSH"
 					variant="outline"
 				/>
 				<Button

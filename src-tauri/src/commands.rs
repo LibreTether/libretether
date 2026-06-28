@@ -41,6 +41,10 @@ pub struct ControllerInfo {
 	pub advertise_addr: Option<String>,
 	/// Tailscale pre-auth key embedded in deploy scripts (empty = direct mode).
 	pub tailscale_auth_key: Option<String>,
+	/// Preferred RDP client key or custom command.
+	pub rdp_client: Option<String>,
+	/// Preferred terminal launcher for SSH.
+	pub terminal: Option<String>,
 }
 
 fn to_dto(client: &Client, online: bool, status: Option<AgentStatus>) -> ClientDto {
@@ -315,7 +319,33 @@ pub async fn connect_rdp(state: State<'_, AppState>, id: String) -> AppResult<()
 		.address
 		.clone()
 		.unwrap_or_else(|| conn.remote_address().ip().to_string());
-	crate::rdp::launch(&host, info.port, &info.username, info.password.as_deref())
+	let pref = state.0.config.lock().unwrap().rdp_client.clone();
+	crate::rdp::launch(
+		pref.as_deref(),
+		&host,
+		info.port,
+		&info.username,
+		info.password.as_deref(),
+	)
+}
+
+/// Open a terminal SSH session to a client at its tailnet IP.
+#[tauri::command]
+pub async fn connect_ssh(state: State<'_, AppState>, id: String) -> AppResult<()> {
+	let state = state.inner().clone();
+	let id = parse_id(&id)?;
+	let conn = state.connection(id).ok_or(AppError::Offline)?;
+	let status = match control_request(&conn, &ControlRequest::Status).await? {
+		ControlResponse::Status(s) => s,
+		ControlResponse::Error { message } => return Err(AppError::Agent(message)),
+		_ => return Err(AppError::msg("unexpected response")),
+	};
+	let host = status
+		.tailscale_ip
+		.clone()
+		.unwrap_or_else(|| conn.remote_address().ip().to_string());
+	let terminal = state.0.config.lock().unwrap().terminal.clone();
+	crate::ssh::launch(terminal.as_deref(), &host, 22, &status.host.username)
 }
 
 // ---------------------------------------------------------------- controller
@@ -336,13 +366,15 @@ pub async fn save_text_file(path: String, contents: String) -> AppResult<()> {
 #[tauri::command]
 pub async fn controller_info(state: State<'_, AppState>) -> AppResult<ControllerInfo> {
 	let state = state.inner().clone();
-	let (listen_port, fingerprint, advertise_addr, tailscale_auth_key) = {
+	let (listen_port, fingerprint, advertise_addr, tailscale_auth_key, rdp_client, terminal) = {
 		let cfg = state.0.config.lock().unwrap();
 		(
 			cfg.listen_port,
 			cfg.fingerprint(),
 			cfg.advertise_addr.clone(),
 			cfg.tailscale_auth_key.clone(),
+			cfg.rdp_client.clone(),
+			cfg.terminal.clone(),
 		)
 	};
 	Ok(ControllerInfo {
@@ -351,6 +383,8 @@ pub async fn controller_info(state: State<'_, AppState>) -> AppResult<Controller
 		tailscale: tailscale::status().await,
 		advertise_addr,
 		tailscale_auth_key,
+		rdp_client,
+		terminal,
 	})
 }
 
@@ -361,14 +395,17 @@ pub async fn set_controller_settings(
 	state: State<'_, AppState>,
 	advertise_addr: Option<String>,
 	tailscale_auth_key: Option<String>,
+	rdp_client: Option<String>,
+	terminal: Option<String>,
 ) -> AppResult<()> {
 	let state = state.inner().clone();
+	let clean = |s: Option<String>| s.map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
 	{
 		let mut cfg = state.0.config.lock().unwrap();
-		cfg.advertise_addr = advertise_addr.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
-		cfg.tailscale_auth_key = tailscale_auth_key
-			.map(|s| s.trim().to_string())
-			.filter(|s| !s.is_empty());
+		cfg.advertise_addr = clean(advertise_addr);
+		cfg.tailscale_auth_key = clean(tailscale_auth_key);
+		cfg.rdp_client = clean(rdp_client);
+		cfg.terminal = clean(terminal);
 	}
 	state.save_config()?;
 	state.notify_changed();

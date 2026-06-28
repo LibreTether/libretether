@@ -146,6 +146,9 @@ pub struct AgentStatus {
 	pub boot_time_secs: Option<u64>,
 	/// Number of attached displays the agent can see.
 	pub displays: u32,
+	/// The agent's tailnet IPv4, when on Tailscale — used as the address the
+	/// controller dials for RDP/SSH.
+	pub tailscale_ip: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

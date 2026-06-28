@@ -9,14 +9,6 @@ license = "MIT"
 name = "tether-agent"
 path = "src/main.rs"
 
-[features]
-# `wayland` adds XDG-portal input + screenshots (D-Bus only, no extra system deps).
-# `wayland-capture` adds live screen capture via the ScreenCast portal + PipeWire,
-# which needs `libpipewire-0.3-dev` at build time (installed by `run setup`).
-default = ["wayland"]
-wayland = ["dep:ashpd"]
-wayland-capture = ["wayland", "dep:pipewire", "dep:libspa"]
-
 [dependencies]
 tether-protocol = { path = "../protocol" }
 
@@ -33,8 +25,10 @@ image = { version = "0.25", default-features = false, features = ["jpeg", "png"]
 xcap = "0.3"
 enigo = "0.3"
 
-# Wayland support (XDG desktop portals). `ashpd` is pure D-Bus; `pipewire`/`libspa`
-# bind libpipewire and are only pulled in by the `wayland-capture` feature.
-ashpd = { version = "0.13", optional = true, default-features = false, features = ["tokio", "remote_desktop", "screencast", "screenshot"] }
-pipewire = { version = "0.10", optional = true }
-libspa = { version = "0.10", optional = true }
+# Wayland support (XDG desktop portals + PipeWire) is Linux-only and always
+# built in there. `ashpd` is pure D-Bus; `pipewire`/`libspa` bind libpipewire, so
+# Linux builds need `libpipewire-0.3-dev` (installed by `run setup`).
+[target.'cfg(target_os = "linux")'.dependencies]
+ashpd = { version = "0.13", default-features = false, features = ["tokio", "remote_desktop", "screencast", "screenshot"] }
+pipewire = "0.10"
+libspa = "0.10"

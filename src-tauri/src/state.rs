@@ -36,6 +36,14 @@ pub struct ControllerConfig {
 	/// assume a direct connection.
 	#[serde(default)]
 	pub tailscale_auth_key: Option<String>,
+	/// Preferred RDP client: "auto" | "freerdp" | "remmina" | "gnome-connections",
+	/// or a custom command template (with {host} {port} {user} {password}).
+	#[serde(default)]
+	pub rdp_client: Option<String>,
+	/// Preferred terminal launcher for SSH, e.g. "gnome-terminal --" or
+	/// "xterm -e". Empty = auto-detect.
+	#[serde(default)]
+	pub terminal: Option<String>,
 }
 
 impl ControllerConfig {
@@ -48,6 +56,8 @@ impl ControllerConfig {
 			key_der: B64.encode(key_der),
 			advertise_addr: None,
 			tailscale_auth_key: None,
+			rdp_client: None,
+			terminal: None,
 		}
 	}
 

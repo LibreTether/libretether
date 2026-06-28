@@ -28,19 +28,6 @@ pub fn enable() -> Result<RdpInfo, String> {
 	}
 }
 
-/// The agent's first tailnet IPv4, used as the address the controller dials.
-fn tailscale_ip() -> Option<String> {
-	let out = Command::new("tailscale").args(["ip", "-4"]).output().ok()?;
-	if !out.status.success() {
-		return None;
-	}
-	String::from_utf8_lossy(&out.stdout)
-		.lines()
-		.next()
-		.map(|s| s.trim().to_string())
-		.filter(|s| !s.is_empty())
-}
-
 fn has(bin: &str) -> bool {
 	Command::new(bin).arg("--help").output().is_ok()
 }
@@ -69,7 +56,7 @@ fn enable_linux() -> Result<RdpInfo, String> {
 
 	Ok(RdpInfo {
 		backend: "gnome-remote-desktop".to_string(),
-		address: tailscale_ip(),
+		address: crate::host::tailscale_ip(),
 		port: RDP_PORT,
 		username,
 		password: Some(password),
@@ -140,7 +127,7 @@ fn enable_windows() -> Result<RdpInfo, String> {
 
 	Ok(RdpInfo {
 		backend: "windows".to_string(),
-		address: tailscale_ip(),
+		address: crate::host::tailscale_ip(),
 		port: RDP_PORT,
 		username: whoami::username(),
 		password: None, // use the machine's existing Windows account password

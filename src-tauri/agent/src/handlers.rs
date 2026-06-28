@@ -58,6 +58,7 @@ fn status() -> AgentStatus {
 		started_at: START_UNIX.get().copied().unwrap_or_else(host::now_secs),
 		boot_time_secs: host::boot_time_secs(),
 		displays: capture::display_count(),
+		tailscale_ip: host::tailscale_ip(),
 	}
 }
 

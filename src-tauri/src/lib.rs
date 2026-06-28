@@ -5,6 +5,7 @@ mod rdp;
 mod registry;
 mod server;
 mod session;
+mod ssh;
 mod state;
 mod tailscale;
 
@@ -56,6 +57,7 @@ pub fn run() {
 			commands::send_input,
 			commands::stop_control,
 			commands::connect_rdp,
+			commands::connect_ssh,
 			commands::save_text_file,
 			commands::controller_info,
 			commands::set_controller_settings,

@@ -23,6 +23,22 @@ fn os_label() -> String {
 	}
 }
 
+/// The agent's first tailnet IPv4, if Tailscale is up.
+pub fn tailscale_ip() -> Option<String> {
+	let out = std::process::Command::new("tailscale")
+		.args(["ip", "-4"])
+		.output()
+		.ok()?;
+	if !out.status.success() {
+		return None;
+	}
+	String::from_utf8_lossy(&out.stdout)
+		.lines()
+		.next()
+		.map(|s| s.trim().to_string())
+		.filter(|s| !s.is_empty())
+}
+
 /// Current unix time in seconds.
 pub fn now_secs() -> u64 {
 	SystemTime::now()

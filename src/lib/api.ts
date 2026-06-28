@@ -39,11 +39,16 @@ export const startControl = (id: string, opts: SessionOpts = {}) =>
 export const sendInput = (id: string, event: InputEvent) => invoke<void>("send_input", { event, id })
 export const stopControl = (id: string) => invoke<void>("stop_control", { id })
 export const connectRdp = (id: string) => invoke<void>("connect_rdp", { id })
+export const connectSsh = (id: string) => invoke<void>("connect_ssh", { id })
 
 // ---------------------------------------------------------------- controller
 export const controllerInfo = () => invoke<ControllerInfo>("controller_info")
-export const setControllerSettings = (advertiseAddr: string | null, tailscaleAuthKey: string | null) =>
-	invoke<void>("set_controller_settings", { advertiseAddr, tailscaleAuthKey })
+export const setControllerSettings = (settings: {
+	advertiseAddr: string | null
+	tailscaleAuthKey: string | null
+	rdpClient: string | null
+	terminal: string | null
+}) => invoke<void>("set_controller_settings", settings)
 export const saveTextFile = (path: string, contents: string) => invoke<void>("save_text_file", { contents, path })
 
 // ---------------------------------------------------------------- events

@@ -75,20 +75,24 @@ The agent detects the session at runtime and picks a backend:
   by `run setup`); `run build:agent` enables it via the `wayland-capture` feature. Without
   that feature the agent still does Wayland input + screenshots, just no live frames.
 
-### Two ways to take control
+### Ways to connect
+
+Every method rides Tailscale straight to the client's private IP — no extra tunneling.
 
 - **Live control (in-app)** — the controller streams frames and injects input over its own
   QUIC session, rendered inside the Tether window. On Wayland this uses the portals (one
   consent prompt per connect).
 - **RDP** — the **Connect via RDP** button enables an RDP server on the client and launches
-  your host's RDP viewer pointed at the client's tailnet IP. On Linux it drives
+  your host's RDP viewer at the client's tailnet IP. On Linux it drives
   **gnome-remote-desktop** (`grdctl`) with generated credentials, so there's **no per-connect
   consent prompt** and it sidesteps the Wayland portal entirely; on Windows it enables the
-  built-in Remote Desktop service (sign in with the PC's Windows account). Requirements: an
-  RDP client on the **controller** (FreeRDP — `freerdp3-x11`, installed by `run setup`) and
-  `gnome-remote-desktop` on **Linux clients** (installed by the deploy script). macOS has no
-  built-in RDP server. The connection rides Tailscale straight to the client's private IP —
-  no extra tunneling.
+  built-in Remote Desktop service. Choose your viewer on the **Controller** page — FreeRDP,
+  Remmina, GNOME Connections, or a custom command. Requirements: an RDP client on the
+  **controller** (FreeRDP installed by `run setup`) and `gnome-remote-desktop` on **Linux
+  clients** (installed by the deploy script). macOS has no built-in RDP server.
+- **SSH** — the **Connect via SSH** button opens your terminal running `ssh` to the client's
+  tailnet IP (as the agent's user). The client needs `sshd`; pick your terminal on the
+  Controller page (or it auto-detects gnome-terminal/konsole/xterm/…).
 
 ### Security
 
@@ -109,13 +113,17 @@ This is an early build. What works today:
 - ✅ Live online status, uptime, remote command execution, screenshots
 - ✅ **Live screen control** — streamed frames with mouse + keyboard takeover
 - ✅ **Wayland support** via XDG portals (X11 still supported too)
-- ✅ **RDP connect** — one-click into gnome-remote-desktop / Windows RDP over the tailnet
+- ✅ **RDP connect** — one-click into gnome-remote-desktop / Windows RDP, your choice of viewer
+- ✅ **SSH connect** — one-click terminal session to the client over the tailnet
+
+Releases publish the `tether-agent` binary for every platform
+(`tether-agent-linux-x86_64`, `-linux-aarch64`, `-macos-universal`,
+`-windows-x86_64.exe`) — point the deploy script's `TETHER_AGENT_URL` at the asset, or use
+a local build via `TETHER_AGENT_BIN`.
 
 Rough edges & next up: frame streaming is JPEG-over-QUIC (no delta/codec yet), input
-mapping is tuned for the primary display, the agent binary isn't published as a release
-yet (the deploy script takes it from `TETHER_AGENT_BIN`/`TETHER_AGENT_URL`), and the
-Wayland PipeWire capture (`src-tauri/agent/src/pwstream.rs`) is the newest piece and
-benefits from testing across compositors.
+mapping is tuned for the primary display, and the Wayland PipeWire capture
+(`src-tauri/agent/src/pwstream.rs`) benefits from testing across compositors.
 
 ## Quick start
 

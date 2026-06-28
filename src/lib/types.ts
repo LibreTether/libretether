@@ -16,6 +16,7 @@ export interface AgentStatus {
 	started_at: number
 	boot_time_secs: number | null
 	displays: number
+	tailscale_ip: string | null
 }
 
 export interface ClientDto {
@@ -47,6 +48,8 @@ export interface ControllerInfo {
 	tailscale: TailscaleInfo
 	advertise_addr: string | null
 	tailscale_auth_key: string | null
+	rdp_client: string | null
+	terminal: string | null
 }
 
 export interface ExecResult {

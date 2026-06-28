@@ -1,10 +1,12 @@
 import { writeText } from "@tauri-apps/plugin-clipboard-manager"
-import { Copy, Fingerprint, KeyRound, Network, RefreshCw, Save, Wifi, WifiOff } from "lucide-react"
+import { Copy, Fingerprint, KeyRound, Network, RefreshCw, Save, ScreenShare, Wifi, WifiOff } from "lucide-react"
 import { useCallback, useEffect, useState } from "react"
-import { Badge, Button, Field, Input } from "../components/ui"
+import { Badge, Button, Field, Input, Select } from "../components/ui"
 import * as api from "../lib/api"
 import { useToast } from "../lib/toast"
 import type { ControllerInfo } from "../lib/types"
+
+const RDP_PRESETS = ["", "auto", "freerdp", "remmina", "gnome-connections"]
 
 export function ControllerPage() {
 	const toast = useToast()
@@ -12,6 +14,9 @@ export function ControllerPage() {
 	const [busy, setBusy] = useState(true)
 	const [advertise, setAdvertise] = useState("")
 	const [authKey, setAuthKey] = useState("")
+	const [rdpMode, setRdpMode] = useState("auto")
+	const [rdpCustom, setRdpCustom] = useState("")
+	const [terminal, setTerminal] = useState("")
 	const [saving, setSaving] = useState(false)
 
 	const load = useCallback(() => {
@@ -21,6 +26,14 @@ export function ControllerPage() {
 				setInfo(i)
 				setAdvertise(i.advertise_addr ?? "")
 				setAuthKey(i.tailscale_auth_key ?? "")
+				setTerminal(i.terminal ?? "")
+				const rc = i.rdp_client ?? ""
+				if (RDP_PRESETS.includes(rc)) {
+					setRdpMode(rc || "auto")
+				} else {
+					setRdpMode("custom")
+					setRdpCustom(rc)
+				}
 			})
 			.catch((e) => toast.error("Couldn't load controller info", api.errString(e)))
 			.finally(() => setBusy(false))
@@ -32,9 +45,15 @@ export function ControllerPage() {
 
 	const save = async () => {
 		setSaving(true)
+		const rdpClient = rdpMode === "custom" ? rdpCustom.trim() || null : rdpMode === "auto" ? null : rdpMode
 		try {
-			await api.setControllerSettings(advertise || null, authKey || null)
-			toast.success("Saved", "New deploy scripts will use these settings.")
+			await api.setControllerSettings({
+				advertiseAddr: advertise || null,
+				rdpClient,
+				tailscaleAuthKey: authKey || null,
+				terminal: terminal || null
+			})
+			toast.success("Saved", "Settings updated.")
 			load()
 		} catch (e) {
 			toast.error("Couldn't save", api.errString(e))
@@ -102,6 +121,55 @@ export function ControllerPage() {
 									? "Mode: Tailscale — deploy scripts join the tailnet with this key, no client login."
 									: "Mode: direct — clients must already be able to reach the advertise address."}
 							</p>
+							<Button
+								icon={<Save className="h-4 w-4" />}
+								loading={saving}
+								onClick={save}
+								variant="primary"
+							>
+								Save
+							</Button>
+						</div>
+					</section>
+
+					<section className="card flex flex-col gap-4 p-5">
+						<div className="flex items-center gap-2.5">
+							<ScreenShare className="h-5 w-5 text-primary dark:text-primary-strong" />
+							<h2 className="font-semibold text-text">Remote clients</h2>
+						</div>
+
+						<Field hint="Which client the “Connect via RDP” button launches." label="RDP client">
+							<Select onChange={(e) => setRdpMode(e.target.value)} value={rdpMode}>
+								<option value="auto">Auto-detect</option>
+								<option value="freerdp">FreeRDP</option>
+								<option value="remmina">Remmina</option>
+								<option value="gnome-connections">GNOME Connections</option>
+								<option value="custom">Custom command…</option>
+							</Select>
+						</Field>
+
+						{rdpMode === "custom" && (
+							<Field hint="Placeholders: {host} {port} {user} {password}" label="Custom RDP command">
+								<Input
+									onChange={(e) => setRdpCustom(e.target.value)}
+									placeholder="e.g. remmina -c rdp://{user}:{password}@{host}:{port}"
+									value={rdpCustom}
+								/>
+							</Field>
+						)}
+
+						<Field
+							hint="Terminal that “Connect via SSH” opens. Leave blank to auto-detect; include the run flag, e.g. “xterm -e”."
+							label="Terminal (SSH)"
+						>
+							<Input
+								onChange={(e) => setTerminal(e.target.value)}
+								placeholder="auto-detect (gnome-terminal --, konsole -e, …)"
+								value={terminal}
+							/>
+						</Field>
+
+						<div className="flex justify-end">
 							<Button
 								icon={<Save className="h-4 w-4" />}
 								loading={saving}
