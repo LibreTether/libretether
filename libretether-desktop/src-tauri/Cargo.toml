@@ -13,14 +13,11 @@ rust-version = "1.77.2"
 name = "libretether_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
-[workspace]
-members = ["agent", "protocol", "relay"]
-
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-libretether-protocol = { path = "protocol" }
+libretether-protocol = { path = "../../libretether-protocol" }
 
 tauri = { version = "2", features = [] }
 tauri-plugin-dialog = "2"
@@ -41,10 +38,3 @@ base64 = "0.22"
 [features]
 # This feature is used for production builds or when a dev server is not running.
 custom-protocol = ["tauri/custom-protocol"]
-
-[profile.release]
-panic = "abort"
-codegen-units = 1
-lto = true
-opt-level = "s"
-strip = true

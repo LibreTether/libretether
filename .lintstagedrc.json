@@ -1,4 +1,4 @@
 {
 	"*": "biome check --write --no-errors-on-unmatched",
-	"src-tauri/**/*.rs": "rustfmt --edition 2021"
+	"**/*.rs": "rustfmt --edition 2021"
 }

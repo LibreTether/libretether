@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="public/libretether.svg" alt="LibreTether" width="120" />
+<img src="libretether-desktop/public/libretether.svg" alt="LibreTether" width="120" />
 
 # LibreTether
 
@@ -157,7 +157,7 @@ also published as a multi-arch container image at
 
 Rough edges & next up: frame streaming is JPEG-over-QUIC (no delta/codec yet), input
 mapping is tuned for the primary display, and the Wayland PipeWire capture
-(`src-tauri/agent/src/pwstream.rs`) benefits from testing across compositors.
+(`libretether-agent/src/pwstream.rs`) benefits from testing across compositors.
 
 ## Quick start
 
@@ -175,11 +175,11 @@ run dev
 run build
 
 # 4. Build the headless agent binary (ship this to the machines you control)
-run build:agent     # -> src-tauri/target/release/libretether-agent
+run build:agent     # -> target/release/libretether-agent
 ```
 
-> Without Runfile: `pnpm install`, then `pnpm exec tauri dev` / `pnpm exec tauri build`,
-> and `cargo build --manifest-path src-tauri/Cargo.toml -p libretether-agent --release`.
+> Without Runfile: `pnpm install`, then (from `libretether-desktop/`) `pnpm exec tauri dev` /
+> `pnpm exec tauri build`, and `cargo build -p libretether-agent --release`.
 
 ### Enrolling a machine
 
@@ -210,13 +210,16 @@ run lint          # auto-format & fix everything
 
 ### Layout
 
+A Cargo workspace (root `Cargo.toml`) ties the Rust crates together; the desktop app's
+frontend + Tauri shell live in `libretether-desktop/`.
+
 ```
-src/                     React UI (Vite + Tailwind v4)
-src-tauri/               Cargo workspace
-  src/                   controller app — QUIC server, registry, deploy scripts, commands
-  protocol/              shared wire protocol, QUIC transport, Ed25519 identity
-  agent/                 headless libretether-agent daemon (capture, input, service install)
-  server/                libretether-relay relay (optional, for relay mode)
+libretether-desktop/     desktop controller app
+  src/                   React UI (Vite + Tailwind v4)
+  src-tauri/             controller backend — QUIC server, registry, deploy scripts, commands
+libretether-protocol/    shared wire protocol, QUIC transport, Ed25519 identity
+libretether-agent/       headless libretether-agent daemon (capture, input, service install)
+libretether-relay/       libretether-relay relay (optional, for relay mode)
 ```
 
 ## License

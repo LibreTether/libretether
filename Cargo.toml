@@ -1,0 +1,18 @@
+[workspace]
+resolver = "2"
+members = [
+	"libretether-desktop/src-tauri",
+	"libretether-agent",
+	"libretether-protocol",
+	"libretether-relay",
+]
+
+# Applied workspace-wide (the relay/agent binaries and the desktop bundle all
+# ship from `--release`), matching the profile that previously lived on the
+# desktop crate when it was the workspace root.
+[profile.release]
+panic = "abort"
+codegen-units = 1
+lto = true
+opt-level = "s"
+strip = true

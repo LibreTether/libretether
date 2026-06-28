@@ -62,21 +62,21 @@ jobs:
         if: ${{ !matrix.universal }}
         shell: bash
         run: |
-          cargo build --manifest-path src-tauri/Cargo.toml -p libretether-agent -p libretether-relay --release
-          cp "src-tauri/target/release/libretether-agent${{ matrix.ext }}" "libretether-agent-${{ matrix.key }}${{ matrix.ext }}"
-          cp "src-tauri/target/release/libretether-relay${{ matrix.ext }}" "libretether-relay-${{ matrix.key }}${{ matrix.ext }}"
+          cargo build -p libretether-agent -p libretether-relay --release
+          cp "target/release/libretether-agent${{ matrix.ext }}" "libretether-agent-${{ matrix.key }}${{ matrix.ext }}"
+          cp "target/release/libretether-relay${{ matrix.ext }}" "libretether-relay-${{ matrix.key }}${{ matrix.ext }}"
 
       - name: Build agent + relay (universal macOS)
         if: ${{ matrix.universal }}
         shell: bash
         run: |
           rustup target add x86_64-apple-darwin aarch64-apple-darwin
-          cargo build --manifest-path src-tauri/Cargo.toml -p libretether-agent -p libretether-relay --release --target x86_64-apple-darwin
-          cargo build --manifest-path src-tauri/Cargo.toml -p libretether-agent -p libretether-relay --release --target aarch64-apple-darwin
+          cargo build -p libretether-agent -p libretether-relay --release --target x86_64-apple-darwin
+          cargo build -p libretether-agent -p libretether-relay --release --target aarch64-apple-darwin
           for bin in libretether-agent libretether-relay; do
             lipo -create -output "$bin-${{ matrix.key }}" \
-              "src-tauri/target/x86_64-apple-darwin/release/$bin" \
-              "src-tauri/target/aarch64-apple-darwin/release/$bin"
+              "target/x86_64-apple-darwin/release/$bin" \
+              "target/aarch64-apple-darwin/release/$bin"
           done
 
       - name: Upload to release

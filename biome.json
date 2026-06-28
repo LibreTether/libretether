@@ -23,8 +23,8 @@
 			"!**/dist",
 			"!**/node_modules",
 			"!**/*.svg",
-			"!src-tauri/target",
-			"!src-tauri/gen"
+			"!**/target",
+			"!libretether-desktop/src-tauri/gen"
 		]
 	},
 	"formatter": {

@@ -9,11 +9,17 @@ WORKDIR /build
 # Only the Cargo workspace is needed: the relay (`libretether-relay`) is a pure-Rust
 # QUIC server with no system dependencies, and `cargo build -p libretether-relay`
 # compiles just it and `libretether-protocol` — never the Tauri controller crate.
-COPY src-tauri ./src-tauri
+# Cargo still has to *load* every workspace member, so each member manifest must
+# be present; the desktop crate's source is never compiled (we only build -p relay).
+COPY Cargo.toml Cargo.lock ./
+COPY libretether-protocol ./libretether-protocol
+COPY libretether-agent ./libretether-agent
+COPY libretether-relay ./libretether-relay
+COPY libretether-desktop/src-tauri ./libretether-desktop/src-tauri
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,target=/build/src-tauri/target \
-    cargo build --manifest-path src-tauri/Cargo.toml -p libretether-relay --release \
- && cp src-tauri/target/release/libretether-relay /usr/local/bin/libretether-relay
+    --mount=type=cache,target=/build/target \
+    cargo build -p libretether-relay --release \
+ && cp target/release/libretether-relay /usr/local/bin/libretether-relay
 
 # ---- runtime -----------------------------------------------------------------
 FROM debian:bookworm-slim AS runtime

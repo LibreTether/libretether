@@ -6,7 +6,7 @@
 	"targets": {
 		"build": {
 			"commands": [
-				"tauri build {{ ARGS }}",
+				"pnpm -C libretether-desktop exec tauri build {{ ARGS }}",
 				{
 					"if": "{{ RUN.os == 'linux' }}",
 					"then": "@fix-appimage-icon"
@@ -15,44 +15,49 @@
 			"description": "Build the production controller bundle for the current OS"
 		},
 		"build:agent": {
-			"commands": "cargo build --manifest-path src-tauri/Cargo.toml -p libretether-agent --release {{ ARGS }}",
+			"commands": "cargo build -p libretether-agent --release {{ ARGS }}",
 			"description": "Build the headless libretether-agent daemon (release). On Linux this includes Wayland/PipeWire support (run `run setup` for libpipewire-0.3-dev)"
 		},
 		"build:relay": {
-			"commands": "cargo build --manifest-path src-tauri/Cargo.toml -p libretether-relay --release {{ ARGS }}",
+			"commands": "cargo build -p libretether-relay --release {{ ARGS }}",
 			"description": "Build the libretether-relay relay (release) to deploy on a public cloud host for relay mode"
 		},
 		"build:universal": {
-			"commands": "tauri build --target universal-apple-darwin {{ ARGS }}",
+			"commands": "pnpm -C libretether-desktop exec tauri build --target universal-apple-darwin {{ ARGS }}",
 			"description": "Build a universal (Intel + Apple Silicon) macOS bundle"
 		},
 		"build:web": {
-			"commands": "tsc --noEmit && vite build",
-			"description": "Type-check and build only the frontend bundle into dist/"
+			"commands": [
+				"pnpm -C libretether-desktop exec tsc --noEmit",
+				"pnpm -C libretether-desktop exec vite build"
+			],
+			"description": "Type-check and build only the frontend bundle into libretether-desktop/dist/"
 		},
 		"check": {
 			"commands": [
 				"biome check",
-				"tsc --noEmit",
-				"cargo fmt --manifest-path src-tauri/Cargo.toml --all -- --check",
-				"cargo clippy --manifest-path src-tauri/Cargo.toml --workspace --all-targets -- -D warnings"
+				"pnpm -C libretether-desktop exec tsc --noEmit",
+				"cargo fmt --all -- --check",
+				"cargo clippy --workspace --all-targets -- -D warnings"
 			],
 			"description": "Verify the code is correctly formatted, linted and type-checks (frontend + Rust workspace)"
 		},
 		"clean": {
-			"commands": ["rm -rf dist node_modules src-tauri/target"],
+			"commands": [
+				"rm -rf libretether-desktop/dist target node_modules libretether-desktop/node_modules"
+			],
 			"description": "Remove build artifacts (dist, node_modules, Rust target)"
 		},
 		"dev": {
-			"commands": "tauri dev {{ ARGS }}",
+			"commands": "pnpm -C libretether-desktop exec tauri dev {{ ARGS }}",
 			"description": "Run the full LibreTether controller (Rust backend + Vite frontend) with hot reload"
 		},
 		"dev:agent": {
-			"commands": "cargo run --manifest-path src-tauri/Cargo.toml -p libretether-agent -- {{ ARGS }}",
+			"commands": "cargo run -p libretether-agent -- {{ ARGS }}",
 			"description": "Run the headless agent from source (pass subcommands after --, e.g. run / enroll / status)"
 		},
 		"dev:web": {
-			"commands": "vite",
+			"commands": "pnpm -C libretether-desktop exec vite",
 			"description": "Run only the Vite dev server (UI preview; Tauri APIs unavailable)"
 		},
 		"docker:build": {
@@ -64,24 +69,21 @@
 			"description": "Repack built AppImages with a valid .DirIcon so file managers show the icon"
 		},
 		"icons": {
-			"commands": "tauri icon src-tauri/icons/source.png",
-			"description": "Regenerate app icons from src-tauri/icons/source.png"
+			"commands": "pnpm -C libretether-desktop exec tauri icon src-tauri/icons/source.png",
+			"description": "Regenerate app icons from libretether-desktop/src-tauri/icons/source.png"
 		},
 		"install": {
 			"commands": ["pnpm install", "pnpm exec husky"],
 			"description": "Install JS dependencies and set up git hooks (husky)"
 		},
 		"lint": {
-			"commands": [
-				"biome check --write",
-				"cargo fmt --manifest-path src-tauri/Cargo.toml --all"
-			],
+			"commands": ["biome check --write", "cargo fmt --all"],
 			"description": "Auto-format and fix the whole codebase (Biome for JS/CSS/JSON, rustfmt for Rust)"
 		},
 		"release": {
 			"commands": [
 				"{{ define(part, one_of(ARGS, 'major', 'minor', 'patch')) }}",
-				"{{ define(pkg, read_file('package.json')) }}",
+				"{{ define(pkg, read_file('libretether-desktop/package.json')) }}",
 				"{{ define(cur, regex_capture(VAR.pkg, '\"version\": \"([^\"]+)\"', '1')) }}",
 				{
 					"cases": {
@@ -91,14 +93,14 @@
 					},
 					"match": "{{ VAR.part }}"
 				},
-				"{{ write_file('package.json', regex_replace(VAR.pkg, '\"version\": \"[^\"]+\"', concat('\"version\": \"', VAR.new, '\"'))) }}",
-				"{{ write_file('src-tauri/tauri.conf.json', regex_replace(read_file('src-tauri/tauri.conf.json'), '\"version\": \"[^\"]+\"', concat('\"version\": \"', VAR.new, '\"'))) }}",
-				"{{ write_file('src-tauri/Cargo.toml', regex_replace(read_file('src-tauri/Cargo.toml'), '(?m)^version = \"[^\"]+\"', concat('version = \"', VAR.new, '\"'))) }}",
-				"cargo update --manifest-path src-tauri/Cargo.toml --workspace",
+				"{{ write_file('libretether-desktop/package.json', regex_replace(VAR.pkg, '\"version\": \"[^\"]+\"', concat('\"version\": \"', VAR.new, '\"'))) }}",
+				"{{ write_file('libretether-desktop/src-tauri/tauri.conf.json', regex_replace(read_file('libretether-desktop/src-tauri/tauri.conf.json'), '\"version\": \"[^\"]+\"', concat('\"version\": \"', VAR.new, '\"'))) }}",
+				"{{ write_file('libretether-desktop/src-tauri/Cargo.toml', regex_replace(read_file('libretether-desktop/src-tauri/Cargo.toml'), '(?m)^version = \"[^\"]+\"', concat('version = \"', VAR.new, '\"'))) }}",
+				"cargo update --workspace",
 				"echo 'Bumped: version {{ VAR.cur }} -> {{ VAR.new }}'",
 				"{{ define(tag, concat('v', VAR.new)) }}",
 				"echo Tagging {{ VAR.tag }}",
-				"git commit package.json src-tauri/Cargo.toml src-tauri/tauri.conf.json src-tauri/Cargo.lock -m {{ shell_quote(concat('chore: release ', VAR.tag)) }}",
+				"git commit libretether-desktop/package.json libretether-desktop/src-tauri/Cargo.toml libretether-desktop/src-tauri/tauri.conf.json Cargo.lock -m {{ shell_quote(concat('chore: release ', VAR.tag)) }}",
 				"git tag {{ shell_quote(VAR.tag) }}",
 				"git push",
 				"git push --tags"
@@ -121,10 +123,7 @@
 			"description": "Install system prerequisites (Tauri/WebKit deps) and JS dependencies"
 		},
 		"update-deps": {
-			"commands": [
-				"pnpm update --latest",
-				"cargo update --manifest-path src-tauri/Cargo.toml --workspace"
-			],
+			"commands": ["pnpm -r update --latest", "cargo update --workspace"],
 			"description": "Update JS dependencies to their latest versions and update Cargo crates"
 		}
 	}

@@ -12,8 +12,8 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
-BUNDLE_DIR="$PROJECT_DIR/src-tauri/target/release/bundle/appimage"
-ICON="$PROJECT_DIR/src-tauri/icons/icon.png"
+BUNDLE_DIR="$PROJECT_DIR/target/release/bundle/appimage"
+ICON="$PROJECT_DIR/libretether-desktop/src-tauri/icons/icon.png"
 
 shopt -s nullglob
 appimages=("$BUNDLE_DIR"/*.AppImage)

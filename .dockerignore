@@ -1,10 +1,8 @@
-# Keep the Docker build context tiny — the relay image only needs the Cargo
-# workspace. Everything else (frontend, build artifacts, git) is excluded so it
-# never bloats the context or busts layer caching.
-*
-!src-tauri
-
-# …but drop the heavy/irrelevant bits inside the workspace too.
-src-tauri/target
+# Keep the Docker build context small — the relay image only needs the Cargo
+# workspace source, never the frontend's deps, build artifacts, or git history.
+**/node_modules
+**/target
+**/dist
 **/*.swp
 .git
+.github

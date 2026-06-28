@@ -10,7 +10,7 @@ name = "libretether-relay"
 path = "src/main.rs"
 
 [dependencies]
-libretether-protocol = { path = "../protocol" }
+libretether-protocol = { path = "../libretether-protocol" }
 
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "io-util", "net", "sync"] }
 quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring", "log"] }
