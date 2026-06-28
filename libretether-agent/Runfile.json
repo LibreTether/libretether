@@ -1,0 +1,24 @@
+{
+	"$schema": "https://github.com/Skiley/runfile/releases/latest/download/v0.schema.json",
+	"targets": {
+		"build": {
+			"commands": "cargo build --release {{ ARGS }}",
+			"description": "Build the headless libretether-agent daemon (release). On Linux this includes Wayland/PipeWire support (run `run setup` for libpipewire-0.3-dev)"
+		},
+		"check": {
+			"commands": [
+				"cargo fmt -- --check",
+				"cargo clippy --all-targets -- -D warnings"
+			],
+			"description": "Format-check and lint just this crate"
+		},
+		"dev": {
+			"commands": "cargo run -- {{ ARGS }}",
+			"description": "Run the agent from source (pass subcommands directly, e.g. `run agent:dev enroll` / `run agent:dev run` / status / install)"
+		},
+		"test": {
+			"commands": "cargo test {{ ARGS }}",
+			"description": "Run the libretether-agent tests"
+		}
+	}
+}

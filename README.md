@@ -52,7 +52,7 @@ of the modes require the client to log in:
 
 ### Relay setup (`libretether-relay`)
 
-1. On a cloud host with a public IP, build/copy `libretether-relay` (`run build:relay`) and run
+1. On a cloud host with a public IP, build/copy `libretether-relay` (`run relay:build`) and run
    `libretether-relay run`. First run generates a config and prints an **owner secret** and an
    **agent secret**:
    ```
@@ -77,7 +77,7 @@ docker run -d --name libretether-relay -p 47600:47600/udp \
 
 The named volume (`/data`) keeps the generated config — the owner/agent secrets and the
 TLS cert — stable across restarts. QUIC is UDP, hence `-p 47600:47600/udp`. Build it
-yourself with `run docker:build` (or `docker build -t libretether-relay .`).
+yourself with `run relay:docker:build` (or `docker build -t libretether-relay .`).
 
 Authentication is layered: the secrets gate access to the relay, and the agent still proves
 its identity to the controller end-to-end with Ed25519 — the relay only forwards bytes.
@@ -175,7 +175,7 @@ run dev
 run build
 
 # 4. Build the headless agent binary (ship this to the machines you control)
-run build:agent     # -> target/release/libretether-agent
+run agent:build     # -> target/release/libretether-agent
 ```
 
 > Without Runfile: `pnpm install`, then (from `libretether-desktop/`) `pnpm exec tauri dev` /
@@ -202,16 +202,23 @@ run build:agent     # -> target/release/libretether-agent
 ## Development
 
 ```bash
-run dev           # controller with hot reload
-run dev:agent -- run     # run the agent from source (subcommands: enroll/run/status/install)
-run check         # biome + tsc + cargo fmt + clippy (the CI gate)
-run lint          # auto-format & fix everything
+run dev                  # controller with hot reload
+run agent:dev run        # run the agent from source (subcommands: enroll/run/status/install)
+run check                # biome + tsc + cargo fmt + clippy + license check (the CI gate)
+run lint                 # auto-format & fix everything
 ```
+
+The Runfile is a [workspace](https://github.com/Skiley/runfile): the root `Runfile.json`
+owns workspace-wide tasks (`install`, `setup`, `check`, `lint`, `release`, …) and includes one
+`Runfile.json` per submodule under a namespace. Each submodule's tasks run in its own directory,
+so they're invoked as `<namespace>:<task>` — e.g. `run agent:build`, `run relay:dev run`,
+`run relay:docker:build`, `run desktop:build:web`, `run protocol:check`. `run :list` shows them all.
 
 ### Layout
 
 A Cargo workspace (root `Cargo.toml`) ties the Rust crates together; the desktop app's
-frontend + Tauri shell live in `libretether-desktop/`.
+frontend + Tauri shell live in `libretether-desktop/`. Each submodule also carries its own
+`Runfile.json` (see [Development](#development)).
 
 ```
 libretether-desktop/     desktop controller app

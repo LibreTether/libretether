@@ -3,79 +3,40 @@
 	"globals": {
 		"addToPath": ["node_modules/.bin"]
 	},
+	"includes": [
+		{
+			"namespace": "desktop",
+			"path": "./libretether-desktop/Runfile.json"
+		},
+		{ "namespace": "agent", "path": "./libretether-agent/Runfile.json" },
+		{
+			"namespace": "protocol",
+			"path": "./libretether-protocol/Runfile.json"
+		},
+		{ "namespace": "relay", "path": "./libretether-relay/Runfile.json" }
+	],
 	"targets": {
 		"build": {
-			"commands": [
-				"pnpm -C libretether-desktop exec tauri build {{ ARGS }}",
-				{
-					"if": "{{ RUN.os == 'linux' }}",
-					"then": "@fix-appimage-icon"
-				}
-			],
-			"description": "Build the production controller bundle for the current OS"
-		},
-		"build:agent": {
-			"commands": "cargo build -p libretether-agent --release {{ ARGS }}",
-			"description": "Build the headless libretether-agent daemon (release). On Linux this includes Wayland/PipeWire support (run `run setup` for libpipewire-0.3-dev)"
-		},
-		"build:relay": {
-			"commands": "cargo build -p libretether-relay --release {{ ARGS }}",
-			"description": "Build the libretether-relay relay (release) to deploy on a public cloud host for relay mode"
-		},
-		"build:universal": {
-			"commands": "pnpm -C libretether-desktop exec tauri build --target universal-apple-darwin {{ ARGS }}",
-			"description": "Build a universal (Intel + Apple Silicon) macOS bundle"
-		},
-		"build:web": {
-			"commands": [
-				"pnpm -C libretether-desktop exec tsc --noEmit",
-				"pnpm -C libretether-desktop exec vite build"
-			],
-			"description": "Type-check and build only the frontend bundle into libretether-desktop/dist/"
+			"commands": "@desktop:build {{ ARGS }}",
+			"description": "Build the production desktop controller bundle (alias for `desktop:build`)"
 		},
 		"check": {
 			"commands": [
 				"biome check",
-				"pnpm -C libretether-desktop exec tsc --noEmit",
+				"@desktop:typecheck",
 				"cargo fmt --all -- --check",
 				"cargo clippy --workspace --all-targets -- -D warnings",
 				"@check:licenses"
 			],
-			"description": "Verify the code is correctly formatted, linted and type-checks (frontend + Rust workspace)"
+			"description": "Workspace gate: format, lint, type-check, and license-check everything (frontend + Rust workspace)"
 		},
 		"check:licenses": {
 			"commands": "node scripts/check-licenses.mjs",
 			"description": "Verify every Rust + JS dependency license is compatible with the project's AGPL-3.0 license"
 		},
 		"clean": {
-			"commands": [
-				"rm -rf libretether-desktop/dist target node_modules libretether-desktop/node_modules"
-			],
-			"description": "Remove build artifacts (dist, node_modules, Rust target)"
-		},
-		"dev": {
-			"commands": "pnpm -C libretether-desktop exec tauri dev {{ ARGS }}",
-			"description": "Run the full LibreTether controller (Rust backend + Vite frontend) with hot reload"
-		},
-		"dev:agent": {
-			"commands": "cargo run -p libretether-agent -- {{ ARGS }}",
-			"description": "Run the headless agent from source (pass subcommands after --, e.g. run / enroll / status)"
-		},
-		"dev:web": {
-			"commands": "pnpm -C libretether-desktop exec vite",
-			"description": "Run only the Vite dev server (UI preview; Tauri APIs unavailable)"
-		},
-		"docker:build": {
-			"commands": "docker build -t libretether-relay:latest {{ ARGS }} .",
-			"description": "Build the libretether-relay relay Docker image locally (published to ghcr.io/<owner>/libretether-relay on release)"
-		},
-		"fix-appimage-icon": {
-			"commands": "bash scripts/fix-appimage.sh",
-			"description": "Repack built AppImages with a valid .DirIcon so file managers show the icon"
-		},
-		"icons": {
-			"commands": "pnpm -C libretether-desktop exec tauri icon src-tauri/icons/source.png",
-			"description": "Regenerate app icons from libretether-desktop/src-tauri/icons/source.png"
+			"commands": "rm -rf target node_modules libretether-desktop/node_modules libretether-desktop/dist",
+			"description": "Remove build artifacts (Rust target, node_modules, dist)"
 		},
 		"install": {
 			"commands": ["pnpm install", "pnpm exec husky"],
@@ -83,7 +44,7 @@
 		},
 		"lint": {
 			"commands": ["biome check --write", "cargo fmt --all"],
-			"description": "Auto-format and fix the whole codebase (Biome for JS/CSS/JSON, rustfmt for Rust)"
+			"description": "Auto-format & fix the whole workspace (Biome for JS/CSS/JSON, rustfmt for Rust)"
 		},
 		"release": {
 			"commands": [
@@ -126,6 +87,10 @@
 				"@install"
 			],
 			"description": "Install system prerequisites (Tauri/WebKit deps) and JS dependencies"
+		},
+		"test": {
+			"commands": "cargo test --workspace {{ ARGS }}",
+			"description": "Run the whole Rust workspace's tests"
 		},
 		"update-deps": {
 			"commands": ["pnpm -r update --latest", "cargo update --workspace"],

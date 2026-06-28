@@ -1,0 +1,28 @@
+{
+	"$schema": "https://github.com/Skiley/runfile/releases/latest/download/v0.schema.json",
+	"targets": {
+		"build": {
+			"commands": "cargo build --release {{ ARGS }}",
+			"description": "Build the libretether-relay relay (release) to deploy on a public cloud host for relay mode"
+		},
+		"check": {
+			"commands": [
+				"cargo fmt -- --check",
+				"cargo clippy --all-targets -- -D warnings"
+			],
+			"description": "Format-check and lint just this crate"
+		},
+		"dev": {
+			"commands": "cargo run -- {{ ARGS }}",
+			"description": "Run the relay from source (pass subcommands directly, e.g. `run relay:dev run` / `run relay:dev info`)"
+		},
+		"docker:build": {
+			"commands": "docker build -t libretether-relay:latest -f ../Dockerfile {{ ARGS }} ..",
+			"description": "Build the libretether-relay Docker image locally (context is the workspace root; published to ghcr.io/<owner>/libretether-relay on release)"
+		},
+		"test": {
+			"commands": "cargo test {{ ARGS }}",
+			"description": "Run the libretether-relay tests"
+		}
+	}
+}

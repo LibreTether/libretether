@@ -1,0 +1,53 @@
+{
+	"$schema": "https://github.com/Skiley/runfile/releases/latest/download/v0.schema.json",
+	"globals": {
+		"addToPath": ["node_modules/.bin"]
+	},
+	"targets": {
+		"build": {
+			"commands": [
+				"tauri build {{ ARGS }}",
+				{
+					"if": "{{ RUN.os == 'linux' }}",
+					"then": "@fix-appimage"
+				}
+			],
+			"description": "Build the production controller bundle for the current OS"
+		},
+		"build:universal": {
+			"commands": "tauri build --target universal-apple-darwin {{ ARGS }}",
+			"description": "Build a universal (Intel + Apple Silicon) macOS bundle"
+		},
+		"build:web": {
+			"commands": ["tsc --noEmit", "vite build"],
+			"description": "Type-check and build only the frontend bundle into dist/"
+		},
+		"check": {
+			"commands": [
+				"tsc --noEmit",
+				"cargo clippy -p libretether --all-targets -- -D warnings"
+			],
+			"description": "Type-check the frontend and lint the desktop crate"
+		},
+		"dev": {
+			"commands": "tauri dev {{ ARGS }}",
+			"description": "Run the full controller (Rust backend + Vite frontend) with hot reload"
+		},
+		"dev:web": {
+			"commands": "vite",
+			"description": "Run only the Vite dev server (UI preview; Tauri APIs unavailable)"
+		},
+		"fix-appimage": {
+			"commands": "bash ../scripts/fix-appimage.sh",
+			"description": "Repack built AppImages with a valid .DirIcon so file managers show the icon"
+		},
+		"icons": {
+			"commands": "tauri icon src-tauri/icons/source.png",
+			"description": "Regenerate app icons from src-tauri/icons/source.png"
+		},
+		"typecheck": {
+			"commands": "tsc --noEmit",
+			"description": "Type-check the frontend (tsc --noEmit)"
+		}
+	}
+}
