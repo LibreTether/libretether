@@ -1,0 +1,282 @@
+//! Tether relay (`tether-server`).
+//!
+//! Run this on a public cloud host. The controller and the agents all dial out
+//! to it; it authenticates each side (owner secret vs agent secret), tracks
+//! agents by Ed25519 public key, and pipes streams between the controller and
+//! the addressed agent. It never inspects stream contents — the Tether handshake,
+//! control RPCs, live session and TCP tunnels are all end-to-end.
+
+use std::collections::HashMap;
+use std::net::SocketAddr;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+
+use anyhow::{Context, Result};
+use base64::engine::general_purpose::STANDARD as B64;
+use base64::Engine;
+use clap::{Parser, Subcommand};
+use quinn::{Endpoint, RecvStream, SendStream};
+use serde::{Deserialize, Serialize};
+use tether_protocol::crypto::random_alnum;
+use tether_protocol::frame::{read_frame, write_frame};
+use tether_protocol::relay::{RelayAck, RelayEvent, RelayHello, RelayRole, RouteTo};
+use tether_protocol::{tls, DEFAULT_PORT};
+use tokio::sync::mpsc::UnboundedSender;
+
+#[derive(Serialize, Deserialize)]
+struct ServerConfig {
+	listen_addr: String,
+	owner_secret: String,
+	agent_secret: String,
+	cert_der: String,
+	key_der: String,
+}
+
+impl ServerConfig {
+	fn generate() -> Self {
+		let (cert_der, key_der) = tls::self_signed();
+		Self {
+			listen_addr: format!("0.0.0.0:{DEFAULT_PORT}"),
+			owner_secret: random_alnum(24),
+			agent_secret: random_alnum(24),
+			cert_der: B64.encode(cert_der),
+			key_der: B64.encode(key_der),
+		}
+	}
+
+	fn cert_key(&self) -> Result<(Vec<u8>, Vec<u8>)> {
+		Ok((B64.decode(&self.cert_der)?, B64.decode(&self.key_der)?))
+	}
+}
+
+fn config_path(arg: Option<PathBuf>) -> PathBuf {
+	arg.unwrap_or_else(|| {
+		dirs::config_dir()
+			.unwrap_or_else(|| PathBuf::from("."))
+			.join("tether-server")
+			.join("config.json")
+	})
+}
+
+fn load_or_create(path: &PathBuf) -> Result<ServerConfig> {
+	match std::fs::read_to_string(path) {
+		Ok(raw) => serde_json::from_str(&raw).context("parsing server config"),
+		Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+			let cfg = ServerConfig::generate();
+			if let Some(dir) = path.parent() {
+				std::fs::create_dir_all(dir)?;
+			}
+			std::fs::write(path, serde_json::to_string_pretty(&cfg)?)?;
+			Ok(cfg)
+		}
+		Err(e) => Err(e.into()),
+	}
+}
+
+// ---------------------------------------------------------------- relay state
+
+#[derive(Clone, Default)]
+struct Relay {
+	agents: Arc<Mutex<HashMap<String, quinn::Connection>>>,
+	controller: Arc<Mutex<Option<UnboundedSender<RelayEvent>>>>,
+}
+
+impl Relay {
+	fn agent(&self, public_key: &str) -> Option<quinn::Connection> {
+		self.agents.lock().unwrap().get(public_key).cloned()
+	}
+
+	fn notify(&self, event: RelayEvent) {
+		if let Some(tx) = self.controller.lock().unwrap().as_ref() {
+			let _ = tx.send(event);
+		}
+	}
+}
+
+#[derive(Parser)]
+#[command(name = "tether-server", version, about = "Tether relay server")]
+struct Cli {
+	/// Path to the server config file.
+	#[arg(long, global = true)]
+	config: Option<PathBuf>,
+
+	#[command(subcommand)]
+	command: Command,
+}
+
+#[derive(Subcommand)]
+enum Command {
+	/// Run the relay.
+	Run {
+		/// Override the listen address (e.g. 0.0.0.0:47600).
+		#[arg(long)]
+		listen: Option<String>,
+	},
+	/// Print the listen address and the owner/agent secrets.
+	Info,
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+	let cli = Cli::parse();
+	let path = config_path(cli.config.clone());
+	let mut cfg = load_or_create(&path)?;
+
+	match cli.command {
+		Command::Info => {
+			print_credentials(&cfg);
+			Ok(())
+		}
+		Command::Run { listen } => {
+			if let Some(listen) = listen {
+				cfg.listen_addr = listen;
+			}
+			run(cfg).await
+		}
+	}
+}
+
+fn print_credentials(cfg: &ServerConfig) {
+	println!("listen:       {}", cfg.listen_addr);
+	println!("owner secret: {}", cfg.owner_secret);
+	println!("agent secret: {}", cfg.agent_secret);
+	println!();
+	println!("Point the controller at this host with the owner secret, and");
+	println!("deploy clients with the agent secret.");
+}
+
+async fn run(cfg: ServerConfig) -> Result<()> {
+	let (cert, key) = cfg.cert_key()?;
+	let addr: SocketAddr = cfg.listen_addr.parse().context("invalid listen address")?;
+	let endpoint = Endpoint::server(tls::server_config(cert, key), addr)?;
+	eprintln!("[tether-server] relay listening on udp/{addr}");
+	print_credentials(&cfg);
+
+	let relay = Relay::default();
+	let secrets = Arc::new((cfg.owner_secret, cfg.agent_secret));
+
+	while let Some(incoming) = endpoint.accept().await {
+		let relay = relay.clone();
+		let secrets = secrets.clone();
+		tokio::spawn(async move {
+			if let Err(e) = handle(relay, incoming, &secrets).await {
+				eprintln!("[tether-server] connection error: {e}");
+			}
+		});
+	}
+	Ok(())
+}
+
+async fn handle(relay: Relay, incoming: quinn::Incoming, secrets: &(String, String)) -> Result<()> {
+	let conn = incoming.accept()?.await?;
+	let (mut send, mut recv) = conn.accept_bi().await.context("accept hello stream")?;
+	let hello: RelayHello = read_frame(&mut recv).await?;
+
+	let (expected, role_ok) = match hello.role {
+		RelayRole::Controller => (&secrets.0, "controller"),
+		RelayRole::Agent => (&secrets.1, "agent"),
+	};
+	if &hello.secret != expected {
+		let _ = write_frame(
+			&mut send,
+			&RelayAck {
+				accepted: false,
+				reason: Some("bad secret".into()),
+			},
+		)
+		.await;
+		return Ok(());
+	}
+	write_frame(
+		&mut send,
+		&RelayAck {
+			accepted: true,
+			reason: None,
+		},
+	)
+	.await?;
+	eprintln!(
+		"[tether-server] {role_ok} connected ({}…)",
+		&hello.public_key.chars().take(8).collect::<String>()
+	);
+
+	match hello.role {
+		RelayRole::Controller => serve_controller(relay, conn, send).await,
+		RelayRole::Agent => serve_agent(relay, conn, hello.public_key).await,
+	}
+}
+
+/// The controller pushes presence events out on `events`, and opens one routed
+/// bi stream per request which we pipe to the addressed agent.
+async fn serve_controller(relay: Relay, conn: quinn::Connection, mut events: SendStream) -> Result<()> {
+	let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<RelayEvent>();
+
+	// Announce agents that are already connected, then install the sender.
+	{
+		let agents = relay.agents.lock().unwrap();
+		for key in agents.keys() {
+			let _ = tx.send(RelayEvent::AgentOnline {
+				public_key: key.clone(),
+			});
+		}
+	}
+	*relay.controller.lock().unwrap() = Some(tx);
+
+	// Forward presence events to the controller.
+	let events_task = tokio::spawn(async move {
+		while let Some(event) = rx.recv().await {
+			if write_frame(&mut events, &event).await.is_err() {
+				break;
+			}
+		}
+	});
+
+	// Route each stream the controller opens to the named agent.
+	loop {
+		let (c_send, mut c_recv) = match conn.accept_bi().await {
+			Ok(pair) => pair,
+			Err(_) => break,
+		};
+		let relay = relay.clone();
+		tokio::spawn(async move {
+			let Ok(route) = read_frame::<_, RouteTo>(&mut c_recv).await else {
+				return;
+			};
+			let Some(agent) = relay.agent(&route.agent) else {
+				return;
+			};
+			if let Ok((a_send, a_recv)) = agent.open_bi().await {
+				pipe(c_recv, a_send, a_recv, c_send).await;
+			}
+		});
+	}
+
+	relay.controller.lock().unwrap().take();
+	events_task.abort();
+	Ok(())
+}
+
+async fn serve_agent(relay: Relay, conn: quinn::Connection, public_key: String) -> Result<()> {
+	relay.agents.lock().unwrap().insert(public_key.clone(), conn.clone());
+	relay.notify(RelayEvent::AgentOnline {
+		public_key: public_key.clone(),
+	});
+
+	conn.closed().await;
+
+	relay.agents.lock().unwrap().remove(&public_key);
+	relay.notify(RelayEvent::AgentOffline { public_key });
+	Ok(())
+}
+
+/// Pipe a controller stream and an agent stream together until either closes.
+async fn pipe(mut c_recv: RecvStream, mut a_send: SendStream, mut a_recv: RecvStream, mut c_send: SendStream) {
+	let up = tokio::io::copy(&mut c_recv, &mut a_send);
+	let down = tokio::io::copy(&mut a_recv, &mut c_send);
+	tokio::select! {
+		_ = up => {}
+		_ = down => {}
+	}
+	let _ = a_send.finish();
+	let _ = c_send.finish();
+}

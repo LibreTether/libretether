@@ -9,6 +9,7 @@ use std::time::Duration;
 use anyhow::{anyhow, Context, Result};
 use quinn::{Endpoint, RecvStream, SendStream};
 use tether_protocol::frame::{read_frame, write_frame};
+use tether_protocol::relay::{RelayAck, RelayHello, RelayRole};
 use tether_protocol::{tls, Challenge, ControlRequest, Hello, HelloAck, StreamOpen, PROTOCOL_VERSION};
 
 use crate::config::AgentConfig;
@@ -30,10 +31,11 @@ pub async fn run(cfg_path: PathBuf) -> Result<()> {
 	let mut cfg = AgentConfig::load(&cfg_path)?;
 	handlers::mark_start();
 	let endpoint = make_endpoint()?;
-	log(&format!(
-		"agent {AGENT_VERSION} starting; controller = {}",
-		cfg.controller_addr
-	));
+	let target = match cfg.relay() {
+		Some(relay) => format!("relay {relay}"),
+		None => format!("controller {}", cfg.controller_addr),
+	};
+	log(&format!("agent {AGENT_VERSION} starting; {target}"));
 
 	let mut backoff = 1u64;
 	loop {
@@ -58,13 +60,54 @@ fn make_endpoint() -> Result<Endpoint> {
 }
 
 async fn connect_once(endpoint: &Endpoint, cfg: &mut AgentConfig, cfg_path: &PathBuf) -> Result<()> {
+	let conn = match cfg.relay() {
+		Some(relay) => connect_relay(endpoint, cfg, relay).await?,
+		None => connect_direct(endpoint, cfg).await?,
+	};
+	serve(conn, cfg, cfg_path).await
+}
+
+async fn connect_direct(endpoint: &Endpoint, cfg: &AgentConfig) -> Result<quinn::Connection> {
 	let addr = resolve(&cfg.controller_addr).await?;
 	log(&format!("dialing controller at {addr}"));
-	let connecting = endpoint.connect(addr, &cfg.server_name)?;
-	let conn = tokio::time::timeout(Duration::from_secs(CONNECT_TIMEOUT_SECS), connecting)
+	dial(endpoint, addr, &cfg.server_name).await
+}
+
+/// Dial the relay and register as an agent; the controller's streams will then
+/// arrive piped through it.
+async fn connect_relay(endpoint: &Endpoint, cfg: &AgentConfig, relay: &str) -> Result<quinn::Connection> {
+	let addr = resolve(relay).await?;
+	log(&format!("dialing relay at {addr}"));
+	let conn = dial(endpoint, addr, &cfg.server_name).await?;
+
+	let identity = cfg.identity()?;
+	let (mut send, mut recv) = conn.open_bi().await.context("opening relay hello stream")?;
+	let hello = RelayHello {
+		role: RelayRole::Agent,
+		secret: cfg.relay_secret.clone().unwrap_or_default(),
+		public_key: identity.public_b64(),
+	};
+	write_frame(&mut send, &hello).await.context("sending relay hello")?;
+	let ack: RelayAck = read_frame(&mut recv).await.context("reading relay ack")?;
+	if !ack.accepted {
+		return Err(anyhow!("relay rejected agent: {}", ack.reason.unwrap_or_default()));
+	}
+	log("registered with relay; awaiting controller");
+	Ok(conn)
+}
+
+async fn dial(endpoint: &Endpoint, addr: SocketAddr, server_name: &str) -> Result<quinn::Connection> {
+	let connecting = endpoint.connect(addr, server_name)?;
+	tokio::time::timeout(Duration::from_secs(CONNECT_TIMEOUT_SECS), connecting)
 		.await
 		.map_err(|_| anyhow!("dial timed out after {CONNECT_TIMEOUT_SECS}s"))?
-		.context("quic handshake")?;
+		.context("quic handshake")
+}
+
+/// Complete the controller handshake, then service control/session/tunnel
+/// streams until the connection ends. In relay mode the controller's streams
+/// arrive piped through the relay; the logic is identical.
+async fn serve(conn: quinn::Connection, cfg: &mut AgentConfig, cfg_path: &PathBuf) -> Result<()> {
 	log("connected; awaiting challenge");
 
 	// Handshake stream is opened by the controller.
@@ -132,7 +175,29 @@ async fn handle_stream(mut send: SendStream, mut recv: RecvStream) {
 				log(&format!("session ended: {e}"));
 			}
 		}
+		StreamOpen::Tunnel { port } => tunnel(port, send, recv).await,
 		StreamOpen::Handshake => log("unexpected handshake stream after auth"),
+	}
+}
+
+/// Pipe a QUIC stream to a local TCP port (the client's RDP/SSH server) — used
+/// to reach the client through the relay.
+async fn tunnel(port: u16, mut q_send: SendStream, mut q_recv: RecvStream) {
+	match tokio::net::TcpStream::connect(("127.0.0.1", port)).await {
+		Ok(tcp) => {
+			let (mut tcp_read, mut tcp_write) = tcp.into_split();
+			let up = tokio::io::copy(&mut q_recv, &mut tcp_write);
+			let down = tokio::io::copy(&mut tcp_read, &mut q_send);
+			tokio::select! {
+				_ = up => {}
+				_ = down => {}
+			}
+			let _ = q_send.finish();
+		}
+		Err(e) => {
+			log(&format!("tunnel to 127.0.0.1:{port} failed: {e}"));
+			let _ = q_send.finish();
+		}
 	}
 }
 

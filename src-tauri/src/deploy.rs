@@ -2,47 +2,68 @@
 //! machine reachable by the controller, installs the agent binary, then enrolls
 //! it and registers the always-on background service.
 //!
-//! Connectivity has two modes, neither of which requires the client to log in:
-//! - **Tailscale auth key** — when the controller has a pre-auth key configured,
-//!   the script joins the tailnet non-interactively (`tailscale up --reset --authkey`).
-//! - **Direct** — otherwise the agent just dials the controller's address, which
-//!   must be reachable (same LAN, an existing VPN, or a port-forward).
+//! Three connection modes, none of which requires the client to log in:
+//! - **Tailscale auth key** — the script joins the tailnet non-interactively.
+//! - **Direct** — the agent dials the controller's reachable address.
+//! - **Relay** — the agent dials out to a `tether-server` relay; nothing on the
+//!   client (or controller) needs to be exposed.
 //!
-//! We do not host the agent binary ourselves (no cloud), so the script takes it
-//! from `TETHER_AGENT_BIN` (a local path) or `TETHER_AGENT_URL` (a release asset).
+//! We do not host the agent binary, so the script takes it from
+//! `TETHER_AGENT_BIN` (a local path) or `TETHER_AGENT_URL` (a release asset).
 
 use crate::registry::ClientOs;
 
-/// Render the deploy script for a client. `auth_key` is the optional Tailscale
-/// pre-auth key; when `None`, a direct connection is assumed.
-pub fn script(name: &str, os: ClientOs, controller_addr: &str, token: &str, auth_key: Option<&str>) -> String {
+/// Where the client should connect, and how it enrols.
+pub enum DeployTarget {
+	/// Dial the controller directly (optionally joining Tailscale first).
+	Controller { address: String, auth_key: Option<String> },
+	/// Dial the relay (`tether-server`) with an agent secret.
+	Relay { address: String, agent_secret: String },
+}
+
+impl DeployTarget {
+	fn address(&self) -> &str {
+		match self {
+			DeployTarget::Controller { address, .. } | DeployTarget::Relay { address, .. } => address,
+		}
+	}
+}
+
+/// Render the deploy script for a client.
+pub fn script(name: &str, os: ClientOs, token: &str, target: &DeployTarget) -> String {
 	let template = match os {
 		ClientOs::Linux => LINUX,
 		ClientOs::Macos => MACOS,
 		ClientOs::Windows => WINDOWS,
 	};
 	template
-		.replace("__CONNECT_BLOCK__", &connect_block(os, controller_addr, auth_key))
+		.replace("__CONNECT_BLOCK__", &connect_block(os, target))
+		.replace("__ENROLL__", &enroll_cmd(os, target))
 		.replace("__NAME__", name)
-		.replace("__CONTROLLER__", controller_addr)
+		.replace("__CONTROLLER__", target.address())
 		.replace("__TOKEN__", token)
 }
 
 /// The connectivity section, which differs by OS and mode.
-fn connect_block(os: ClientOs, controller_addr: &str, auth_key: Option<&str>) -> String {
-	match (os, auth_key) {
-		(ClientOs::Windows, Some(key)) => format!(
+fn connect_block(os: ClientOs, target: &DeployTarget) -> String {
+	let win = matches!(os, ClientOs::Windows);
+	match target {
+		DeployTarget::Relay { address, .. } => format!(
+			"# 1. This client dials out to the relay at {address} — nothing on this\n\
+			 #    machine needs to be exposed or port-forwarded."
+		),
+		DeployTarget::Controller { address, auth_key: None } => format!(
+			"# 1. Direct connection — this machine must be able to reach the controller at\n\
+			 #    {address} (same LAN, an existing VPN, or a port-forward). No Tailscale needed."
+		),
+		DeployTarget::Controller { auth_key: Some(key), .. } if win => format!(
 			"# 1. Join the controller's Tailscale network with a pre-auth key (no login).\n\
 			 if (-not (Get-Command tailscale -ErrorAction SilentlyContinue)) {{\n\
 			 \u{20}\u{20}Write-Host \"!! Install Tailscale from https://tailscale.com/download/windows, then re-run.\" -ForegroundColor Yellow; exit 1\n\
 			 }}\n\
 			 tailscale up --reset --authkey \"{key}\""
 		),
-		(ClientOs::Windows, None) => format!(
-			"# 1. Direct connection — this machine must be able to reach the controller at\n\
-			 #    {controller_addr} (same LAN, an existing VPN, or a port-forward). No Tailscale needed."
-		),
-		(_, Some(key)) => format!(
+		DeployTarget::Controller { auth_key: Some(key), .. } => format!(
 			"# 1. Join the controller's Tailscale network with a pre-auth key (no login).\n\
 			 if ! command -v tailscale >/dev/null 2>&1; then\n\
 			 \u{20}\u{20}echo \"==> Installing Tailscale\"\n\
@@ -50,10 +71,24 @@ fn connect_block(os: ClientOs, controller_addr: &str, auth_key: Option<&str>) ->
 			 fi\n\
 			 sudo tailscale up --reset --authkey \"{key}\""
 		),
-		(_, None) => format!(
-			"# 1. Direct connection — this machine must be able to reach the controller at\n\
-			 #    {controller_addr} (same LAN, an existing VPN, or a port-forward). No Tailscale needed."
-		),
+	}
+}
+
+/// The enrollment command, which differs by OS shell and mode.
+fn enroll_cmd(os: ClientOs, target: &DeployTarget) -> String {
+	match (os, target) {
+		(ClientOs::Windows, DeployTarget::Relay { agent_secret, .. }) => {
+			format!("& $Bin enroll --relay $Controller --relay-secret \"{agent_secret}\" --token $Token")
+		}
+		(ClientOs::Windows, DeployTarget::Controller { .. }) => {
+			"& $Bin enroll --controller $Controller --token $Token".to_string()
+		}
+		(_, DeployTarget::Relay { agent_secret, .. }) => {
+			format!("\"$BIN\" enroll --relay \"$CONTROLLER\" --relay-secret \"{agent_secret}\" --token \"$TOKEN\"")
+		}
+		(_, DeployTarget::Controller { .. }) => {
+			"\"$BIN\" enroll --controller \"$CONTROLLER\" --token \"$TOKEN\"".to_string()
+		}
 	}
 }
 
@@ -98,8 +133,8 @@ else
   exit 1
 fi
 
-# 4. Enroll with the controller and install the always-on service.
-"$BIN" enroll --controller "$CONTROLLER" --token "$TOKEN"
+# 4. Enroll and install the always-on service.
+__ENROLL__
 "$BIN" install
 
 echo "==> Done. __NAME__ is now reachable from your Tether controller."
@@ -132,7 +167,7 @@ else
 fi
 
 # 3. Enroll and install the LaunchAgent.
-"$BIN" enroll --controller "$CONTROLLER" --token "$TOKEN"
+__ENROLL__
 "$BIN" install
 
 echo "==> Done. Grant Screen Recording + Accessibility to tether-agent in System Settings > Privacy."
@@ -166,7 +201,7 @@ if ($env:TETHER_AGENT_BIN) {
 }
 
 # 3. Enroll and register the logon task.
-& $Bin enroll --controller $Controller --token $Token
+__ENROLL__
 & $Bin install
 
 Write-Host "==> Done. __NAME__ is now reachable from your Tether controller."

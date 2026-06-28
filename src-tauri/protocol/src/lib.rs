@@ -15,6 +15,7 @@
 
 pub mod crypto;
 pub mod frame;
+pub mod relay;
 pub mod tls;
 
 use serde::{Deserialize, Serialize};
@@ -82,6 +83,9 @@ pub enum StreamOpen {
 	Control,
 	/// A live screen-control session (full-duplex [`SessionClient`]/[`SessionServer`]).
 	Session,
+	/// A raw TCP tunnel: the agent connects to `127.0.0.1:port` and pipes bytes
+	/// both ways (used to reach the client's RDP/SSH server through the relay).
+	Tunnel { port: u16 },
 }
 
 // ---------------------------------------------------------------- control RPC

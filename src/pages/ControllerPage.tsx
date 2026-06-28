@@ -1,5 +1,5 @@
 import { writeText } from "@tauri-apps/plugin-clipboard-manager"
-import { Copy, Fingerprint, KeyRound, Network, RefreshCw, Save, ScreenShare, Wifi, WifiOff } from "lucide-react"
+import { Copy, Fingerprint, KeyRound, Network, RefreshCw, Save, ScreenShare, Server, Wifi, WifiOff } from "lucide-react"
 import { useCallback, useEffect, useState } from "react"
 import { Badge, Button, Field, Input, Select } from "../components/ui"
 import * as api from "../lib/api"
@@ -17,6 +17,9 @@ export function ControllerPage() {
 	const [rdpMode, setRdpMode] = useState("auto")
 	const [rdpCustom, setRdpCustom] = useState("")
 	const [terminal, setTerminal] = useState("")
+	const [relayAddr, setRelayAddr] = useState("")
+	const [relayOwner, setRelayOwner] = useState("")
+	const [relayAgent, setRelayAgent] = useState("")
 	const [saving, setSaving] = useState(false)
 
 	const load = useCallback(() => {
@@ -27,6 +30,9 @@ export function ControllerPage() {
 				setAdvertise(i.advertise_addr ?? "")
 				setAuthKey(i.tailscale_auth_key ?? "")
 				setTerminal(i.terminal ?? "")
+				setRelayAddr(i.relay_addr ?? "")
+				setRelayOwner(i.relay_owner_secret ?? "")
+				setRelayAgent(i.relay_agent_secret ?? "")
 				const rc = i.rdp_client ?? ""
 				if (RDP_PRESETS.includes(rc)) {
 					setRdpMode(rc || "auto")
@@ -50,10 +56,13 @@ export function ControllerPage() {
 			await api.setControllerSettings({
 				advertiseAddr: advertise || null,
 				rdpClient,
+				relayAddr: relayAddr || null,
+				relayAgentSecret: relayAgent || null,
+				relayOwnerSecret: relayOwner || null,
 				tailscaleAuthKey: authKey || null,
 				terminal: terminal || null
 			})
-			toast.success("Saved", "Settings updated.")
+			toast.success("Saved", relayAddr ? "Relay mode set — restart Tether to apply." : "Settings updated.")
 			load()
 		} catch (e) {
 			toast.error("Couldn't save", api.errString(e))
@@ -121,6 +130,51 @@ export function ControllerPage() {
 									? "Mode: Tailscale — deploy scripts join the tailnet with this key, no client login."
 									: "Mode: direct — clients must already be able to reach the advertise address."}
 							</p>
+							<Button
+								icon={<Save className="h-4 w-4" />}
+								loading={saving}
+								onClick={save}
+								variant="primary"
+							>
+								Save
+							</Button>
+						</div>
+					</section>
+
+					<section className="card flex flex-col gap-4 p-5">
+						<div className="flex items-center gap-2.5">
+							<Server className="h-5 w-5 text-primary dark:text-primary-strong" />
+							<h2 className="font-semibold text-text">Relay (server-backed)</h2>
+							{relayAddr ? <Badge tone="primary">active</Badge> : <Badge>off</Badge>}
+						</div>
+						<p className="text-xs text-muted">
+							Run <code>tether-server</code> on a public cloud host, then paste its address and secrets
+							here. The controller and all clients dial out to it — nothing else needs to be exposed.
+							Leave the address blank to use Tailscale/Direct instead. Changing this needs a Tether
+							restart.
+						</p>
+
+						<Field hint="host:port of your tether-server (its public IP/DNS)." label="Relay address">
+							<Input
+								onChange={(e) => setRelayAddr(e.target.value)}
+								placeholder="e.g. relay.example.com:47600"
+								value={relayAddr}
+							/>
+						</Field>
+						<Field
+							hint="From `tether-server info` — authenticates this controller as the owner."
+							label="Owner secret"
+						>
+							<Input onChange={(e) => setRelayOwner(e.target.value)} type="password" value={relayOwner} />
+						</Field>
+						<Field
+							hint="From `tether-server info` — embedded in relay-mode deploy scripts."
+							label="Agent secret"
+						>
+							<Input onChange={(e) => setRelayAgent(e.target.value)} type="password" value={relayAgent} />
+						</Field>
+
+						<div className="flex justify-end">
 							<Button
 								icon={<Save className="h-4 w-4" />}
 								loading={saving}

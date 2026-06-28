@@ -14,6 +14,7 @@ use tether_protocol::{tls, AgentStatus, SessionClient, DEFAULT_PORT};
 use uuid::Uuid;
 
 use crate::error::{AppError, AppResult};
+use crate::link::AgentLink;
 use crate::registry::ClientStore;
 
 /// Event emitted whenever the client list or a client's connection state changes.
@@ -44,6 +45,23 @@ pub struct ControllerConfig {
 	/// "xterm -e". Empty = auto-detect.
 	#[serde(default)]
 	pub terminal: Option<String>,
+	/// Relay (`tether-server`) address. When set, the controller dials the relay
+	/// instead of listening, and agents reach it through the relay.
+	#[serde(default)]
+	pub relay_addr: Option<String>,
+	/// Owner secret used to authenticate the controller to the relay.
+	#[serde(default)]
+	pub relay_owner_secret: Option<String>,
+	/// Agent secret embedded in relay-mode deploy scripts.
+	#[serde(default)]
+	pub relay_agent_secret: Option<String>,
+}
+
+impl ControllerConfig {
+	/// The relay address when in relay mode, else `None`.
+	pub fn relay(&self) -> Option<&str> {
+		self.relay_addr.as_deref().filter(|s| !s.is_empty())
+	}
 }
 
 impl ControllerConfig {
@@ -58,6 +76,9 @@ impl ControllerConfig {
 			tailscale_auth_key: None,
 			rdp_client: None,
 			terminal: None,
+			relay_addr: None,
+			relay_owner_secret: None,
+			relay_agent_secret: None,
 		}
 	}
 
@@ -84,7 +105,7 @@ impl ControllerConfig {
 
 /// A live agent connection.
 pub struct LiveConn {
-	pub conn: quinn::Connection,
+	pub link: AgentLink,
 	pub status: Option<AgentStatus>,
 }
 
@@ -135,9 +156,9 @@ impl AppState {
 		}
 	}
 
-	/// Clone out the live connection for a client, if connected.
-	pub fn connection(&self, id: Uuid) -> Option<quinn::Connection> {
-		self.0.live.lock().unwrap().get(&id).map(|c| c.conn.clone())
+	/// Clone out the link for a client, if connected.
+	pub fn connection(&self, id: Uuid) -> Option<AgentLink> {
+		self.0.live.lock().unwrap().get(&id).map(|c| c.link.clone())
 	}
 
 	pub fn is_online(&self, id: Uuid) -> bool {

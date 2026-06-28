@@ -39,11 +39,17 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-	/// Write config + a fresh identity for a controller and enrollment token.
+	/// Write config + a fresh identity for a controller (or relay) and token.
 	Enroll {
-		/// Controller address as `host[:port]` (typically a tailnet name/IP).
+		/// Controller address as `host[:port]` (direct/Tailscale mode).
 		#[arg(long)]
-		controller: String,
+		controller: Option<String>,
+		/// Relay address as `host[:port]` (relay mode).
+		#[arg(long)]
+		relay: Option<String>,
+		/// Agent secret for the relay (relay mode).
+		#[arg(long)]
+		relay_secret: Option<String>,
 		/// One-time enrollment token from the controller.
 		#[arg(long)]
 		token: String,
@@ -69,12 +75,22 @@ async fn main() -> Result<()> {
 	match cli.command {
 		Command::Enroll {
 			controller,
+			relay,
+			relay_secret,
 			token,
 			server_name,
 		} => {
+			let (controller_addr, relay_addr) = match (controller, relay) {
+				(Some(c), None) => (normalize_addr(&c), None),
+				(None, Some(r)) => (String::new(), Some(normalize_addr(&r))),
+				(Some(_), Some(_)) => anyhow::bail!("provide only one of --controller or --relay"),
+				(None, None) => anyhow::bail!("provide either --controller or --relay"),
+			};
 			let identity = Identity::generate();
 			let cfg = AgentConfig {
-				controller_addr: normalize_addr(&controller),
+				controller_addr,
+				relay_addr,
+				relay_secret,
 				server_name,
 				enrollment_token: Some(token),
 				identity_seed: identity.seed_b64(),
@@ -104,7 +120,10 @@ async fn main() -> Result<()> {
 			match AgentConfig::load(&cfg_path) {
 				Ok(cfg) => {
 					println!("config:    {}", cfg_path.display());
-					println!("controller:{}", cfg.controller_addr);
+					match cfg.relay() {
+						Some(relay) => println!("relay:     {relay}"),
+						None => println!("controller:{}", cfg.controller_addr),
+					}
 					println!(
 						"enrolled:  {}",
 						if cfg.enrollment_token.is_none() {

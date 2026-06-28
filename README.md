@@ -33,23 +33,38 @@ Tether is two programs that talk over [QUIC](https://en.wikipedia.org/wiki/QUIC)
  └──────────────┘            live screen frames             └────────────────────┘
 ```
 
-### Reaching machines without a cloud server
+### Connection modes
 
-Tether has no rendezvous/relay server of its own. On the **Controller** page you set the
-address agents dial and pick how they connect — neither mode needs the client to log in:
+On the **Controller** page you pick how the controller and clients reach each other. None
+of the modes require the client to log in:
 
-- **Tailscale (pre-auth key)** — paste a [Tailscale **auth key**](https://tailscale.com/kb/1085/auth-keys)
-  (generated once in your admin console) into the controller. Deploy scripts run
-  `tailscale up --authkey=…`, so each client joins your tailnet **non-interactively — no SSO
-  on the client**. You get NAT traversal for free (Tailscale's DERP relays, not infra you
-  run). Keys can be reusable, ephemeral, and tagged.
-- **Direct** — leave the auth key blank. The agent just dials the advertise address, which
-  must be reachable (same LAN, an existing VPN, or a port-forward on the controller). Zero
-  third-party dependency.
+- **Tailscale** — paste a [Tailscale **auth key**](https://tailscale.com/kb/1085/auth-keys)
+  into the controller. Deploy scripts run `tailscale up --authkey=…`, so each client joins
+  your tailnet **non-interactively**. NAT traversal is free (Tailscale's DERP relays). The
+  controller listens on its tailnet address; agents dial in.
+- **Direct** — no Tailscale. Agents dial the controller's advertise address, which must be
+  reachable (LAN, an existing VPN, or a port-forward on the controller). Zero third-party
+  dependency.
+- **Relay (server-backed)** — run **`tether-server`** on a public cloud host. The controller
+  **and** every client dial *out* to it, so nothing on either side needs to be exposed — the
+  relay routes between them. It carries everything: the control plane, the live session, and
+  RDP/SSH (tunneled). This is the option for fleets where neither end is reachable.
 
-The controller is the one fixed point either way: it listens, and agents dial in. A
-fully self-hosted middle ground (your own coordination server) is also possible with
-[Headscale](https://github.com/juanfont/headscale), at the cost of hosting it yourself.
+### Relay setup (`tether-server`)
+
+1. On a cloud host with a public IP, build/copy `tether-server` (`run build:server`) and run
+   `tether-server run`. First run generates a config and prints an **owner secret** and an
+   **agent secret**:
+   ```
+   tether-server info       # prints listen address + the two secrets
+   ```
+2. On the **Controller** page → **Relay**, enter the relay's `host:port` and the two secrets,
+   save, and restart Tether. The controller now dials the relay instead of listening.
+3. Add machines as usual — their deploy scripts now enrol against the relay (no Tailscale,
+   no exposure). Open UDP 47600 on the cloud host's firewall.
+
+Authentication is layered: the secrets gate access to the relay, and the agent still proves
+its identity to the controller end-to-end with Ed25519 — the relay only forwards bytes.
 
 ### The background agent
 
@@ -115,6 +130,7 @@ This is an early build. What works today:
 - ✅ **Wayland support** via XDG portals (X11 still supported too)
 - ✅ **RDP connect** — one-click into gnome-remote-desktop / Windows RDP, your choice of viewer
 - ✅ **SSH connect** — one-click terminal session to the client over the tailnet
+- ✅ **Relay mode** — `tether-server` on a cloud host routes between controller and clients (control plane + RDP/SSH tunneled), so neither end is exposed
 
 Releases publish the `tether-agent` binary for every platform
 (`tether-agent-linux-x86_64`, `-linux-aarch64`, `-macos-universal`,
@@ -182,6 +198,7 @@ src-tauri/               Cargo workspace
   src/                   controller app — QUIC server, registry, deploy scripts, commands
   protocol/              shared wire protocol, QUIC transport, Ed25519 identity
   agent/                 headless tether-agent daemon (capture, input, service install)
+  server/                tether-server relay (optional, for relay mode)
 ```
 
 ## License

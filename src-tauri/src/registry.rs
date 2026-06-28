@@ -155,6 +155,13 @@ impl ClientStore {
 		None
 	}
 
+	pub fn id_for_pubkey(&self, public_key: &str) -> Option<Uuid> {
+		self.clients
+			.iter()
+			.find(|c| c.public_key.as_deref() == Some(public_key))
+			.map(|c| c.id)
+	}
+
 	pub fn touch_seen(&mut self, id: Uuid) {
 		if let Some(client) = self.clients.iter_mut().find(|c| c.id == id) {
 			client.last_seen = Some(now_secs());

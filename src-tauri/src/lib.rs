@@ -1,6 +1,7 @@
 mod commands;
 mod deploy;
 mod error;
+mod link;
 mod rdp;
 mod registry;
 mod server;
@@ -8,6 +9,7 @@ mod session;
 mod ssh;
 mod state;
 mod tailscale;
+mod tunnel;
 
 use std::path::PathBuf;
 
@@ -38,8 +40,13 @@ pub fn run() {
 			// start the QUIC listener that agents dial into.
 			state.set_app(app.handle().clone());
 			let serve_state = state.clone();
+			let relay = serve_state.0.config.lock().unwrap().relay().is_some();
 			tauri::async_runtime::spawn(async move {
-				server::serve(serve_state).await;
+				if relay {
+					server::serve_relay(serve_state).await;
+				} else {
+					server::serve(serve_state).await;
+				}
 			});
 			Ok(())
 		})

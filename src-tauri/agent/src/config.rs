@@ -10,8 +10,17 @@ use tether_protocol::DEFAULT_PORT;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct AgentConfig {
-	/// `host:port` of the controller (a tailnet name/IP, typically).
+	/// `host:port` of the controller for direct mode (a tailnet name/IP). Empty
+	/// when using relay mode.
+	#[serde(default)]
 	pub controller_addr: String,
+	/// `host:port` of the relay (`tether-server`) for relay mode. When set, the
+	/// agent dials the relay instead of the controller.
+	#[serde(default)]
+	pub relay_addr: Option<String>,
+	/// Agent secret used to authenticate to the relay.
+	#[serde(default)]
+	pub relay_secret: Option<String>,
 	/// TLS server name presented during the handshake.
 	#[serde(default = "default_server_name")]
 	pub server_name: String,
@@ -32,6 +41,11 @@ fn default_server_name() -> String {
 impl AgentConfig {
 	pub fn identity(&self) -> Result<Identity> {
 		Identity::from_seed_b64(&self.identity_seed).context("config has an invalid identity_seed")
+	}
+
+	/// The relay address when in relay mode, else `None` (direct mode).
+	pub fn relay(&self) -> Option<&str> {
+		self.relay_addr.as_deref().filter(|s| !s.is_empty())
 	}
 
 	pub fn load(path: &PathBuf) -> Result<Self> {

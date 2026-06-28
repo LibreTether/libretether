@@ -1,0 +1,22 @@
+[package]
+name = "tether-server"
+version = "0.1.0"
+description = "Tether relay — routes between a controller and its agents through a public cloud host"
+edition = "2021"
+license = "MIT"
+
+[[bin]]
+name = "tether-server"
+path = "src/main.rs"
+
+[dependencies]
+tether-protocol = { path = "../protocol" }
+
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "io-util", "net", "sync"] }
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring", "log"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+dirs = "6"
+base64 = "0.22"

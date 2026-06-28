@@ -50,6 +50,9 @@ export interface ControllerInfo {
 	tailscale_auth_key: string | null
 	rdp_client: string | null
 	terminal: string | null
+	relay_addr: string | null
+	relay_owner_secret: string | null
+	relay_agent_secret: string | null
 }
 
 export interface ExecResult {

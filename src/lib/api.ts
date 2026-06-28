@@ -48,6 +48,9 @@ export const setControllerSettings = (settings: {
 	tailscaleAuthKey: string | null
 	rdpClient: string | null
 	terminal: string | null
+	relayAddr: string | null
+	relayOwnerSecret: string | null
+	relayAgentSecret: string | null
 }) => invoke<void>("set_controller_settings", settings)
 export const saveTextFile = (path: string, contents: string) => invoke<void>("save_text_file", { contents, path })
 
