@@ -1,0 +1,26 @@
+{
+	"$schema": "../gen/schemas/desktop-schema.json",
+	"description": "Capabilities granted to the main Tether window.",
+	"identifier": "default",
+	"permissions": [
+		"core:default",
+		"core:window:allow-start-dragging",
+		"core:window:allow-set-theme",
+		"core:event:allow-listen",
+		"core:event:allow-unlisten",
+		"core:event:allow-emit",
+		"dialog:default",
+		"dialog:allow-open",
+		"dialog:allow-save",
+		"opener:default",
+		"opener:allow-open-url",
+		"opener:allow-open-path",
+		"opener:allow-reveal-item-in-dir",
+		"notification:default",
+		"os:default",
+		"clipboard-manager:default",
+		"clipboard-manager:allow-write-text",
+		"clipboard-manager:allow-read-text"
+	],
+	"windows": ["main"]
+}

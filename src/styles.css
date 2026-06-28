@@ -1,0 +1,254 @@
+@import "tailwindcss";
+
+/* Dark mode is driven by a `.dark` class on <html> so we can toggle it ourselves
+   and also honour the OS preference. */
+@custom-variant dark (&:where(.dark, .dark *));
+
+/* ------------------------------------------------------------------ *
+ * Design tokens                                                       *
+ * ------------------------------------------------------------------ */
+:root {
+	--bg: #f4f5fb;
+	--bg-grad-a: #eef0fb;
+	--bg-grad-b: #f7f5ff;
+	--surface: #ffffff;
+	--surface-2: #f7f8fc;
+	--surface-3: #eef1f8;
+	--border: #e4e7f0;
+	--border-strong: #d3d8e6;
+	--text: #1b1f2a;
+	--text-muted: #5b6478;
+	--text-subtle: #8a92a6;
+	--primary: #6d5cff;
+	--primary-strong: #5b46f5;
+	--primary-fg: #ffffff;
+	--primary-soft: #ece9ff;
+	--accent: #19c6b8;
+	--success: #18a957;
+	--success-soft: #e2f6ea;
+	--warning: #d98a00;
+	--warning-soft: #fbf0d8;
+	--danger: #e23d4f;
+	--danger-soft: #fbe5e8;
+	--ring: #8a7bff;
+	--shadow-color: 230 232 245;
+}
+
+.dark {
+	--bg: #0a0c12;
+	--bg-grad-a: #0c0e17;
+	--bg-grad-b: #0a0b13;
+	--surface: #12141e;
+	--surface-2: #171a26;
+	--surface-3: #1d2130;
+	--border: #232838;
+	--border-strong: #313851;
+	--text: #eef1f8;
+	--text-muted: #9aa3ba;
+	--text-subtle: #6b7488;
+	--primary: #7c6bff;
+	--primary-strong: #8e7dff;
+	--primary-fg: #ffffff;
+	--primary-soft: #1e1c3a;
+	--accent: #2bd9c9;
+	--success: #2bd06f;
+	--success-soft: #11271b;
+	--warning: #e2a032;
+	--warning-soft: #2a2113;
+	--danger: #ff5c6c;
+	--danger-soft: #2c1419;
+	--ring: #7c6bff;
+	--shadow-color: 0 0 0;
+}
+
+/* ------------------------------------------------------------------ *
+ * Expose tokens as Tailwind theme colours                             *
+ * ------------------------------------------------------------------ */
+@theme inline {
+	--color-bg: var(--bg);
+	--color-surface: var(--surface);
+	--color-surface-2: var(--surface-2);
+	--color-surface-3: var(--surface-3);
+	--color-border: var(--border);
+	--color-border-strong: var(--border-strong);
+	--color-text: var(--text);
+	--color-muted: var(--text-muted);
+	--color-subtle: var(--text-subtle);
+	--color-primary: var(--primary);
+	--color-primary-strong: var(--primary-strong);
+	--color-primary-fg: var(--primary-fg);
+	--color-primary-soft: var(--primary-soft);
+	--color-accent: var(--accent);
+	--color-success: var(--success);
+	--color-success-soft: var(--success-soft);
+	--color-warning: var(--warning);
+	--color-warning-soft: var(--warning-soft);
+	--color-danger: var(--danger);
+	--color-danger-soft: var(--danger-soft);
+	--color-ring: var(--ring);
+
+	--font-sans:
+		"Inter", ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto,
+		Helvetica, Arial, sans-serif;
+	--font-mono:
+		"JetBrains Mono", ui-monospace, "SF Mono", "Cascadia Code", Menlo,
+		monospace;
+
+	--radius-xl: 1rem;
+	--radius-2xl: 1.25rem;
+
+	--animate-fade-in: fade-in 0.25s ease both;
+	--animate-slide-up: slide-up 0.3s cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+
+@keyframes fade-in {
+	from {
+		opacity: 0;
+	}
+	to {
+		opacity: 1;
+	}
+}
+
+@keyframes slide-up {
+	from {
+		opacity: 0;
+		transform: translateY(8px);
+	}
+	to {
+		opacity: 1;
+		transform: translateY(0);
+	}
+}
+
+@keyframes spin-slow {
+	to {
+		transform: rotate(360deg);
+	}
+}
+
+/* ------------------------------------------------------------------ *
+ * Base                                                                *
+ * ------------------------------------------------------------------ */
+@layer base {
+	* {
+		border-color: var(--color-border);
+	}
+
+	html,
+	body,
+	#root {
+		height: 100%;
+	}
+
+	body {
+		margin: 0;
+		overflow: hidden;
+		font-family: var(--font-sans);
+		-webkit-font-smoothing: antialiased;
+		-moz-osx-font-smoothing: grayscale;
+		font-synthesis-weight: none;
+		color: var(--color-text);
+		user-select: none;
+		background: var(--bg);
+		background-image:
+			radial-gradient(
+				1200px 600px at 100% -10%,
+				color-mix(in srgb, var(--primary) 14%, transparent),
+				transparent 60%
+			),
+			radial-gradient(
+				900px 500px at -10% 110%,
+				color-mix(in srgb, var(--accent) 12%, transparent),
+				transparent 55%
+			);
+		background-attachment: fixed;
+		text-rendering: optimizeLegibility;
+	}
+
+	::selection {
+		background: color-mix(in srgb, var(--primary) 35%, transparent);
+	}
+
+	/* Scrollbars */
+	::-webkit-scrollbar {
+		width: 10px;
+		height: 10px;
+	}
+	::-webkit-scrollbar-track {
+		background: transparent;
+	}
+	::-webkit-scrollbar-thumb {
+		background: color-mix(in srgb, var(--text-subtle) 35%, transparent);
+		background-clip: content-box;
+		border: 2px solid transparent;
+		border-radius: 999px;
+	}
+	::-webkit-scrollbar-thumb:hover {
+		background: color-mix(in srgb, var(--text-subtle) 55%, transparent);
+		background-clip: content-box;
+	}
+
+	input,
+	textarea {
+		user-select: text;
+	}
+}
+
+/* ------------------------------------------------------------------ *
+ * Reusable component classes                                          *
+ * ------------------------------------------------------------------ */
+@layer components {
+	.card {
+		background: var(--color-surface);
+		border: 1px solid var(--color-border);
+		border-radius: var(--radius-2xl);
+	}
+
+	.glass {
+		background: color-mix(in srgb, var(--surface) 78%, transparent);
+		-webkit-backdrop-filter: blur(16px) saturate(140%);
+		backdrop-filter: blur(16px) saturate(140%);
+	}
+
+	.btn {
+		display: inline-flex;
+		gap: 0.5rem;
+		align-items: center;
+		justify-content: center;
+		padding: 0.6rem 0.95rem;
+		font-size: 0.875rem;
+		font-weight: 600;
+		line-height: 1;
+		white-space: nowrap;
+		user-select: none;
+		border-radius: 0.75rem;
+		transition: all 0.16s ease;
+	}
+	.btn:disabled {
+		cursor: not-allowed;
+		opacity: 0.5;
+	}
+
+	.gradient-text {
+		color: transparent;
+		background: linear-gradient(95deg, var(--primary), var(--accent));
+		-webkit-background-clip: text;
+		background-clip: text;
+	}
+
+	.gradient-brand {
+		background-image: linear-gradient(
+			135deg,
+			var(--primary) 0%,
+			var(--accent) 100%
+		);
+	}
+}
+
+@utility no-drag {
+	-webkit-app-region: no-drag;
+}
+@utility drag {
+	-webkit-app-region: drag;
+}

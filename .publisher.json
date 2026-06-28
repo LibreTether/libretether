@@ -1,0 +1,32 @@
+{
+	"$schema": "https://raw.githubusercontent.com/Skiley/rust-binary-publish/v3.0.0/schema/publisher.schema.json",
+	"input": {
+		"post-build": "bash scripts/fix-appimage.sh",
+		"targets": [
+			{
+				"key": "linux-x86_64",
+				"runner": "ubuntu-24.04"
+			},
+			{
+				"key": "linux-aarch64",
+				"runner": "ubuntu-24.04-arm"
+			},
+			{
+				"args": "--target universal-apple-darwin",
+				"key": "macos-universal",
+				"runner": "macos-latest",
+				"rust-targets": "aarch64-apple-darwin,x86_64-apple-darwin"
+			},
+			{
+				"key": "windows-x86_64",
+				"runner": "windows-latest"
+			}
+		],
+		"type": "tauri-app"
+	},
+	"outputs": [
+		{
+			"type": "github-release"
+		}
+	]
+}

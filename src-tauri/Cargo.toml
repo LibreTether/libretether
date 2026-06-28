@@ -1,0 +1,50 @@
+[package]
+name = "tether"
+version = "0.1.0"
+description = "Tether — a self-hosted remote desktop controller"
+authors = ["Tether contributors"]
+license = "MIT"
+repository = ""
+edition = "2021"
+rust-version = "1.77.2"
+
+# The library is what Tauri's mobile tooling expects; the binary just calls into it.
+[lib]
+name = "tether_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[workspace]
+members = ["agent", "protocol"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tether-protocol = { path = "protocol" }
+
+tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2"
+tauri-plugin-opener = "2"
+tauri-plugin-notification = "2"
+tauri-plugin-os = "2"
+tauri-plugin-clipboard-manager = "2"
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time", "io-util", "net", "process"] }
+thiserror = "2"
+dirs = "6"
+uuid = { version = "1", features = ["v4", "serde"] }
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring", "log"] }
+base64 = "0.22"
+
+[features]
+# This feature is used for production builds or when a dev server is not running.
+custom-protocol = ["tauri/custom-protocol"]
+
+[profile.release]
+panic = "abort"
+codegen-units = 1
+lto = true
+opt-level = "s"
+strip = true

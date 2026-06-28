@@ -1,0 +1,48 @@
+{
+	"$schema": "https://schema.tauri.app/config/2",
+	"app": {
+		"security": {
+			"csp": null
+		},
+		"windows": [
+			{
+				"center": true,
+				"decorations": true,
+				"height": 800,
+				"hiddenTitle": true,
+				"label": "main",
+				"minHeight": 640,
+				"minWidth": 960,
+				"resizable": true,
+				"theme": null,
+				"title": "Tether",
+				"titleBarStyle": "Overlay",
+				"width": 1200
+			}
+		]
+	},
+	"build": {
+		"beforeBuildCommand": "tsc --noEmit && vite build",
+		"beforeDevCommand": "vite",
+		"devUrl": "http://localhost:1420",
+		"frontendDist": "../dist"
+	},
+	"bundle": {
+		"active": true,
+		"category": "Utility",
+		"icon": [
+			"icons/icon.png",
+			"icons/128x128@2x.png",
+			"icons/128x128.png",
+			"icons/32x32.png",
+			"icons/icon.icns",
+			"icons/icon.ico"
+		],
+		"longDescription": "Tether is a self-hosted remote desktop controller. Enrol your machines with a one-click deployment script, reach them over your own private Tailscale mesh, check their status, run commands, take screenshots, and take over the screen with full mouse and keyboard control.",
+		"shortDescription": "Self-hosted remote desktop control over a private mesh",
+		"targets": "all"
+	},
+	"identifier": "com.tether.desktop",
+	"productName": "Tether",
+	"version": "0.1.0"
+}

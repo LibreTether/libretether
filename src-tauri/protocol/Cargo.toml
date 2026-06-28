@@ -1,0 +1,21 @@
+[package]
+name = "tether-protocol"
+version = "0.1.0"
+description = "Shared wire protocol, transport and identity for Tether"
+edition = "2021"
+license = "MIT"
+
+[lib]
+name = "tether_protocol"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["io-util"] }
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring", "log"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+rcgen = { version = "0.13", default-features = false, features = ["crypto", "ring", "pem"] }
+ed25519-dalek = "2"
+base64 = "0.22"
+getrandom = "0.2"
+thiserror = "2"

@@ -1,0 +1,4 @@
+# Allow esbuild (used by Vite and Tailwind) to run its install script so its
+# native binary is set up. pnpm 11 blocks dependency build scripts by default.
+allowBuilds:
+  esbuild: true
