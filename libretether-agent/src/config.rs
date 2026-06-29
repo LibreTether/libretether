@@ -87,3 +87,40 @@ pub fn normalize_addr(addr: &str) -> String {
 		format!("{addr}:{DEFAULT_PORT}")
 	}
 }
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn appends_default_port_when_missing() {
+		assert_eq!(normalize_addr("ctl.example"), format!("ctl.example:{DEFAULT_PORT}"));
+		assert_eq!(normalize_addr("10.0.0.5"), format!("10.0.0.5:{DEFAULT_PORT}"));
+	}
+
+	#[test]
+	fn keeps_an_explicit_port() {
+		assert_eq!(normalize_addr("ctl.example:1234"), "ctl.example:1234");
+		assert_eq!(normalize_addr("10.0.0.5:9000"), "10.0.0.5:9000");
+	}
+
+	#[test]
+	fn relay_mode_is_detected_from_a_non_empty_relay_addr() {
+		let mut cfg = AgentConfig {
+			controller_addr: String::new(),
+			relay_addr: Some("relay.example:47600".into()),
+			relay_secret: Some("s".into()),
+			server_name: default_server_name(),
+			enrollment_token: None,
+			controller_key: Some("k".into()),
+			identity_seed: Identity::generate().seed_b64(),
+			client_id: None,
+		};
+		assert_eq!(cfg.relay(), Some("relay.example:47600"));
+		// An empty relay address falls back to direct mode.
+		cfg.relay_addr = Some(String::new());
+		assert_eq!(cfg.relay(), None);
+		cfg.relay_addr = None;
+		assert_eq!(cfg.relay(), None);
+	}
+}

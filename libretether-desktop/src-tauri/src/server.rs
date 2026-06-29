@@ -13,7 +13,8 @@ use libretether_protocol::crypto;
 use libretether_protocol::frame::{read_frame, read_frame_capped, write_frame, MAX_CONTROL_FRAME};
 use libretether_protocol::relay::{RelayAck, RelayChallenge, RelayEvent, RelayHello, RelayProof, RelayRole};
 use libretether_protocol::{
-	tls, Challenge, ControlRequest, ControlResponse, Hello, HelloAck, SessionGrant, StreamOpen, PROTOCOL_VERSION,
+	tls, Challenge, ControlRequest, ControlResponse, Hello, HelloAck, SessionGrant, StreamOpen,
+	DEFAULT_EXEC_TIMEOUT_SECS, MAX_EXEC_TIMEOUT_SECS, PROTOCOL_VERSION,
 };
 use quinn::Endpoint;
 use tauri::Emitter;
@@ -340,11 +341,281 @@ async fn reject(send: &mut quinn::SendStream, reason: &str) {
 }
 
 /// Open a one-shot control stream to an agent, send `req`, and read the response.
+/// Bounded by a per-request timeout: an agent that accepts the stream but never
+/// replies (compromised, deadlocked, or just buggy) must not hang the caller — and
+/// the UI command behind it — indefinitely, since QUIC keep-alives would otherwise
+/// hold the connection open forever.
 pub async fn control_request(link: &AgentLink, req: &ControlRequest) -> AppResult<ControlResponse> {
+	match tokio::time::timeout(request_timeout(req), control_request_inner(link, req)).await {
+		Ok(res) => res,
+		Err(_) => Err(AppError::msg("agent did not respond in time")),
+	}
+}
+
+/// How long a control request may take before we give up. `Exec` waits for the
+/// agent's own (bounded) execution budget plus headroom for spawn + transfer;
+/// every other request is a short fixed cap.
+fn request_timeout(req: &ControlRequest) -> Duration {
+	match req {
+		ControlRequest::Exec { timeout_secs, .. } => {
+			let secs = timeout_secs
+				.unwrap_or(DEFAULT_EXEC_TIMEOUT_SECS)
+				.clamp(1, MAX_EXEC_TIMEOUT_SECS);
+			Duration::from_secs(secs + 15)
+		}
+		_ => Duration::from_secs(30),
+	}
+}
+
+async fn control_request_inner(link: &AgentLink, req: &ControlRequest) -> AppResult<ControlResponse> {
 	let (mut send, mut recv) = link.open_bi().await?;
 	write_frame(&mut send, &StreamOpen::Control).await?;
 	link.authenticate(&mut send).await?;
 	write_frame(&mut send, req).await?;
 	let _ = send.finish();
 	Ok(read_frame::<_, ControlResponse>(&mut recv).await?)
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use crate::registry::{ClientOs, ClientStore};
+	use crate::state::ControllerProfile;
+	use libretether_protocol::crypto::Identity;
+	use libretether_protocol::{AgentStatus, HostInfo, StreamAuth};
+	use std::collections::HashMap;
+	use std::net::Ipv4Addr;
+	use std::sync::Mutex;
+
+	fn temp_dir() -> std::path::PathBuf {
+		use std::sync::atomic::{AtomicU32, Ordering};
+		static N: AtomicU32 = AtomicU32::new(0);
+		let p = std::env::temp_dir().join(format!(
+			"lt-server-{}-{}",
+			std::process::id(),
+			N.fetch_add(1, Ordering::Relaxed)
+		));
+		let _ = std::fs::remove_dir_all(&p);
+		p
+	}
+
+	/// An `AppState` + a fresh direct-mode `ActiveController` holding one
+	/// not-yet-enrolled client. Returns the client's one-time enrollment token.
+	fn setup() -> (AppState, ActiveController, String) {
+		let dir = temp_dir();
+		let state = AppState::init(dir.clone()).unwrap();
+		let profile = ControllerProfile::new(
+			"test".into(),
+			ControllerKind::Direct {
+				advertise_addr: None,
+				listen_port: 0,
+			},
+		);
+		let mut store = ClientStore::load(dir.join("clients.json")).unwrap();
+		let token = store
+			.create("box".into(), ClientOs::Linux)
+			.unwrap()
+			.enrollment_token
+			.unwrap();
+		let ctrl = ActiveController {
+			profile,
+			store: Mutex::new(store),
+			live: Mutex::new(HashMap::new()),
+			sessions: Mutex::new(HashMap::new()),
+			tunnels: Mutex::new(HashMap::new()),
+		};
+		(state, ctrl, token)
+	}
+
+	/// A connected QUIC pair: the controller is the server (it opens streams), the
+	/// agent is the client (it accepts). Endpoints are returned so the test keeps
+	/// them — and the connections — alive.
+	async fn loopback() -> (Endpoint, quinn::Connection, Endpoint, quinn::Connection) {
+		tls::install_crypto_provider();
+		let (cert, key) = tls::self_signed();
+		let server_ep = Endpoint::server(tls::server_config(cert, key), (Ipv4Addr::LOCALHOST, 0).into()).unwrap();
+		let addr = server_ep.local_addr().unwrap();
+		let client_ep = tls::client_endpoint(addr).unwrap();
+		let accept = {
+			let ep = server_ep.clone();
+			tokio::spawn(async move { ep.accept().await.unwrap().accept().unwrap().await.unwrap() })
+		};
+		let client_conn = client_ep.connect(addr, "libretether.local").unwrap().await.unwrap();
+		let server_conn = accept.await.unwrap();
+		(server_ep, server_conn, client_ep, client_conn)
+	}
+
+	fn host() -> HostInfo {
+		HostInfo {
+			hostname: "box".into(),
+			os: "linux".into(),
+			arch: "x86_64".into(),
+			username: "u".into(),
+		}
+	}
+
+	#[tokio::test]
+	async fn enrolls_burns_token_authenticates_both_ways_and_grants_a_session() {
+		let (state, ctrl, token) = setup();
+		let ctrl_pub = ctrl.profile.public_key();
+		let (_sep, server, _cep, client) = loopback().await;
+		let agent = Identity::generate();
+		let agent_pub = agent.public_b64();
+
+		// A faithful agent: signs the challenge, verifies the controller, issues a
+		// capability token, then serves the controller's initial Status request.
+		let agent_task = tokio::spawn(async move {
+			let (mut a_send, mut a_recv) = client.accept_bi().await.unwrap();
+			let open: StreamOpen = read_frame_capped(&mut a_recv, MAX_CONTROL_FRAME).await.unwrap();
+			assert!(matches!(open, StreamOpen::Handshake));
+			let challenge: Challenge = read_frame_capped(&mut a_recv, MAX_CONTROL_FRAME).await.unwrap();
+			assert_eq!(challenge.controller_key, ctrl_pub, "controller presents its pinned key");
+			let agent_nonce = crypto::random_nonce_b64();
+			let hello = Hello {
+				protocol: PROTOCOL_VERSION,
+				enrollment_token: Some(token),
+				public_key: agent.public_b64(),
+				signature: agent.sign_b64(challenge.nonce.as_bytes()),
+				agent_nonce: agent_nonce.clone(),
+				host: host(),
+				agent_version: "test".into(),
+			};
+			write_frame(&mut a_send, &hello).await.unwrap();
+			let ack: HelloAck = read_frame_capped(&mut a_recv, MAX_CONTROL_FRAME).await.unwrap();
+			assert!(ack.accepted, "controller should accept: {:?}", ack.reason);
+			// The controller authenticated itself (mutual auth): signature over our
+			// nonce verifies against the key it presented.
+			assert!(crypto::verify_b64(
+				&challenge.controller_key,
+				agent_nonce.as_bytes(),
+				&ack.controller_sig
+			));
+			let cap = crypto::random_nonce_b64();
+			write_frame(&mut a_send, &SessionGrant { token: cap.clone() })
+				.await
+				.unwrap();
+			let _ = a_send.finish();
+
+			// Initial Status: must arrive stamped with the capability token.
+			let (mut s_send, mut s_recv) = client.accept_bi().await.unwrap();
+			let open2: StreamOpen = read_frame_capped(&mut s_recv, MAX_CONTROL_FRAME).await.unwrap();
+			assert!(matches!(open2, StreamOpen::Control));
+			let auth: StreamAuth = read_frame_capped(&mut s_recv, MAX_CONTROL_FRAME).await.unwrap();
+			assert_eq!(auth.token, cap, "control stream carries the issued token");
+			let req: ControlRequest = read_frame_capped(&mut s_recv, MAX_CONTROL_FRAME).await.unwrap();
+			assert!(matches!(req, ControlRequest::Status));
+			let status = AgentStatus {
+				host: host(),
+				agent_version: "test".into(),
+				uptime_secs: 1,
+				started_at: 0,
+				boot_time_secs: None,
+				displays: 1,
+				tailscale_ip: None,
+			};
+			write_frame(&mut s_send, &ControlResponse::Status(status))
+				.await
+				.unwrap();
+			let _ = s_send.finish();
+			client
+		});
+
+		let res = enroll_and_register(&state, &ctrl, AgentLink::direct(server.clone()))
+			.await
+			.unwrap();
+		let (client_id, _gen) = res.expect("handshake should succeed");
+		let _client = agent_task.await.unwrap();
+
+		// Registered live, with the initial status captured.
+		{
+			let live = ctrl.live.lock().unwrap();
+			let conn = live.get(&client_id).expect("registered in the live map");
+			assert!(conn.status.is_some(), "initial status recorded");
+		}
+		// Persisted: key bound, one-time token burned.
+		let store = ctrl.store.lock().unwrap();
+		let c = store.get(client_id).unwrap();
+		assert!(c.enrolled);
+		assert_eq!(c.public_key.as_deref(), Some(agent_pub.as_str()));
+		assert!(c.enrollment_token.is_none(), "the one-time token is burned");
+	}
+
+	/// Drive an agent that fails the handshake in one specific way, and return the
+	/// rejection ack it receives. `mangle` mutates an otherwise-valid `Hello`.
+	async fn run_rejected_agent(
+		client: quinn::Connection,
+		agent: Identity,
+		token: Option<String>,
+		mangle: impl FnOnce(&mut Hello) + Send + 'static,
+	) -> HelloAck {
+		let (mut a_send, mut a_recv) = client.accept_bi().await.unwrap();
+		let _open: StreamOpen = read_frame_capped(&mut a_recv, MAX_CONTROL_FRAME).await.unwrap();
+		let challenge: Challenge = read_frame_capped(&mut a_recv, MAX_CONTROL_FRAME).await.unwrap();
+		let mut hello = Hello {
+			protocol: PROTOCOL_VERSION,
+			enrollment_token: token,
+			public_key: agent.public_b64(),
+			signature: agent.sign_b64(challenge.nonce.as_bytes()),
+			agent_nonce: crypto::random_nonce_b64(),
+			host: host(),
+			agent_version: "test".into(),
+		};
+		mangle(&mut hello);
+		write_frame(&mut a_send, &hello).await.unwrap();
+		read_frame_capped(&mut a_recv, MAX_CONTROL_FRAME).await.unwrap()
+	}
+
+	#[tokio::test]
+	async fn rejects_a_protocol_version_mismatch() {
+		let (state, ctrl, token) = setup();
+		let (_sep, server, _cep, client) = loopback().await;
+		let agent = Identity::generate();
+		let agent_task = tokio::spawn(run_rejected_agent(client, agent, Some(token), |h| {
+			h.protocol = PROTOCOL_VERSION + 1
+		}));
+
+		let res = enroll_and_register(&state, &ctrl, AgentLink::direct(server.clone()))
+			.await
+			.unwrap();
+		assert!(res.is_none(), "version mismatch must be rejected");
+		assert!(!agent_task.await.unwrap().accepted);
+	}
+
+	#[tokio::test]
+	async fn rejects_a_bad_agent_signature() {
+		let (state, ctrl, token) = setup();
+		let (_sep, server, _cep, client) = loopback().await;
+		let agent = Identity::generate();
+		// Replace the signature with one that won't verify against the public key.
+		let agent_task = tokio::spawn(run_rejected_agent(client, agent, Some(token), |h| {
+			h.signature = Identity::generate().sign_b64(b"unrelated");
+		}));
+
+		let res = enroll_and_register(&state, &ctrl, AgentLink::direct(server.clone()))
+			.await
+			.unwrap();
+		assert!(res.is_none(), "an unverifiable signature must be rejected");
+		assert!(!agent_task.await.unwrap().accepted);
+	}
+
+	#[tokio::test]
+	async fn rejects_an_unknown_enrollment_token() {
+		let (state, ctrl, _real_token) = setup();
+		let (_sep, server, _cep, client) = loopback().await;
+		let agent = Identity::generate();
+		// Valid self-signature, but a token that matches no client and a key that
+		// isn't bound to one — the agent is unknown.
+		let agent_task = tokio::spawn(run_rejected_agent(
+			client,
+			agent,
+			Some("not-a-real-token".into()),
+			|_| {},
+		));
+
+		let res = enroll_and_register(&state, &ctrl, AgentLink::direct(server.clone()))
+			.await
+			.unwrap();
+		assert!(res.is_none(), "an unknown agent must be rejected");
+		assert!(!agent_task.await.unwrap().accepted);
+	}
 }

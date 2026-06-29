@@ -346,3 +346,34 @@ fn evdev_keycode(code: &str) -> Option<i32> {
 	};
 	Some(kc)
 }
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn maps_known_codes_to_evdev_keycodes() {
+		assert_eq!(evdev_keycode("Escape"), Some(1));
+		assert_eq!(evdev_keycode("KeyA"), Some(30));
+		assert_eq!(evdev_keycode("Enter"), Some(28));
+		assert_eq!(evdev_keycode("NumpadEnter"), Some(28));
+		assert_eq!(evdev_keycode("Space"), Some(57));
+		assert_eq!(evdev_keycode("F1"), Some(59));
+		assert_eq!(evdev_keycode("F12"), Some(88));
+		assert_eq!(evdev_keycode("ArrowUp"), Some(103));
+	}
+
+	#[test]
+	fn unknown_codes_map_to_none() {
+		assert_eq!(evdev_keycode("Bogus"), None);
+		assert_eq!(evdev_keycode(""), None);
+		assert_eq!(evdev_keycode("KeyÆ"), None);
+	}
+
+	#[test]
+	fn maps_evdev_buttons() {
+		assert_eq!(evdev_button(MouseButton::Left), BTN_LEFT);
+		assert_eq!(evdev_button(MouseButton::Right), BTN_RIGHT);
+		assert_eq!(evdev_button(MouseButton::Middle), BTN_MIDDLE);
+	}
+}

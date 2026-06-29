@@ -133,6 +133,18 @@ mod tests {
 		assert!(!verify_b64(&id.public_b64(), b"hello", &B64.encode([0u8; 64])));
 	}
 
+	// An empty key or empty signature must never verify. This is what makes the
+	// handshake fail closed if a peer omits the mutual-auth fields (the agent
+	// compares against a non-empty pinned key, and verifies a real signature).
+	#[test]
+	fn verify_rejects_empty_key_or_signature() {
+		let id = Identity::generate();
+		let sig = id.sign_b64(b"msg");
+		assert!(!verify_b64("", b"msg", &sig));
+		assert!(!verify_b64(&id.public_b64(), b"msg", ""));
+		assert!(!verify_b64("", b"msg", ""));
+	}
+
 	#[test]
 	fn seed_round_trip_preserves_identity() {
 		let id = Identity::generate();

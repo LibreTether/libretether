@@ -166,7 +166,7 @@ export function MachinesPage({
 					script={deploy.script}
 				/>
 			)}
-			{detail && <ClientDetailModal client={detail} onClose={() => setDetail(null)} open />}
+			{detail && <ClientDetailModal client={detail} key={detail.id} onClose={() => setDetail(null)} open />}
 		</>
 	)
 }

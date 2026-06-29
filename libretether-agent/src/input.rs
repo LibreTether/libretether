@@ -173,3 +173,48 @@ fn func_key(n: u8) -> Key {
 		_ => Key::F12,
 	}
 }
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn maps_letters_digits_and_named_keys() {
+		assert!(matches!(map_key("KeyA"), Some(Key::Unicode('a'))));
+		assert!(matches!(map_key("KeyZ"), Some(Key::Unicode('z'))));
+		assert!(matches!(map_key("Digit0"), Some(Key::Unicode('0'))));
+		assert!(matches!(map_key("Enter"), Some(Key::Return)));
+		assert!(matches!(map_key("NumpadEnter"), Some(Key::Return)));
+		assert!(matches!(map_key("Space"), Some(Key::Space)));
+		assert!(matches!(map_key("ShiftLeft"), Some(Key::Shift)));
+		assert!(matches!(map_key("ArrowUp"), Some(Key::UpArrow)));
+		assert!(matches!(map_key("Minus"), Some(Key::Unicode('-'))));
+		assert!(matches!(map_key("Slash"), Some(Key::Unicode('/'))));
+	}
+
+	#[test]
+	fn unknown_or_malformed_key_codes_map_to_none() {
+		assert!(map_key("").is_none());
+		assert!(map_key("Bogus").is_none());
+		assert!(map_key("Key").is_none()); // "Key" with no letter
+		assert!(map_key("KeyAB").is_none()); // not a single letter
+	}
+
+	#[test]
+	fn function_keys_parse_and_clamp() {
+		assert!(matches!(map_key("F1"), Some(Key::F1)));
+		assert!(matches!(map_key("F12"), Some(Key::F12)));
+		assert!(matches!(func_key(1), Key::F1));
+		assert!(matches!(func_key(11), Key::F11));
+		assert!(matches!(func_key(12), Key::F12));
+		// Out-of-range numbers clamp to F12 rather than panicking.
+		assert!(matches!(func_key(99), Key::F12));
+	}
+
+	#[test]
+	fn maps_mouse_buttons() {
+		assert!(matches!(map_button(MouseButton::Left), Button::Left));
+		assert!(matches!(map_button(MouseButton::Right), Button::Right));
+		assert!(matches!(map_button(MouseButton::Middle), Button::Middle));
+	}
+}

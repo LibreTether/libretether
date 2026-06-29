@@ -5,7 +5,10 @@ use std::time::{Duration, Instant};
 
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
-use libretether_protocol::{AgentStatus, ControlRequest, ControlResponse, ExecResult, ScreenshotResult};
+use libretether_protocol::{
+	AgentStatus, ControlRequest, ControlResponse, ExecResult, ScreenshotResult, DEFAULT_EXEC_TIMEOUT_SECS,
+	MAX_EXEC_TIMEOUT_SECS,
+};
 use tokio::process::Command;
 
 use crate::capture;
@@ -68,13 +71,21 @@ async fn exec(program: String, args: Vec<String>, timeout_secs: Option<u64>) -> 
 	cmd.args(&args)
 		.stdin(Stdio::null())
 		.stdout(Stdio::piped())
-		.stderr(Stdio::piped());
+		.stderr(Stdio::piped())
+		// Kill the child if we stop waiting on it (the timeout below, or the task
+		// being dropped). Without this a timed-out process is orphaned and keeps
+		// running, since tokio does not kill children on drop by default.
+		.kill_on_drop(true);
 	// Don't flash a console window on Windows — the agent runs windowless, so a
 	// spawned console program would otherwise pop one up on the guest's screen.
 	crate::proc::NoWindow::no_window(&mut cmd);
 
 	let child = cmd.spawn().map_err(|e| format!("spawning {program}: {e}"))?;
-	let timeout = Duration::from_secs(timeout_secs.unwrap_or(30).clamp(1, 600));
+	let timeout = Duration::from_secs(
+		timeout_secs
+			.unwrap_or(DEFAULT_EXEC_TIMEOUT_SECS)
+			.clamp(1, MAX_EXEC_TIMEOUT_SECS),
+	);
 
 	let output = match tokio::time::timeout(timeout, child.wait_with_output()).await {
 		Ok(Ok(out)) => out,

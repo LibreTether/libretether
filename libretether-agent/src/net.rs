@@ -385,3 +385,274 @@ async fn tunnel(port: u16, mut q_send: SendStream, mut q_recv: RecvStream) {
 		}
 	}
 }
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use std::net::Ipv4Addr;
+
+	/// A connected QUIC pair over loopback using the project's real transport
+	/// config. Returns `(controller_endpoint, controller_conn, agent_endpoint,
+	/// agent_conn)`. The endpoints must be kept alive for the connections to work,
+	/// so callers bind them (even as `_`-prefixed) for the test's duration.
+	///
+	/// The controller is the QUIC *server* (it opens streams); the agent is the
+	/// client (it accepts) — exactly as in direct mode.
+	async fn loopback() -> (Endpoint, quinn::Connection, Endpoint, quinn::Connection) {
+		tls::install_crypto_provider();
+		let (cert, key) = tls::self_signed();
+		let server_ep = Endpoint::server(tls::server_config(cert, key), (Ipv4Addr::LOCALHOST, 0).into()).unwrap();
+		let addr = server_ep.local_addr().unwrap();
+		let client_ep = tls::client_endpoint(addr).unwrap();
+		let accept = {
+			let ep = server_ep.clone();
+			tokio::spawn(async move { ep.accept().await.unwrap().accept().unwrap().await.unwrap() })
+		};
+		let client_conn = client_ep.connect(addr, "libretether.local").unwrap().await.unwrap();
+		let server_conn = accept.await.unwrap();
+		(server_ep, server_conn, client_ep, client_conn)
+	}
+
+	/// What `verify_and_grant` resolves to: `(controller_key, client_id)` on success.
+	type VerifyOutcome = Result<Option<(String, Option<String>)>>;
+
+	/// Run the agent's real `verify_and_grant` on the agent (client) side.
+	fn spawn_agent(
+		agent_conn: quinn::Connection,
+		agent: Identity,
+		pinned_controller_key: String,
+		tokens: TokenSet,
+	) -> tokio::task::JoinHandle<VerifyOutcome> {
+		tokio::spawn(async move {
+			let (mut send, mut recv) = agent_conn.accept_bi().await.map_err(|e| anyhow!("accept: {e}"))?;
+			verify_and_grant(&mut send, &mut recv, &agent, None, &pinned_controller_key, &tokens).await
+		})
+	}
+
+	#[tokio::test]
+	async fn mutual_handshake_succeeds_and_issues_a_capability_token() {
+		let (_sep, server, _cep, client) = loopback().await;
+		let ctrl = Identity::generate();
+		let agent = Identity::generate();
+		let tokens: TokenSet = Arc::new(Mutex::new(HashSet::new()));
+
+		// Pass a cloned handle so dropping the agent task at the end of the handshake
+		// doesn't close the connection out from under the controller's final read
+		// (in production `serve` holds the connection open in a loop).
+		let handle = spawn_agent(client.clone(), agent, ctrl.public_b64(), tokens.clone());
+
+		// An honest controller: presents its real key, verifies the agent's
+		// signature, and signs the agent's nonce with its identity key.
+		let (mut c_send, mut c_recv) = server.open_bi().await.unwrap();
+		let nonce = crypto::random_nonce_b64();
+		write_frame(
+			&mut c_send,
+			&Challenge {
+				nonce: nonce.clone(),
+				controller_key: ctrl.public_b64(),
+			},
+		)
+		.await
+		.unwrap();
+		let hello: Hello = read_frame_capped(&mut c_recv, MAX_CONTROL_FRAME).await.unwrap();
+		assert_eq!(hello.protocol, PROTOCOL_VERSION);
+		assert!(crypto::verify_b64(
+			&hello.public_key,
+			nonce.as_bytes(),
+			&hello.signature
+		));
+		write_frame(
+			&mut c_send,
+			&HelloAck {
+				accepted: true,
+				reason: None,
+				client_id: Some("cid-1".into()),
+				controller_sig: ctrl.sign_b64(hello.agent_nonce.as_bytes()),
+			},
+		)
+		.await
+		.unwrap();
+		let grant: SessionGrant = read_frame_capped(&mut c_recv, MAX_CONTROL_FRAME).await.unwrap();
+
+		let (key, client_id) = handle.await.unwrap().unwrap().expect("handshake should succeed");
+		assert_eq!(key, ctrl.public_b64());
+		assert_eq!(client_id.as_deref(), Some("cid-1"));
+		// The token the agent issued (and stored) is exactly the one the controller
+		// received — and the only one the agent will later honour.
+		assert!(tokens.lock().unwrap().contains(&grant.token));
+		assert_eq!(tokens.lock().unwrap().len(), 1);
+	}
+
+	/// Drive the controller side up to (and including) the `HelloAck`, with knobs
+	/// to forge the presented key / the signing key / the verdict. Used by the
+	/// rejection tests — the agent errors out before reading a `SessionGrant`.
+	async fn drive_dishonest_controller(
+		server: &quinn::Connection,
+		presented_key: String,
+		signer: &Identity,
+		accepted: bool,
+	) {
+		let (mut c_send, mut c_recv) = server.open_bi().await.unwrap();
+		let nonce = crypto::random_nonce_b64();
+		write_frame(
+			&mut c_send,
+			&Challenge {
+				nonce,
+				controller_key: presented_key,
+			},
+		)
+		.await
+		.unwrap();
+		let hello: Hello = read_frame_capped(&mut c_recv, MAX_CONTROL_FRAME).await.unwrap();
+		write_frame(
+			&mut c_send,
+			&HelloAck {
+				accepted,
+				reason: (!accepted).then(|| "rejected".to_string()),
+				client_id: None,
+				controller_sig: signer.sign_b64(hello.agent_nonce.as_bytes()),
+			},
+		)
+		.await
+		.unwrap();
+		let _ = c_send.finish();
+	}
+
+	#[tokio::test]
+	async fn rejects_a_controller_key_that_does_not_match_the_pinned_one() {
+		let (_sep, server, _cep, client) = loopback().await;
+		let pinned = Identity::generate();
+		let imposter = Identity::generate();
+		let tokens: TokenSet = Arc::new(Mutex::new(HashSet::new()));
+
+		let handle = spawn_agent(client, Identity::generate(), pinned.public_b64(), tokens.clone());
+		// Imposter presents its own key (and signs with it) — a different key than
+		// the agent pinned at enrollment.
+		drive_dishonest_controller(&server, imposter.public_b64(), &imposter, true).await;
+
+		assert!(handle.await.unwrap().is_err());
+		assert!(
+			tokens.lock().unwrap().is_empty(),
+			"no token issued to an unverified controller"
+		);
+	}
+
+	#[tokio::test]
+	async fn rejects_an_empty_controller_key_downgrade() {
+		let (_sep, server, _cep, client) = loopback().await;
+		let pinned = Identity::generate();
+		let tokens: TokenSet = Arc::new(Mutex::new(HashSet::new()));
+
+		let handle = spawn_agent(client, Identity::generate(), pinned.public_b64(), tokens.clone());
+		// A peer that omits/blanks the controller key (the downgrade the
+		// `#[serde(default)]` removal guards against) must be rejected.
+		drive_dishonest_controller(&server, String::new(), &pinned, true).await;
+
+		assert!(handle.await.unwrap().is_err());
+		assert!(tokens.lock().unwrap().is_empty());
+	}
+
+	#[tokio::test]
+	async fn rejects_a_bad_controller_signature() {
+		let (_sep, server, _cep, client) = loopback().await;
+		let ctrl = Identity::generate();
+		let wrong = Identity::generate();
+		let tokens: TokenSet = Arc::new(Mutex::new(HashSet::new()));
+
+		let handle = spawn_agent(client, Identity::generate(), ctrl.public_b64(), tokens.clone());
+		// Correct key is presented, but the nonce is signed by the wrong key, so
+		// the signature won't verify against the pinned key.
+		drive_dishonest_controller(&server, ctrl.public_b64(), &wrong, true).await;
+
+		assert!(handle.await.unwrap().is_err());
+		assert!(tokens.lock().unwrap().is_empty());
+	}
+
+	#[tokio::test]
+	async fn rejects_when_the_controller_declines_the_agent() {
+		let (_sep, server, _cep, client) = loopback().await;
+		let ctrl = Identity::generate();
+		let tokens: TokenSet = Arc::new(Mutex::new(HashSet::new()));
+
+		let handle = spawn_agent(client, Identity::generate(), ctrl.public_b64(), tokens.clone());
+		drive_dishonest_controller(&server, ctrl.public_b64(), &ctrl, false).await;
+
+		assert!(handle.await.unwrap().is_err());
+		assert!(tokens.lock().unwrap().is_empty());
+	}
+
+	#[tokio::test]
+	async fn authed_accepts_only_known_capability_tokens() {
+		let (_sep, server, _cep, client) = loopback().await;
+		let tokens: TokenSet = Arc::new(Mutex::new(HashSet::new()));
+		tokens.lock().unwrap().insert("good-token".to_string());
+
+		// A stream stamped with the issued token passes.
+		let writer = {
+			let server = server.clone();
+			tokio::spawn(async move {
+				let (mut s, _r) = server.open_bi().await.unwrap();
+				write_frame(
+					&mut s,
+					&StreamAuth {
+						token: "good-token".into(),
+					},
+				)
+				.await
+				.unwrap();
+				let _ = s.finish();
+			})
+		};
+		let (_s, mut recv) = client.accept_bi().await.unwrap();
+		assert!(authed(&mut recv, &tokens).await);
+		writer.await.unwrap();
+
+		// A stream with an unknown token is rejected.
+		let writer = {
+			let server = server.clone();
+			tokio::spawn(async move {
+				let (mut s, _r) = server.open_bi().await.unwrap();
+				write_frame(&mut s, &StreamAuth { token: "forged".into() })
+					.await
+					.unwrap();
+				let _ = s.finish();
+			})
+		};
+		let (_s, mut recv) = client.accept_bi().await.unwrap();
+		assert!(!authed(&mut recv, &tokens).await);
+		writer.await.unwrap();
+	}
+
+	#[tokio::test]
+	async fn tunnel_pipes_bytes_to_a_local_tcp_port_both_ways() {
+		// A loopback echo server the tunnel connects to (the stand-in RDP/SSH port).
+		let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+		let port = listener.local_addr().unwrap().port();
+		tokio::spawn(async move {
+			if let Ok((mut sock, _)) = listener.accept().await {
+				let mut buf = [0u8; 64];
+				let n = sock.read(&mut buf).await.unwrap_or(0);
+				let _ = sock.write_all(&buf[..n]).await;
+				let _ = sock.flush().await;
+			}
+		});
+
+		let (_sep, server, _cep, client) = loopback().await;
+		// Keep `client` alive in the test; the task gets a clone so finishing the
+		// tunnel doesn't tear the connection down before the controller's read.
+		let agent_conn = client.clone();
+		let agent = tokio::spawn(async move {
+			let (send, recv) = agent_conn.accept_bi().await.unwrap();
+			tunnel(port, send, recv).await;
+		});
+
+		let (mut send, mut recv) = server.open_bi().await.unwrap();
+		send.write_all(b"hello-tunnel").await.unwrap();
+		let _ = send.finish();
+		let echoed = recv.read_to_end(64).await.unwrap();
+		assert_eq!(echoed, b"hello-tunnel");
+		agent.await.unwrap();
+	}
+
+	use tokio::io::{AsyncReadExt, AsyncWriteExt};
+}

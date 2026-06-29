@@ -628,3 +628,114 @@ pub async fn save_text_file(path: String, contents: String) -> AppResult<()> {
 	}
 	Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	// These validators are the anti-injection guard for untrusted agent-reported
+	// values (username/address/password) that get handed to ssh / RDP viewers /
+	// the terminal. They must accept ordinary values and reject anything that
+	// could break out into a shell/AppleScript/cmd.
+
+	#[test]
+	fn safe_username_accepts_reasonable_names() {
+		for ok in ["alice", "user.name_1", "DOMAIN\\user", "a-b", "Administrator"] {
+			assert!(safe_username(ok).is_ok(), "should accept {ok:?}");
+		}
+	}
+
+	#[test]
+	fn safe_username_rejects_injection_and_garbage() {
+		let too_long = "x".repeat(65);
+		let bad = [
+			"",
+			"   ",
+			"-flag",
+			"a b",
+			"a;b",
+			"a$b",
+			"a`b",
+			"user@host",
+			"a/b",
+			"a|b",
+			"a&b",
+			"a\nb",
+			too_long.as_str(),
+		];
+		for b in bad {
+			assert!(safe_username(b).is_err(), "should reject {b:?}");
+		}
+	}
+
+	#[test]
+	fn safe_host_accepts_ips_and_hostnames() {
+		for ok in ["10.0.0.1", "::1", "fd00::1", "host.example", "a-b.example.com"] {
+			assert!(safe_host(ok).is_ok(), "should accept {ok:?}");
+		}
+	}
+
+	#[test]
+	fn safe_host_rejects_injection_and_garbage() {
+		let too_long = "x".repeat(254);
+		let bad = [
+			"",
+			"  ",
+			"-h",
+			"a b",
+			"host;rm -rf",
+			"h$(x)",
+			"h|y",
+			"a/../b",
+			"h&y",
+			"h`y",
+			too_long.as_str(),
+		];
+		for b in bad {
+			assert!(safe_host(b).is_err(), "should reject {b:?}");
+		}
+	}
+
+	#[test]
+	fn safe_password_accepts_plain_alnum() {
+		assert!(safe_password("Abc123xyzPlain").is_ok());
+	}
+
+	#[test]
+	fn safe_password_rejects_metacharacters_and_whitespace() {
+		let too_long = "x".repeat(129);
+		let bad = [
+			"",
+			"has space",
+			"a'b",
+			"a\"b",
+			"a@b",
+			"a:b",
+			"a/b",
+			"a\\b",
+			"a`b",
+			"a$b",
+			"a;b",
+			"a|b",
+			"a&b",
+			"a<b",
+			"a>b",
+			"a(b",
+			"a)b",
+			"a{b",
+			"a\nb",
+			"a\tb",
+			too_long.as_str(),
+		];
+		for b in bad {
+			assert!(safe_password(b).is_err(), "should reject {b:?}");
+		}
+	}
+
+	#[test]
+	fn with_port_appends_only_when_missing() {
+		assert_eq!(with_port("1.2.3.4", 47600), "1.2.3.4:47600");
+		assert_eq!(with_port("host.example", 9000), "host.example:9000");
+		assert_eq!(with_port("host:22", 47600), "host:22");
+	}
+}

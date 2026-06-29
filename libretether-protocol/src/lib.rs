@@ -32,6 +32,15 @@ pub const PROTOCOL_VERSION: u32 = 2;
 /// Default UDP port the controller listens on for incoming agents.
 pub const DEFAULT_PORT: u16 = 47600;
 
+/// Wall-clock an [`ControlRequest::Exec`] runs on the agent before it is killed,
+/// when the controller doesn't specify a `timeout_secs`. The controller sizes its
+/// own response timeout from these so a legitimate long exec isn't cut off while a
+/// wedged agent still can't hang the caller forever.
+pub const DEFAULT_EXEC_TIMEOUT_SECS: u64 = 30;
+/// Hard upper bound on an [`ControlRequest::Exec`]'s wall-clock on the agent. The
+/// agent clamps every request to this.
+pub const MAX_EXEC_TIMEOUT_SECS: u64 = 600;
+
 // ---------------------------------------------------------------- handshake
 
 /// Basic identification of the machine an agent runs on.
@@ -51,7 +60,8 @@ pub struct Challenge {
 	pub nonce: String,
 	/// Base64 Ed25519 public key identifying the controller. The agent pins this
 	/// at enrollment and rejects any controller whose key/signature don't match.
-	#[serde(default)]
+	/// Mandatory: a v2 controller always sends it, so a frame missing it is a
+	/// protocol violation and is rejected at parse time (no compatibility shim).
 	pub controller_key: String,
 }
 
@@ -66,8 +76,7 @@ pub struct Hello {
 	/// Base64 signature over the challenge nonce.
 	pub signature: String,
 	/// A fresh nonce the controller must sign back, so the agent can authenticate
-	/// the controller in turn (mutual auth).
-	#[serde(default)]
+	/// the controller in turn (mutual auth). Mandatory — see [`Challenge::controller_key`].
 	pub agent_nonce: String,
 	pub host: HostInfo,
 	pub agent_version: String,
@@ -103,8 +112,9 @@ pub struct HelloAck {
 	pub client_id: Option<String>,
 	/// Base64 signature over the agent's `agent_nonce`, made with the controller's
 	/// identity key. The agent verifies this against the pinned controller key
-	/// before honouring any control/session/tunnel stream.
-	#[serde(default)]
+	/// before honouring any control/session/tunnel stream. Mandatory — see
+	/// [`Challenge::controller_key`]. (On a rejection it is an empty string, but the
+	/// field is always present on the wire.)
 	pub controller_sig: String,
 }
 
@@ -340,12 +350,149 @@ mod tests {
 		assert!(matches!(back, SessionClient::Input(InputEvent::MouseMove { .. })));
 	}
 
+	// The v2 mutual-auth fields are mandatory. A handshake frame missing any of
+	// them is a protocol violation and must be rejected at parse time (fail
+	// closed), never silently defaulted — the project keeps no compatibility
+	// shims. This is the regression guard for that rule.
 	#[test]
-	fn challenge_and_hello_tolerate_missing_optional_fields() {
-		// v2 fields carry `#[serde(default)]` so a frame without them still parses.
-		let challenge: Challenge = serde_json::from_str(r#"{"nonce":"n"}"#).unwrap();
-		assert!(challenge.controller_key.is_empty());
-		let ack: HelloAck = serde_json::from_str(r#"{"accepted":true}"#).unwrap();
-		assert!(ack.controller_sig.is_empty());
+	fn handshake_frames_reject_missing_mutual_auth_fields() {
+		// Challenge without `controller_key`.
+		assert!(serde_json::from_str::<Challenge>(r#"{"nonce":"n"}"#).is_err());
+		// HelloAck without `controller_sig` (the Option fields may be absent).
+		assert!(serde_json::from_str::<HelloAck>(r#"{"accepted":true}"#).is_err());
+		// Hello without `agent_nonce`.
+		let hello_missing = r#"{"protocol":2,"public_key":"k","signature":"s",
+			"host":{"hostname":"h","os":"o","arch":"a","username":"u"},"agent_version":"1"}"#;
+		assert!(serde_json::from_str::<Hello>(hello_missing).is_err());
 	}
+
+	#[test]
+	fn complete_handshake_frames_round_trip() {
+		let challenge = Challenge {
+			nonce: "n".into(),
+			controller_key: "ck".into(),
+		};
+		let back: Challenge = round_trip(&challenge);
+		assert_eq!(back.nonce, "n");
+		assert_eq!(back.controller_key, "ck");
+
+		let hello = Hello {
+			protocol: PROTOCOL_VERSION,
+			enrollment_token: Some("tok".into()),
+			public_key: "pk".into(),
+			signature: "sig".into(),
+			agent_nonce: "an".into(),
+			host: HostInfo {
+				hostname: "h".into(),
+				os: "linux".into(),
+				arch: "x86_64".into(),
+				username: "u".into(),
+			},
+			agent_version: "1.2.3".into(),
+		};
+		let back: Hello = round_trip(&hello);
+		assert_eq!(back.agent_nonce, "an");
+		assert_eq!(back.enrollment_token.as_deref(), Some("tok"));
+
+		let ack = HelloAck {
+			accepted: true,
+			reason: None,
+			client_id: Some("cid".into()),
+			controller_sig: "csig".into(),
+		};
+		let back: HelloAck = round_trip(&ack);
+		assert!(back.accepted);
+		assert_eq!(back.controller_sig, "csig");
+
+		// An enrolled agent omits the token; that must still round-trip.
+		let enrolled = Hello {
+			enrollment_token: None,
+			..hello
+		};
+		assert!(round_trip::<Hello>(&enrolled).enrollment_token.is_none());
+	}
+
+	#[test]
+	fn control_request_and_response_variants_round_trip() {
+		for req in [
+			ControlRequest::Ping,
+			ControlRequest::Status,
+			ControlRequest::Exec {
+				program: "echo".into(),
+				args: vec!["hi".into()],
+				timeout_secs: Some(5),
+			},
+			ControlRequest::Screenshot { display: Some(1) },
+			ControlRequest::EnableRdp,
+		] {
+			let json = serde_json::to_string(&req).unwrap();
+			let back: ControlRequest = serde_json::from_str(&json).unwrap();
+			// Tag survives the round-trip.
+			assert_eq!(
+				serde_json::to_value(&req).unwrap()["kind"],
+				serde_json::to_value(&back).unwrap()["kind"]
+			);
+		}
+
+		// `args` defaults to empty when omitted; `timeout_secs` is optional.
+		let exec: ControlRequest = serde_json::from_str(r#"{"kind":"exec","program":"ls"}"#).unwrap();
+		assert!(matches!(exec, ControlRequest::Exec { args, timeout_secs: None, .. } if args.is_empty()));
+
+		let resp = ControlResponse::Error { message: "boom".into() };
+		let back: ControlResponse = round_trip(&resp);
+		assert!(matches!(back, ControlResponse::Error { message } if message == "boom"));
+	}
+
+	#[test]
+	fn stream_open_round_trips_including_tunnel_port() {
+		for open in [
+			StreamOpen::Handshake,
+			StreamOpen::Control,
+			StreamOpen::Session,
+			StreamOpen::Tunnel { port: 3389 },
+		] {
+			assert_eq!(round_trip::<StreamOpen>(&open), open);
+		}
+		let tunnel: StreamOpen = serde_json::from_str(r#"{"stream":"tunnel","port":22}"#).unwrap();
+		assert_eq!(tunnel, StreamOpen::Tunnel { port: 22 });
+	}
+
+	#[test]
+	fn session_messages_round_trip() {
+		let meta = SessionServer::Meta {
+			display: 0,
+			width: 1920,
+			height: 1080,
+		};
+		assert!(matches!(
+			round_trip::<SessionServer>(&meta),
+			SessionServer::Meta { width: 1920, .. }
+		));
+
+		let start = SessionClient::Start(SessionConfig::default());
+		assert!(matches!(round_trip::<SessionClient>(&start), SessionClient::Start(_)));
+
+		for ev in [
+			InputEvent::MouseMove { x: 0.1, y: 0.9 },
+			InputEvent::MouseButton {
+				button: MouseButton::Right,
+				pressed: true,
+			},
+			InputEvent::MouseScroll { dx: -1, dy: 2 },
+			InputEvent::Key {
+				code: "KeyA".into(),
+				pressed: false,
+			},
+			InputEvent::Text { text: "hi".into() },
+		] {
+			let wrapped = SessionClient::Input(ev);
+			assert!(matches!(round_trip::<SessionClient>(&wrapped), SessionClient::Input(_)));
+		}
+	}
+
+	fn round_trip<T: Serialize + DeserializeOwned>(value: &T) -> T {
+		serde_json::from_str(&serde_json::to_string(value).unwrap()).unwrap()
+	}
+
+	use serde::de::DeserializeOwned;
 }

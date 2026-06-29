@@ -437,3 +437,154 @@ async fn pipe(mut c_recv: RecvStream, mut a_send: SendStream, mut a_recv: RecvSt
 	};
 	tokio::join!(up, down);
 }
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use libretether_protocol::crypto::Identity;
+	use std::net::Ipv4Addr;
+
+	#[test]
+	fn rate_limiter_allows_a_burst_then_sheds_per_source() {
+		let relay = Relay::default();
+		let ip: IpAddr = "203.0.113.7".parse().unwrap();
+		// Up to the window limit is allowed.
+		for _ in 0..RATE_LIMIT_PER_WINDOW {
+			assert!(relay.allow(ip));
+		}
+		// The next connection in the same window is shed.
+		assert!(!relay.allow(ip));
+		// A different source has its own independent budget.
+		let other: IpAddr = "203.0.113.8".parse().unwrap();
+		assert!(relay.allow(other));
+	}
+
+	/// A connected QUIC pair: the relay is the server (it accepts), the peer is the
+	/// client (it opens the hello stream). Endpoints are returned so callers keep
+	/// them (and the connections) alive for the test's duration.
+	async fn loopback() -> (Endpoint, quinn::Connection, Endpoint, quinn::Connection) {
+		tls::install_crypto_provider();
+		let (cert, key) = tls::self_signed();
+		let relay_ep = Endpoint::server(tls::server_config(cert, key), (Ipv4Addr::LOCALHOST, 0).into()).unwrap();
+		let addr = relay_ep.local_addr().unwrap();
+		let peer_ep = tls::client_endpoint(addr).unwrap();
+		let accept = {
+			let ep = relay_ep.clone();
+			tokio::spawn(async move { ep.accept().await.unwrap().accept().unwrap().await.unwrap() })
+		};
+		let peer_conn = peer_ep.connect(addr, "libretether.local").unwrap().await.unwrap();
+		let relay_conn = accept.await.unwrap();
+		(relay_ep, relay_conn, peer_ep, peer_conn)
+	}
+
+	#[tokio::test]
+	async fn authenticate_accepts_a_controller_with_owner_secret_and_valid_proof() {
+		let (_rep, relay_conn, _pep, peer_conn) = loopback().await;
+		let secrets: (String, String) = ("owner-secret".into(), "agent-secret".into());
+		let id = Identity::generate();
+		let id_pub = id.public_b64();
+
+		// Honest controller: owner secret + a signature proving it holds the key.
+		let peer = tokio::spawn(async move {
+			let (mut s, mut r) = peer_conn.open_bi().await.unwrap();
+			write_frame(
+				&mut s,
+				&RelayHello {
+					role: RelayRole::Controller,
+					secret: "owner-secret".into(),
+					public_key: id.public_b64(),
+				},
+			)
+			.await
+			.unwrap();
+			let ch: RelayChallenge = read_frame_capped(&mut r, MAX_CONTROL_FRAME).await.unwrap();
+			write_frame(
+				&mut s,
+				&RelayProof {
+					signature: id.sign_b64(ch.nonce.as_bytes()),
+				},
+			)
+			.await
+			.unwrap();
+			let ack: RelayAck = read_frame_capped(&mut r, MAX_CONTROL_FRAME).await.unwrap();
+			(ack, peer_conn)
+		});
+
+		let authed = authenticate(&relay_conn, &secrets)
+			.await
+			.unwrap()
+			.expect("should authenticate");
+		assert!(matches!(authed.role, RelayRole::Controller));
+		assert_eq!(authed.public_key, id_pub);
+
+		let (ack, _peer) = peer.await.unwrap();
+		assert!(ack.accepted);
+	}
+
+	#[tokio::test]
+	async fn authenticate_rejects_a_bad_secret() {
+		let (_rep, relay_conn, _pep, peer_conn) = loopback().await;
+		let secrets: (String, String) = ("owner-secret".into(), "agent-secret".into());
+		let id = Identity::generate();
+
+		let peer = tokio::spawn(async move {
+			let (mut s, mut r) = peer_conn.open_bi().await.unwrap();
+			write_frame(
+				&mut s,
+				&RelayHello {
+					role: RelayRole::Agent,
+					secret: "wrong-secret".into(),
+					public_key: id.public_b64(),
+				},
+			)
+			.await
+			.unwrap();
+			// Bad secret short-circuits to an ack (no challenge is sent).
+			let ack: RelayAck = read_frame_capped(&mut r, MAX_CONTROL_FRAME).await.unwrap();
+			(ack, peer_conn)
+		});
+
+		assert!(authenticate(&relay_conn, &secrets).await.unwrap().is_none());
+		let (ack, _peer) = peer.await.unwrap();
+		assert!(!ack.accepted);
+	}
+
+	#[tokio::test]
+	async fn authenticate_rejects_a_bad_key_ownership_proof() {
+		let (_rep, relay_conn, _pep, peer_conn) = loopback().await;
+		let secrets: (String, String) = ("owner-secret".into(), "agent-secret".into());
+		let id = Identity::generate();
+		let imposter = Identity::generate();
+
+		// Correct agent secret but the proof is signed by a different key — so the
+		// peer can't register under `id`'s routing key (the hijack the proof blocks).
+		let peer = tokio::spawn(async move {
+			let (mut s, mut r) = peer_conn.open_bi().await.unwrap();
+			write_frame(
+				&mut s,
+				&RelayHello {
+					role: RelayRole::Agent,
+					secret: "agent-secret".into(),
+					public_key: id.public_b64(),
+				},
+			)
+			.await
+			.unwrap();
+			let ch: RelayChallenge = read_frame_capped(&mut r, MAX_CONTROL_FRAME).await.unwrap();
+			write_frame(
+				&mut s,
+				&RelayProof {
+					signature: imposter.sign_b64(ch.nonce.as_bytes()),
+				},
+			)
+			.await
+			.unwrap();
+			let ack: RelayAck = read_frame_capped(&mut r, MAX_CONTROL_FRAME).await.unwrap();
+			(ack, peer_conn)
+		});
+
+		assert!(authenticate(&relay_conn, &secrets).await.unwrap().is_none());
+		let (ack, _peer) = peer.await.unwrap();
+		assert!(!ack.accepted);
+	}
+}
