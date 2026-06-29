@@ -5,6 +5,7 @@
 
 use libretether_protocol::frame::write_frame;
 use libretether_protocol::StreamOpen;
+use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
 
 use crate::error::{AppError, AppResult};
@@ -36,12 +37,17 @@ async fn forward(link: AgentLink, remote_port: u16, tcp: TcpStream) -> AppResult
 	write_frame(&mut send, &StreamOpen::Tunnel { port: remote_port }).await?;
 
 	let (mut tcp_read, mut tcp_write) = tcp.into_split();
-	let up = tokio::io::copy(&mut tcp_read, &mut send);
-	let down = tokio::io::copy(&mut recv, &mut tcp_write);
-	tokio::select! {
-		_ = up => {}
-		_ = down => {}
-	}
-	let _ = send.finish();
+	// Half-close each direction when its source ends, then wait for BOTH — a
+	// shared select! would tear the peer direction down on first EOF and truncate
+	// the stream (e.g. dropping the tail of an SSH/RDP session).
+	let up = async {
+		let _ = tokio::io::copy(&mut tcp_read, &mut send).await;
+		let _ = send.finish();
+	};
+	let down = async {
+		let _ = tokio::io::copy(&mut recv, &mut tcp_write).await;
+		let _ = tcp_write.shutdown().await;
+	};
+	tokio::join!(up, down);
 	Ok(())
 }

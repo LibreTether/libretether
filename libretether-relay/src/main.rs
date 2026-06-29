@@ -155,16 +155,47 @@ async fn run(cfg: ServerConfig) -> Result<()> {
 	let relay = Relay::default();
 	let secrets = Arc::new((cfg.owner_secret, cfg.agent_secret));
 
-	while let Some(incoming) = endpoint.accept().await {
-		let relay = relay.clone();
-		let secrets = secrets.clone();
-		tokio::spawn(async move {
-			if let Err(e) = handle(relay, incoming, &secrets).await {
-				eprintln!("[libretether-relay] connection error: {e}");
+	loop {
+		tokio::select! {
+			incoming = endpoint.accept() => {
+				let Some(incoming) = incoming else { break };
+				let relay = relay.clone();
+				let secrets = secrets.clone();
+				tokio::spawn(async move {
+					if let Err(e) = handle(relay, incoming, &secrets).await {
+						eprintln!("[libretether-relay] connection error: {e}");
+					}
+				});
 			}
-		});
+			_ = shutdown_signal() => {
+				eprintln!("[libretether-relay] shutting down");
+				break;
+			}
+		}
 	}
+	// Tell peers we're going away so they reconnect promptly instead of waiting
+	// out the idle timeout, then exit cleanly (so `docker stop` is graceful).
+	endpoint.close(0u32.into(), b"relay shutting down");
 	Ok(())
+}
+
+/// Resolve on the first SIGINT/SIGTERM (Ctrl+C on Windows) so `docker stop`
+/// ends the relay gracefully instead of timing out into a SIGKILL.
+async fn shutdown_signal() {
+	#[cfg(unix)]
+	{
+		use tokio::signal::unix::{signal, SignalKind};
+		let mut term = signal(SignalKind::terminate()).expect("install SIGTERM handler");
+		let mut int = signal(SignalKind::interrupt()).expect("install SIGINT handler");
+		tokio::select! {
+			_ = term.recv() => {}
+			_ = int.recv() => {}
+		}
+	}
+	#[cfg(not(unix))]
+	{
+		let _ = tokio::signal::ctrl_c().await;
+	}
 }
 
 async fn handle(relay: Relay, incoming: quinn::Incoming, secrets: &(String, String)) -> Result<()> {

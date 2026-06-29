@@ -355,6 +355,23 @@ async fn client_endpoint(
 	Ok((host, remote_port))
 }
 
+/// Probe that an SSH server actually answers at `host:port` (through the tunnel
+/// in relay mode) before launching a terminal — otherwise `ssh` just flashes
+/// open and closes with no explanation when the client has no SSH server.
+async fn ssh_reachable(host: &str, port: u16) -> bool {
+	use tokio::io::AsyncReadExt;
+	let connect = tokio::net::TcpStream::connect((host, port));
+	let Ok(Ok(mut stream)) = tokio::time::timeout(std::time::Duration::from_secs(6), connect).await else {
+		return false;
+	};
+	// A real SSH server greets with an "SSH-..." banner as soon as you connect.
+	let mut buf = [0u8; 1];
+	matches!(
+		tokio::time::timeout(std::time::Duration::from_secs(6), stream.read(&mut buf)).await,
+		Ok(Ok(n)) if n > 0
+	)
+}
+
 /// Open a terminal SSH session to a client at its tailnet IP.
 #[tauri::command]
 pub async fn connect_ssh(state: State<'_, AppState>, id: String) -> AppResult<()> {
@@ -367,6 +384,12 @@ pub async fn connect_ssh(state: State<'_, AppState>, id: String) -> AppResult<()
 		_ => return Err(AppError::msg("unexpected response")),
 	};
 	let (host, port) = client_endpoint(&conn, status.tailscale_ip.clone(), 22).await?;
+	if !ssh_reachable(&host, port).await {
+		return Err(AppError::msg(format!(
+			"Couldn't reach an SSH server on {}. Make sure an SSH server (e.g. openssh-server) is installed and running on the client.",
+			status.host.hostname
+		)));
+	}
 	let terminal = state.0.config.lock().unwrap().terminal.clone();
 	crate::ssh::launch(terminal.as_deref(), &host, port, &status.host.username)
 }

@@ -2,8 +2,11 @@
 //! handshake, then service control + session streams until the link drops, with
 //! exponential reconnect backoff.
 
+use std::fs::OpenOptions;
+use std::io::Write;
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
@@ -11,6 +14,7 @@ use libretether_protocol::frame::{read_frame, write_frame};
 use libretether_protocol::relay::{RelayAck, RelayHello, RelayRole};
 use libretether_protocol::{tls, Challenge, ControlRequest, Hello, HelloAck, StreamOpen, PROTOCOL_VERSION};
 use quinn::{Endpoint, RecvStream, SendStream};
+use tokio::io::AsyncWriteExt;
 
 use crate::config::AgentConfig;
 use crate::{handlers, host, session};
@@ -22,12 +26,37 @@ const RECONNECT_MAX_SECS: u64 = 5;
 /// How long a single dial attempt may hang before we give up and retry.
 const CONNECT_TIMEOUT_SECS: u64 = 8;
 
-pub fn log(msg: &str) {
-	eprintln!("[libretether-agent] {msg}");
+static LOG_FILE: OnceLock<Mutex<std::fs::File>> = OnceLock::new();
+
+/// Mirror logs to `agent.log` next to the config. A Windows scheduled task (and
+/// detached service starts in general) has no console, so without this there is
+/// nowhere to see why the agent failed to connect. Truncated on each start so it
+/// can't grow without bound.
+fn init_log_file(cfg_path: &Path) {
+	let Some(dir) = cfg_path.parent() else { return };
+	if let Ok(f) = OpenOptions::new()
+		.create(true)
+		.write(true)
+		.truncate(true)
+		.open(dir.join("agent.log"))
+	{
+		let _ = LOG_FILE.set(Mutex::new(f));
+	}
 }
 
-/// Load config and run the connect/serve loop forever.
+pub fn log(msg: &str) {
+	let line = format!("[libretether-agent] {msg}");
+	eprintln!("{line}");
+	if let Some(file) = LOG_FILE.get() {
+		if let Ok(mut file) = file.lock() {
+			let _ = writeln!(file, "{line}");
+		}
+	}
+}
+
+/// Load config and run the connect/serve loop until a shutdown signal arrives.
 pub async fn run(cfg_path: PathBuf) -> Result<()> {
+	init_log_file(&cfg_path);
 	let mut cfg = AgentConfig::load(&cfg_path)?;
 	handlers::mark_start();
 	let target = match cfg.relay() {
@@ -36,9 +65,18 @@ pub async fn run(cfg_path: PathBuf) -> Result<()> {
 	};
 	log(&format!("agent {AGENT_VERSION} starting; {target}"));
 
+	tokio::select! {
+		_ = connect_loop(&mut cfg, &cfg_path) => {}
+		_ = shutdown_signal() => log("shutdown signal received; exiting"),
+	}
+	Ok(())
+}
+
+/// Dial + serve forever, reconnecting with capped backoff.
+async fn connect_loop(cfg: &mut AgentConfig, cfg_path: &PathBuf) {
 	let mut backoff = 1u64;
 	loop {
-		match connect_once(&mut cfg, &cfg_path).await {
+		match connect_once(cfg, cfg_path).await {
 			Ok(()) => {
 				log("controller connection closed");
 				backoff = 1;
@@ -49,6 +87,25 @@ pub async fn run(cfg_path: PathBuf) -> Result<()> {
 		log(&format!("reconnecting in {wait}s"));
 		tokio::time::sleep(Duration::from_secs(wait)).await;
 		backoff = (backoff * 2).min(RECONNECT_MAX_SECS);
+	}
+}
+
+/// Resolve on the first SIGINT/SIGTERM (Ctrl+C on Windows) so the agent shuts
+/// down cleanly instead of being force-killed.
+async fn shutdown_signal() {
+	#[cfg(unix)]
+	{
+		use tokio::signal::unix::{signal, SignalKind};
+		let mut term = signal(SignalKind::terminate()).expect("install SIGTERM handler");
+		let mut int = signal(SignalKind::interrupt()).expect("install SIGINT handler");
+		tokio::select! {
+			_ = term.recv() => {}
+			_ = int.recv() => {}
+		}
+	}
+	#[cfg(not(unix))]
+	{
+		let _ = tokio::signal::ctrl_c().await;
 	}
 }
 
@@ -194,13 +251,18 @@ async fn tunnel(port: u16, mut q_send: SendStream, mut q_recv: RecvStream) {
 	match tokio::net::TcpStream::connect(("127.0.0.1", port)).await {
 		Ok(tcp) => {
 			let (mut tcp_read, mut tcp_write) = tcp.into_split();
-			let up = tokio::io::copy(&mut q_recv, &mut tcp_write);
-			let down = tokio::io::copy(&mut tcp_read, &mut q_send);
-			tokio::select! {
-				_ = up => {}
-				_ = down => {}
-			}
-			let _ = q_send.finish();
+			// Copy each direction independently and half-close it when its source
+			// ends, then wait for BOTH — a shared select! tears the peer direction
+			// down on the first EOF and truncates the stream.
+			let up = async {
+				let _ = tokio::io::copy(&mut q_recv, &mut tcp_write).await;
+				let _ = tcp_write.shutdown().await;
+			};
+			let down = async {
+				let _ = tokio::io::copy(&mut tcp_read, &mut q_send).await;
+				let _ = q_send.finish();
+			};
+			tokio::join!(up, down);
 		}
 		Err(e) => {
 			log(&format!("tunnel to 127.0.0.1:{port} failed: {e}"));
