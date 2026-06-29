@@ -6,6 +6,7 @@ import * as api from "../lib/api"
 import { slug } from "../lib/format"
 import { useToast } from "../lib/toast"
 import type { ClientOs } from "../lib/types"
+import { useAsyncAction } from "../lib/useAsyncAction"
 import { Button, Modal } from "./ui"
 
 const RUN_HINT: Record<ClientOs, string> = {
@@ -28,6 +29,7 @@ export function DeployModal({
 	script: string
 }) {
 	const toast = useToast()
+	const saveAction = useAsyncAction()
 	const [copied, setCopied] = useState(false)
 
 	const copy = async () => {
@@ -40,18 +42,16 @@ export function DeployModal({
 		}
 	}
 
-	const download = async () => {
+	const download = () => {
 		const ext = os === "windows" ? "ps1" : "sh"
 		// The shebang is only needed in the saved file; the textbox/clipboard keep the bare command.
 		const contents = os === "windows" ? `${script}\n` : `#!/usr/bin/env sh\n${script}\n`
-		try {
+		return saveAction.run("Save failed", async () => {
 			const path = await save({ defaultPath: `libretether-deploy-${slug(name)}.${ext}` })
 			if (!path) return
 			await api.saveTextFile(path, contents)
 			toast.success("Script saved", path)
-		} catch (e) {
-			toast.error("Save failed", api.errString(e))
-		}
+		})
 	}
 
 	return (
@@ -61,7 +61,12 @@ export function DeployModal({
 					<Button onClick={onClose} variant="ghost">
 						Done
 					</Button>
-					<Button icon={<Download className="h-4 w-4" />} onClick={download} variant="outline">
+					<Button
+						icon={<Download className="h-4 w-4" />}
+						loading={saveAction.busy}
+						onClick={download}
+						variant="outline"
+					>
 						Save script…
 					</Button>
 					<Button

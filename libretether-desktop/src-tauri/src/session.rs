@@ -47,7 +47,7 @@ async fn drive(
 		finish(&ctrl, id, token, &app);
 		return;
 	};
-	let (mut send, mut recv) = match conn.open_bi().await {
+	let (mut send, mut recv) = match conn.open_authenticated(StreamOpen::Session).await {
 		Ok(pair) => pair,
 		Err(e) => {
 			emit(
@@ -59,10 +59,7 @@ async fn drive(
 			return;
 		}
 	};
-	if write_frame(&mut send, &StreamOpen::Session).await.is_err()
-		|| conn.authenticate(&mut send).await.is_err()
-		|| write_frame(&mut send, &SessionClient::Start(cfg)).await.is_err()
-	{
+	if write_frame(&mut send, &SessionClient::Start(cfg)).await.is_err() {
 		finish(&ctrl, id, token, &app);
 		return;
 	}

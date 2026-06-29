@@ -10,10 +10,13 @@ export function ControlOverlay({ client, onClose }: { client: ClientDto; onClose
 	const surfaceRef = useRef<HTMLDivElement>(null)
 	const [meta, setMeta] = useState<SessionMeta | null>(null)
 	const [error, setError] = useState<string | null>(null)
-	// Count frames in a ref and surface it ~1 Hz, so a 20 fps stream doesn't
-	// re-render the whole overlay on every frame (the <img> is updated imperatively).
+	// Count frames in a ref and surface a frames-per-second readout ~1 Hz, so a
+	// 20 fps stream doesn't re-render the whole overlay on every frame (the <img>
+	// is updated imperatively). `prevFramesRef` holds the last tick's total so the
+	// interval can report the delta (an fps), not an ever-growing cumulative count.
 	const framesRef = useRef(0)
-	const [frameCount, setFrameCount] = useState(0)
+	const prevFramesRef = useRef(0)
+	const [fps, setFps] = useState(0)
 
 	// Coalesce pointer moves to one send per animation frame.
 	const pendingMove = useRef<{ x: number; y: number } | null>(null)
@@ -80,9 +83,12 @@ export function ControlOverlay({ client, onClose }: { client: ClientDto; onClose
 		}
 	}, [client.id, releaseAll])
 
-	// Refresh the frame counter ~1 Hz from the ref (see above).
+	// Report fps ~1 Hz as the delta since the last tick (see above).
 	useEffect(() => {
-		const t = window.setInterval(() => setFrameCount(framesRef.current), 1000)
+		const t = window.setInterval(() => {
+			setFps(framesRef.current - prevFramesRef.current)
+			prevFramesRef.current = framesRef.current
+		}, 1000)
 		return () => window.clearInterval(t)
 	}, [])
 
@@ -201,7 +207,7 @@ export function ControlOverlay({ client, onClose }: { client: ClientDto; onClose
 				<span className="font-semibold">{client.name}</span>
 				<span className="text-xs text-white/50">
 					{meta ? `${meta.width}×${meta.height}` : "connecting…"}
-					{frameCount > 0 && ` · ${frameCount} frames`}
+					{fps > 0 && ` · ${fps} fps`}
 				</span>
 				<span className="ml-auto flex items-center gap-1.5 text-xs text-white/50">
 					<Keyboard className="h-3.5 w-3.5" /> type to control · Esc to exit

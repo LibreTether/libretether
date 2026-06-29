@@ -41,6 +41,7 @@ export function MachinesPage({
 }) {
 	const toast = useToast()
 	const confirm = useConfirm()
+	const action = useAsyncAction()
 	const [createOpen, setCreateOpen] = useState(false)
 	const [deploy, setDeploy] = useState<DeployState | null>(null)
 	const [detail, setDetail] = useState<ClientDto | null>(null)
@@ -53,26 +54,30 @@ export function MachinesPage({
 	}, [])
 
 	const openDeploy = async (client: ClientDto) => {
-		try {
-			const script = await api.getDeployScript(client.id, client.os)
-			setDeploy({ name: client.name, os: client.os, script })
-		} catch {
-			// Already enrolled — offer to reset its token and re-deploy.
-			const ok = await confirm({
-				confirmLabel: "Reset & re-deploy",
-				message: `${client.name} is already enrolled. Resetting issues a new one-time token and revokes the old agent key. Continue?`,
-				title: "Re-deploy machine",
-				tone: "danger"
+		// Decide from the client's own state — not by catching a failure — so an
+		// unrelated error (offline, backend hiccup) can't masquerade as "enrolled"
+		// and drop the user into the destructive reset dialog.
+		if (!client.enrolled) {
+			await action.run("Couldn't get the deploy script", async () => {
+				const script = await api.getDeployScript(client.id, client.os)
+				setDeploy({ name: client.name, os: client.os, script })
 			})
-			if (!ok) return
-			try {
-				const res = await api.resetToken(client.id)
-				setDeploy({ name: res.client.name, os: res.client.os, script: res.deploy_script })
-				onReload()
-			} catch (e) {
-				toast.error("Couldn't reset token", api.errString(e))
-			}
+			return
 		}
+		// Already enrolled — resetting issues a new one-time token and revokes the
+		// old agent key, so confirm first.
+		const ok = await confirm({
+			confirmLabel: "Reset & re-deploy",
+			message: `${client.name} is already enrolled. Resetting issues a new one-time token and revokes the old agent key. Continue?`,
+			title: "Re-deploy machine",
+			tone: "danger"
+		})
+		if (!ok) return
+		await action.run("Couldn't reset token", async () => {
+			const res = await api.resetToken(client.id)
+			setDeploy({ name: res.client.name, os: res.client.os, script: res.deploy_script })
+			onReload()
+		})
 	}
 
 	const remove = async (client: ClientDto) => {
@@ -83,31 +88,23 @@ export function MachinesPage({
 			tone: "danger"
 		})
 		if (!ok) return
-		try {
+		await action.run("Couldn't remove machine", async () => {
 			await api.removeClient(client.id)
 			onReload()
-		} catch (e) {
-			toast.error("Couldn't remove machine", api.errString(e))
-		}
+		})
 	}
 
-	const rdp = async (client: ClientDto) => {
-		try {
+	const rdp = (client: ClientDto) =>
+		action.run("RDP failed", async () => {
 			await api.connectRdp(client.id)
 			toast.info("Launching RDP", `Opening an RDP session to ${client.name}…`)
-		} catch (e) {
-			toast.error("RDP failed", api.errString(e))
-		}
-	}
+		})
 
-	const ssh = async (client: ClientDto) => {
-		try {
+	const ssh = (client: ClientDto) =>
+		action.run("SSH failed", async () => {
 			await api.connectSsh(client.id)
 			toast.info("Opening SSH", `Launching a terminal to ${client.name}…`)
-		} catch (e) {
-			toast.error("SSH failed", api.errString(e))
-		}
-	}
+		})
 
 	return (
 		<>

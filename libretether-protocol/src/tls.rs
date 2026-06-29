@@ -40,6 +40,13 @@ fn transport() -> quinn::TransportConfig {
 	// agents come back "online" within seconds rather than half a minute.
 	t.max_idle_timeout(Some(Duration::from_secs(12).try_into().expect("idle timeout")));
 	t.keep_alive_interval(Some(Duration::from_secs(4)));
+	// Explicitly bound how many bidirectional streams a peer may have open at once.
+	// This caps the per-connection fan-out (each stream spawns a task on the agent
+	// and the relay), so a buggy or hostile peer can't grow it without limit — while
+	// leaving generous headroom for the relay, whose single controller connection
+	// multiplexes control/session/tunnel streams for every agent at once.
+	t.max_concurrent_bidi_streams(1024u32.into());
+	t.max_concurrent_uni_streams(0u32.into());
 	t
 }
 

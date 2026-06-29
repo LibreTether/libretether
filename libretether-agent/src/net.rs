@@ -84,7 +84,7 @@ pub async fn run(cfg_path: PathBuf) -> Result<()> {
 }
 
 /// Dial + serve forever, reconnecting with capped backoff.
-async fn connect_loop(cfg: &mut AgentConfig, cfg_path: &PathBuf) {
+async fn connect_loop(cfg: &mut AgentConfig, cfg_path: &Path) {
 	let mut backoff = Backoff::new(RECONNECT_MAX_SECS);
 	loop {
 		// `connect_once` only returns once the link is gone (serve loops until the
@@ -103,7 +103,7 @@ async fn connect_loop(cfg: &mut AgentConfig, cfg_path: &PathBuf) {
 	}
 }
 
-async fn connect_once(cfg: &mut AgentConfig, cfg_path: &PathBuf) -> Result<()> {
+async fn connect_once(cfg: &mut AgentConfig, cfg_path: &Path) -> Result<()> {
 	// Resolve the peer first so the client endpoint can match its address family.
 	let (addr, is_relay) = match cfg.relay() {
 		Some(relay) => (tls::resolve(relay).await?, true),
@@ -151,7 +151,7 @@ async fn dial(endpoint: &Endpoint, addr: SocketAddr, server_name: &str) -> Resul
 /// Complete the controller handshake, then service control/session/tunnel
 /// streams until the connection ends. In relay mode the controller's streams
 /// arrive piped through the relay; the logic is identical.
-async fn serve(conn: quinn::Connection, cfg: &mut AgentConfig, cfg_path: &PathBuf) -> Result<()> {
+async fn serve(conn: quinn::Connection, cfg: &mut AgentConfig, cfg_path: &Path) -> Result<()> {
 	log("connected; awaiting challenge");
 
 	// Handshake stream is opened by the controller.
@@ -171,7 +171,7 @@ async fn serve(conn: quinn::Connection, cfg: &mut AgentConfig, cfg_path: &PathBu
 	// Mutual handshake: prove our identity, verify the controller's against the
 	// pinned key, and receive the capability token (issued into `tokens`) that
 	// every later stream must carry.
-	let (_controller_key, client_id) = verify_and_grant(
+	let client_id = verify_and_grant(
 		&mut send,
 		&mut recv,
 		&identity,
@@ -215,8 +215,8 @@ async fn serve(conn: quinn::Connection, cfg: &mut AgentConfig, cfg_path: &PathBu
 /// The agent side of the mutual handshake on a handshake stream: prove our
 /// identity over the controller's nonce, verify the controller's signature over
 /// our nonce against the expected (pinned) key, and on success issue a fresh
-/// per-connection capability token. Returns `(controller_key, client_id)`, or an
-/// error if the controller is rejected or fails verification.
+/// per-connection capability token. Returns the controller-assigned `client_id`,
+/// or an error if the controller is rejected or fails verification.
 async fn verify_and_grant(
 	send: &mut SendStream,
 	recv: &mut RecvStream,
@@ -224,7 +224,7 @@ async fn verify_and_grant(
 	enrollment_token: Option<String>,
 	expected_key: &str,
 	tokens: &Mutex<HashSet<String>>,
-) -> Result<(String, Option<String>)> {
+) -> Result<Option<String>> {
 	let challenge: Challenge = read_frame_capped(recv, MAX_CONTROL_FRAME)
 		.await
 		.context("reading challenge")?;
@@ -282,7 +282,7 @@ async fn verify_and_grant(
 		.await
 		.context("sending session grant")?;
 	let _ = send.finish();
-	Ok((presented.to_string(), ack.client_id))
+	Ok(ack.client_id)
 }
 
 async fn handle_stream(
@@ -349,7 +349,7 @@ async fn reauth(
 	tokens: &Mutex<HashSet<String>>,
 ) {
 	match verify_and_grant(&mut send, &mut recv, identity, None, controller_key, tokens).await {
-		Ok((_, client_id)) => log(&format!("re-authenticated as client {}", client_id.unwrap_or_default())),
+		Ok(client_id) => log(&format!("re-authenticated as client {}", client_id.unwrap_or_default())),
 		Err(e) => log(&format!("controller re-auth rejected: {e:#}")),
 	}
 }
@@ -402,8 +402,8 @@ mod tests {
 		(server_ep, server_conn, client_ep, client_conn)
 	}
 
-	/// What `verify_and_grant` resolves to: `(controller_key, client_id)` on success.
-	type VerifyOutcome = Result<(String, Option<String>)>;
+	/// What `verify_and_grant` resolves to: the `client_id` on success.
+	type VerifyOutcome = Result<Option<String>>;
 
 	/// Run the agent's real `verify_and_grant` on the agent (client) side.
 	fn spawn_agent(
@@ -464,8 +464,7 @@ mod tests {
 		.unwrap();
 		let grant: SessionGrant = read_frame_capped(&mut c_recv, MAX_CONTROL_FRAME).await.unwrap();
 
-		let (key, client_id) = handle.await.unwrap().expect("handshake should succeed");
-		assert_eq!(key, ctrl.public_b64());
+		let client_id = handle.await.unwrap().expect("handshake should succeed");
 		assert_eq!(client_id.as_deref(), Some("cid-1"));
 		// The token the agent issued (and stored) is exactly the one the controller
 		// received — and the only one the agent will later honour.

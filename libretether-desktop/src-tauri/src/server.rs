@@ -62,6 +62,11 @@ pub async fn serve(state: AppState, ctrl: Arc<ActiveController>) {
 	};
 	let port = ctrl.profile.kind.listen_port();
 
+	// Bind on all interfaces rather than just the tailnet IP: pinning to the tailnet
+	// address is fragile (it fails if Tailscale isn't up yet at start, leaving the
+	// controller unable to listen at all), and the wider bind is safe because every
+	// agent is authenticated end-to-end with Ed25519 — an attacker who reaches the
+	// port but can't complete the mutual handshake is rejected before any command.
 	let endpoint = match Endpoint::server(tls::server_config(cert, key), SocketAddr::from(([0, 0, 0, 0], port))) {
 		Ok(ep) => ep,
 		Err(e) => {
@@ -325,7 +330,7 @@ async fn reject(send: &mut quinn::SendStream, reason: &str) {
 pub async fn control_request(link: &AgentLink, req: &ControlRequest) -> AppResult<ControlResponse> {
 	match tokio::time::timeout(request_timeout(req), control_request_inner(link, req)).await {
 		Ok(res) => res,
-		Err(_) => Err(AppError::msg("agent did not respond in time")),
+		Err(_) => Err(AppError::Timeout),
 	}
 }
 
@@ -345,9 +350,7 @@ fn request_timeout(req: &ControlRequest) -> Duration {
 }
 
 async fn control_request_inner(link: &AgentLink, req: &ControlRequest) -> AppResult<ControlResponse> {
-	let (mut send, mut recv) = link.open_bi().await?;
-	write_frame(&mut send, &StreamOpen::Control).await?;
-	link.authenticate(&mut send).await?;
+	let (mut send, mut recv) = link.open_authenticated(StreamOpen::Control).await?;
 	write_frame(&mut send, req).await?;
 	let _ = send.finish();
 	Ok(read_frame::<_, ControlResponse>(&mut recv).await?)

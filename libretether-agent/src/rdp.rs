@@ -63,29 +63,39 @@ fn enable_linux() -> Result<RdpInfo, String> {
 }
 
 /// Set the gnome-remote-desktop RDP credentials. The password is fed on stdin so
-/// it doesn't appear in the process argument list (which is world-readable via
-/// `/proc/<pid>/cmdline`); if this grdctl doesn't accept a stdin password we fall
-/// back to passing it as an argument so RDP still works.
+/// it never appears in the process argument list (which is world-readable via
+/// `/proc/<pid>/cmdline`).
+///
+/// There is deliberately **no argv fallback**: passing the password as a command
+/// line argument would leak it to any local process, defeating the protection. A
+/// grdctl too old to read it on stdin fails closed with an upgrade message.
 #[cfg(target_os = "linux")]
 fn set_credentials(username: &str, password: &str) -> Result<(), String> {
 	use std::io::Write;
 	use std::process::Stdio;
 
-	let piped = (|| -> Option<()> {
-		let mut child = Command::new("grdctl")
-			.args(["rdp", "set-credentials", username])
-			.stdin(Stdio::piped())
-			.stdout(Stdio::null())
-			.stderr(Stdio::null())
-			.spawn()
-			.ok()?;
-		child.stdin.take()?.write_all(format!("{password}\n").as_bytes()).ok()?;
-		child.wait().ok()?.success().then_some(())
-	})();
-	if piped.is_some() {
-		return Ok(());
+	let mut child = Command::new("grdctl")
+		.args(["rdp", "set-credentials", username])
+		.stdin(Stdio::piped())
+		.stdout(Stdio::null())
+		.stderr(Stdio::null())
+		.spawn()
+		.map_err(|e| format!("spawning grdctl: {e}"))?;
+	child
+		.stdin
+		.take()
+		.ok_or_else(|| "grdctl stdin was unavailable".to_string())?
+		.write_all(format!("{password}\n").as_bytes())
+		.map_err(|e| format!("writing the RDP password to grdctl: {e}"))?;
+	if child.wait().map_err(|e| format!("waiting for grdctl: {e}"))?.success() {
+		Ok(())
+	} else {
+		Err(
+			"grdctl rejected the RDP credentials on stdin — upgrade gnome-remote-desktop \
+		     (the password is never passed on the command line)"
+				.to_string(),
+		)
 	}
-	grd(&["rdp", "set-credentials", username, password])
 }
 
 #[cfg(target_os = "linux")]

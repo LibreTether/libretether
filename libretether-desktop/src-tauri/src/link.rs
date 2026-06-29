@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use libretether_protocol::frame::write_frame;
 use libretether_protocol::relay::RouteTo;
-use libretether_protocol::StreamAuth;
+use libretether_protocol::{StreamAuth, StreamOpen};
 use quinn::{Connection, RecvStream, SendStream};
 
 use crate::error::{AppError, AppResult};
@@ -75,6 +75,17 @@ impl AgentLink {
 				Ok((send, recv))
 			}
 		}
+	}
+
+	/// Open a non-handshake stream and bring it up to the point a payload can be
+	/// written: open the bi stream, announce `open`, and stamp it with the
+	/// capability token. Centralizes the "every post-handshake stream the controller
+	/// opens must carry the token" invariant so a new stream type can't forget it.
+	pub async fn open_authenticated(&self, open: StreamOpen) -> AppResult<(SendStream, RecvStream)> {
+		let (mut send, recv) = self.open_bi().await?;
+		write_frame(&mut send, &open).await?;
+		self.authenticate(&mut send).await?;
+		Ok((send, recv))
 	}
 
 	/// Stamp a non-handshake stream with the capability token. Call right after

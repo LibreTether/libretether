@@ -409,7 +409,7 @@ pub async fn get_deploy_script(state: State<'_, AppState>, id: String, os: Optio
 		let c = store.get(id).ok_or(AppError::NotFound)?;
 		(c.os, c.enrollment_token.clone())
 	};
-	let token = token.ok_or_else(|| AppError::msg("client already enrolled — reset its token to re-deploy"))?;
+	let token = token.ok_or(AppError::AlreadyEnrolled)?;
 	Ok(deploy::script(
 		os.unwrap_or(client_os),
 		&token,
@@ -560,19 +560,18 @@ pub async fn connect_rdp(state: State<'_, AppState>, id: String) -> AppResult<()
 	crate::rdp::launch(pref.as_deref(), &host, port, &username, password.as_deref())
 }
 
-/// Probe that an SSH server actually answers at `host:port` (through the tunnel
-/// in relay mode) before launching a terminal — otherwise `ssh` just flashes
-/// open and closes with no explanation when the client has no SSH server.
+/// Probe that something is listening at `host:port` (through the tunnel in relay
+/// mode) before launching a terminal — otherwise `ssh` just flashes open and
+/// closes with no explanation when the client has no SSH server.
+///
+/// A successful TCP connect is enough: requiring the SSH banner byte would
+/// false-negative on servers configured to wait for the client to speak first
+/// (`Banner none`, some bastions), turning a working SSH target into a refusal.
 async fn ssh_reachable(host: &str, port: u16) -> bool {
-	use tokio::io::AsyncReadExt;
 	let connect = tokio::net::TcpStream::connect((host, port));
-	let Ok(Ok(mut stream)) = tokio::time::timeout(std::time::Duration::from_secs(6), connect).await else {
-		return false;
-	};
-	let mut buf = [0u8; 1];
 	matches!(
-		tokio::time::timeout(std::time::Duration::from_secs(6), stream.read(&mut buf)).await,
-		Ok(Ok(n)) if n > 0
+		tokio::time::timeout(std::time::Duration::from_secs(6), connect).await,
+		Ok(Ok(_))
 	)
 }
 

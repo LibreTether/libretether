@@ -54,83 +54,55 @@ pub fn script(os: ClientOs, token: &str, target: &DeployTarget) -> String {
 	}
 }
 
-/// POSIX-shell installer arguments. Every value is single-quoted with embedded
-/// single quotes escaped, so a stray quote in an operator-entered address/key
-/// can't break out of the quoting into the generated command.
-fn sh_args(token: &str, target: &DeployTarget) -> String {
+/// The ordered installer arguments for a deploy, each as `(sh_flag, ps_flag,
+/// value)`. The two renderers below share this list so a new flag is added in one
+/// place and can't drift between the POSIX and PowerShell commands.
+fn installer_args<'a>(token: &'a str, target: &'a DeployTarget) -> Vec<(&'static str, &'static str, &'a str)> {
+	let mut args = vec![("--token", "-Token", token)];
 	match target {
 		DeployTarget::Relay {
 			address,
 			agent_secret,
 			controller_key,
-		} => format!(
-			"--token {} --relay {} --relay-secret {} --controller-key {}",
-			sh_quote(token),
-			sh_quote(address),
-			sh_quote(agent_secret),
-			sh_quote(controller_key),
-		),
+		} => {
+			args.push(("--relay", "-Relay", address));
+			args.push(("--relay-secret", "-RelaySecret", agent_secret));
+			args.push(("--controller-key", "-ControllerKey", controller_key));
+		}
 		DeployTarget::Controller {
 			address,
-			auth_key: Some(key),
+			auth_key,
 			controller_key,
-		} => format!(
-			"--token {} --controller {} --tailscale-key {} --controller-key {}",
-			sh_quote(token),
-			sh_quote(address),
-			sh_quote(key),
-			sh_quote(controller_key),
-		),
-		DeployTarget::Controller {
-			address,
-			auth_key: None,
-			controller_key,
-		} => format!(
-			"--token {} --controller {} --controller-key {}",
-			sh_quote(token),
-			sh_quote(address),
-			sh_quote(controller_key),
-		),
+		} => {
+			args.push(("--controller", "-Controller", address));
+			if let Some(key) = auth_key {
+				args.push(("--tailscale-key", "-TailscaleKey", key));
+			}
+			args.push(("--controller-key", "-ControllerKey", controller_key));
+		}
 	}
+	args
+}
+
+/// POSIX-shell installer arguments. Every value is single-quoted with embedded
+/// single quotes escaped, so a stray quote in an operator-entered address/key
+/// can't break out of the quoting into the generated command.
+fn sh_args(token: &str, target: &DeployTarget) -> String {
+	installer_args(token, target)
+		.iter()
+		.map(|(flag, _, value)| format!("{flag} {}", sh_quote(value)))
+		.collect::<Vec<_>>()
+		.join(" ")
 }
 
 /// PowerShell installer arguments (single-quoted literal strings, embedded
 /// quotes escaped by doubling).
 fn win_args(token: &str, target: &DeployTarget) -> String {
-	match target {
-		DeployTarget::Relay {
-			address,
-			agent_secret,
-			controller_key,
-		} => format!(
-			"-Token {} -Relay {} -RelaySecret {} -ControllerKey {}",
-			ps_quote(token),
-			ps_quote(address),
-			ps_quote(agent_secret),
-			ps_quote(controller_key),
-		),
-		DeployTarget::Controller {
-			address,
-			auth_key: Some(key),
-			controller_key,
-		} => format!(
-			"-Token {} -Controller {} -TailscaleKey {} -ControllerKey {}",
-			ps_quote(token),
-			ps_quote(address),
-			ps_quote(key),
-			ps_quote(controller_key),
-		),
-		DeployTarget::Controller {
-			address,
-			auth_key: None,
-			controller_key,
-		} => format!(
-			"-Token {} -Controller {} -ControllerKey {}",
-			ps_quote(token),
-			ps_quote(address),
-			ps_quote(controller_key),
-		),
-	}
+	installer_args(token, target)
+		.iter()
+		.map(|(_, flag, value)| format!("{flag} {}", ps_quote(value)))
+		.collect::<Vec<_>>()
+		.join(" ")
 }
 
 /// Single-quote a value for POSIX `sh`, escaping embedded single quotes.

@@ -1,7 +1,7 @@
 //! On-disk agent configuration: where the controller is, the one-time
 //! enrollment token (until consumed), and the agent's persistent identity seed.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Context, Result};
 use libretether_protocol::crypto::Identity;
@@ -68,13 +68,13 @@ impl AgentConfig {
 			})
 	}
 
-	pub fn load(path: &PathBuf) -> Result<Self> {
+	pub fn load(path: &Path) -> Result<Self> {
 		let raw =
 			std::fs::read_to_string(path).with_context(|| format!("reading agent config at {}", path.display()))?;
 		serde_json::from_str(&raw).context("parsing agent config")
 	}
 
-	pub fn save(&self, path: &PathBuf) -> Result<()> {
+	pub fn save(&self, path: &Path) -> Result<()> {
 		// The config holds the identity seed, enrollment token and relay secret —
 		// write it owner-only so other local users can't read them.
 		let raw = serde_json::to_string_pretty(self)?;

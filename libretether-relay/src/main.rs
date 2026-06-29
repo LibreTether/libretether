@@ -36,6 +36,10 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 /// Per-source rate limit: at most this many new connections per IP per window.
 const RATE_LIMIT_PER_WINDOW: u32 = 60;
 const RATE_WINDOW: Duration = Duration::from_secs(10);
+/// QUIC application error code the relay resets a routed stream with when the
+/// addressed agent isn't connected, so the controller can tell "agent offline"
+/// apart from a transport drop.
+const AGENT_UNAVAILABLE: u32 = 0x10;
 
 #[derive(Serialize, Deserialize)]
 struct ServerConfig {
@@ -61,6 +65,17 @@ impl ServerConfig {
 	fn cert_key(&self) -> Result<(Vec<u8>, Vec<u8>)> {
 		Ok((B64.decode(&self.cert_der)?, B64.decode(&self.key_der)?))
 	}
+
+	/// Refuse to operate with a blank secret. An empty `owner_secret`/`agent_secret`
+	/// would make `ct_eq("", "")` true, i.e. authenticate any peer presenting an
+	/// empty secret — a fail-open we reject outright (a freshly generated config is
+	/// always valid; this only catches a hand-edited/truncated one).
+	fn validate(&self) -> Result<()> {
+		if self.owner_secret.trim().is_empty() || self.agent_secret.trim().is_empty() {
+			anyhow::bail!("has a blank owner/agent secret — delete it to regenerate, or restore the secrets");
+		}
+		Ok(())
+	}
 }
 
 fn config_path(arg: Option<PathBuf>) -> PathBuf {
@@ -74,7 +89,12 @@ fn config_path(arg: Option<PathBuf>) -> PathBuf {
 
 fn load_or_create(path: &PathBuf) -> Result<ServerConfig> {
 	match std::fs::read_to_string(path) {
-		Ok(raw) => serde_json::from_str(&raw).context("parsing server config"),
+		Ok(raw) => {
+			let cfg: ServerConfig = serde_json::from_str(&raw).context("parsing server config")?;
+			cfg.validate()
+				.with_context(|| format!("config at {}", path.display()))?;
+			Ok(cfg)
+		}
 		Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
 			let cfg = ServerConfig::generate();
 			// The config holds the owner/agent secrets and TLS key — write it
@@ -201,7 +221,10 @@ async fn run(cfg: ServerConfig) -> Result<()> {
 	let addr: SocketAddr = cfg.listen_addr.parse().context("invalid listen address")?;
 	let endpoint = Endpoint::server(tls::server_config(cert, key), addr)?;
 	eprintln!("[libretether-relay] relay listening on udp/{addr}");
-	print_credentials(&cfg);
+	// Don't echo the secrets on every `run` — they'd persist in the journal /
+	// `docker logs` for the life of the deployment. `libretether-relay info` prints
+	// them on demand.
+	eprintln!("[libretether-relay] run `libretether-relay info` to print the owner/agent secrets");
 
 	let relay = Relay::default();
 	let secrets = Arc::new((cfg.owner_secret, cfg.agent_secret));
@@ -370,7 +393,7 @@ async fn serve_controller(relay: Relay, conn: quinn::Connection, mut events: Sen
 
 	// Route each stream the controller opens to the named agent.
 	loop {
-		let (c_send, mut c_recv) = match conn.accept_bi().await {
+		let (mut c_send, mut c_recv) = match conn.accept_bi().await {
 			Ok(pair) => pair,
 			Err(_) => break,
 		};
@@ -379,11 +402,19 @@ async fn serve_controller(relay: Relay, conn: quinn::Connection, mut events: Sen
 			let Ok(route) = read_frame_capped::<_, RouteTo>(&mut c_recv, MAX_CONTROL_FRAME).await else {
 				return;
 			};
+			// Reset the stream with a distinct code (rather than silently dropping it)
+			// when the addressed agent is gone or its connection is dying, so the
+			// controller gets a prompt, attributable failure instead of an opaque
+			// close it might mistake for a transient relay hiccup.
 			let Some(agent) = relay.agent(&route.agent) else {
+				let _ = c_send.reset(AGENT_UNAVAILABLE.into());
 				return;
 			};
-			if let Ok((a_send, a_recv)) = agent.open_bi().await {
-				pipe(c_recv, a_send, a_recv, c_send).await;
+			match agent.open_bi().await {
+				Ok((a_send, a_recv)) => pipe(c_recv, a_send, a_recv, c_send).await,
+				Err(_) => {
+					let _ = c_send.reset(AGENT_UNAVAILABLE.into());
+				}
 			}
 		});
 	}
@@ -734,18 +765,37 @@ mod tests {
 			async move { serve_controller(relay, ctrl_view, events_send).await }
 		});
 
-		// Route to an agent that was never registered: the relay drops the stream,
-		// so the controller's read half ends without data.
+		// Route to an agent that was never registered: the relay resets the stream
+		// with AGENT_UNAVAILABLE, so the controller gets an attributable failure
+		// rather than an ambiguous clean close.
 		let (mut rsend, mut rrecv) = ctrl_conn.open_bi().await.unwrap();
 		write_frame(&mut rsend, &RouteTo { agent: "GHOST".into() })
 			.await
 			.unwrap();
 		rsend.write_all(b"hello?").await.unwrap();
 		let _ = rsend.finish();
-		let got = with_timeout("read after route-to-unknown", rrecv.read_to_end(64))
-			.await
-			.unwrap();
-		assert!(got.is_empty(), "an unroutable stream yields no data");
+		let result = with_timeout("read after route-to-unknown", rrecv.read_to_end(64)).await;
+		match result {
+			Err(quinn::ReadToEndError::Read(quinn::ReadError::Reset(code))) => {
+				assert_eq!(
+					code,
+					AGENT_UNAVAILABLE.into(),
+					"reset carries the agent-unavailable code"
+				);
+			}
+			other => panic!("expected a stream reset for an unknown agent, got {other:?}"),
+		}
+	}
+
+	#[test]
+	fn config_validate_rejects_a_blank_secret() {
+		let mut cfg = ServerConfig::generate();
+		assert!(cfg.validate().is_ok(), "a freshly generated config is valid");
+		cfg.owner_secret = "   ".into();
+		assert!(cfg.validate().is_err(), "a blank owner secret must be rejected");
+		let mut cfg = ServerConfig::generate();
+		cfg.agent_secret = String::new();
+		assert!(cfg.validate().is_err(), "a blank agent secret must be rejected");
 	}
 
 	#[tokio::test]

@@ -11,6 +11,12 @@ pub enum AppError {
 	NotFound,
 	#[error("client is offline")]
 	Offline,
+	#[error("no controller is connected")]
+	NoActiveController,
+	#[error("this client is already enrolled — reset its token to re-deploy")]
+	AlreadyEnrolled,
+	#[error("the agent did not respond in time")]
+	Timeout,
 	#[error("the agent returned an error: {0}")]
 	Agent(String),
 	#[error(transparent)]

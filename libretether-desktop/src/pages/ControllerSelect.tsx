@@ -7,6 +7,7 @@ import { Badge, Button, Spinner } from "../components/ui"
 import * as api from "../lib/api"
 import { useToast } from "../lib/toast"
 import type { ActiveInfo, ControllerSummary, ControllerType } from "../lib/types"
+import { useAsyncAction } from "../lib/useAsyncAction"
 
 const TYPE_META: Record<ControllerType, { label: string; icon: ComponentType<{ className?: string }> }> = {
 	direct: { icon: Network, label: "Direct" },
@@ -17,6 +18,7 @@ const TYPE_META: Record<ControllerType, { label: string; icon: ComponentType<{ c
 export function ControllerSelect({ onConnected }: { onConnected: (a: ActiveInfo) => void }) {
 	const toast = useToast()
 	const confirm = useConfirm()
+	const deleteAction = useAsyncAction()
 	const [controllers, setControllers] = useState<ControllerSummary[]>([])
 	const [loading, setLoading] = useState(true)
 	const [form, setForm] = useState<{ existing: ControllerSummary | null } | null>(null)
@@ -57,12 +59,10 @@ export function ControllerSelect({ onConnected }: { onConnected: (a: ActiveInfo)
 			tone: "danger"
 		})
 		if (!ok) return
-		try {
+		await deleteAction.run("Couldn't delete", async () => {
 			await api.deleteController(c.id)
 			reload()
-		} catch (e) {
-			toast.error("Couldn't delete", api.errString(e))
-		}
+		})
 	}
 
 	if (connectingRelay) {

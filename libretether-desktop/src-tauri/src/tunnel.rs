@@ -9,7 +9,6 @@
 //! client is removed or the controller exits.
 
 use libretether_common::pipe_bidirectional;
-use libretether_protocol::frame::write_frame;
 use libretether_protocol::StreamOpen;
 use tokio::net::{TcpListener, TcpStream};
 use uuid::Uuid;
@@ -66,9 +65,9 @@ pub fn close_for(ctrl: &ActiveController, id: Uuid) {
 }
 
 async fn forward(link: AgentLink, remote_port: u16, tcp: TcpStream) -> AppResult<()> {
-	let (mut send, recv) = link.open_bi().await?;
-	write_frame(&mut send, &StreamOpen::Tunnel { port: remote_port }).await?;
-	link.authenticate(&mut send).await?;
+	let (send, recv) = link
+		.open_authenticated(StreamOpen::Tunnel { port: remote_port })
+		.await?;
 
 	// Pipe the local TCP connection to the agent stream in both directions; the
 	// shared helper half-closes each side and waits for both (a shared select!

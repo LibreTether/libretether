@@ -258,10 +258,20 @@ impl AppState {
 		if let Ok(entries) = std::fs::read_dir(self.controllers_dir()) {
 			for entry in entries.flatten() {
 				let path = entry.path().join("controller.json");
-				if let Ok(raw) = std::fs::read_to_string(&path) {
-					if let Ok(profile) = serde_json::from_str::<ControllerProfile>(&raw) {
-						out.push(profile);
-					}
+				match std::fs::read_to_string(&path) {
+					Ok(raw) => match serde_json::from_str::<ControllerProfile>(&raw) {
+						Ok(profile) => out.push(profile),
+						// Don't silently swallow a corrupt profile — a controller
+						// vanishing from the list with no trace is worse than a noisy
+						// log the operator can act on (re-create / restore).
+						Err(e) => eprintln!(
+							"[libretether] skipping unreadable controller at {}: {e}",
+							path.display()
+						),
+					},
+					// A directory without a readable controller.json isn't a profile.
+					Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+					Err(e) => eprintln!("[libretether] could not read controller at {}: {e}", path.display()),
 				}
 			}
 		}
@@ -340,7 +350,7 @@ impl AppState {
 	}
 
 	pub fn require_active(&self) -> AppResult<Arc<ActiveController>> {
-		self.active().ok_or_else(|| AppError::msg("no controller is connected"))
+		self.active().ok_or(AppError::NoActiveController)
 	}
 
 	/// Start serving a controller (replacing any currently-active one).
