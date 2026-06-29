@@ -3,6 +3,13 @@
 //! identity, and then serves status, command-exec, screenshot and live
 //! screen-control requests.
 
+// On Windows, build the (release) binary into the GUI subsystem so the always-on
+// service runs with no console window — a console window would otherwise pop up
+// at logon and closing it would kill the agent. CLI output still appears when run
+// from a terminal because the child inherits the parent's console handles; debug
+// builds keep a normal console for development.
+#![cfg_attr(all(target_os = "windows", not(debug_assertions)), windows_subsystem = "windows")]
+
 mod capture;
 mod config;
 mod handlers;

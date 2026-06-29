@@ -14,7 +14,8 @@ param(
 	[string]$RelaySecret,
 	[string]$TailscaleKey,
 	[string]$Name = $env:COMPUTERNAME,
-	[string]$AgentUrl
+	[string]$AgentUrl,
+	[switch]$NoRdp
 )
 $ErrorActionPreference = "Stop"
 
@@ -51,12 +52,45 @@ if ($env:LIBRETETHER_AGENT_BIN) {
 	Invoke-WebRequest -Uri $Url -OutFile $Bin
 }
 
+# Run an agent subcommand and fail loudly. The agent is a GUI-subsystem binary
+# (no console window for the background service), which PowerShell's call operator
+# would NOT wait for — so use Start-Process -Wait and check the exit code.
+function Invoke-Agent {
+	param([string[]]$AgentArgs)
+	$p = Start-Process -FilePath $Bin -ArgumentList $AgentArgs -NoNewWindow -Wait -PassThru
+	if ($p.ExitCode -ne 0) {
+		throw "agent '$($AgentArgs[0])' failed (exit $($p.ExitCode)); see $BinDir\agent.log"
+	}
+}
+
+# Turn on Remote Desktop so the controller's "Connect via RDP" works (otherwise
+# the agent's tunnel to 127.0.0.1:3389 is refused). Needs admin and an edition
+# with an RDP host (Windows Home has none); best-effort, never blocks the install.
+function Enable-RemoteDesktop {
+	$admin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltinRole]::Administrator)
+	if (-not $admin) {
+		Write-Host "==> Skipped enabling Remote Desktop (not elevated). Re-run as Administrator, or turn on Settings > System > Remote Desktop, to use RDP. Screen control works regardless."
+		return
+	}
+	try {
+		Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name 'fDenyTSConnections' -Value 0 -ErrorAction Stop
+		# Canonical (locale-independent) Remote Desktop firewall group.
+		Enable-NetFirewallRule -Group '@FirewallAPI.dll,-28752' -ErrorAction SilentlyContinue
+		Write-Host "==> Remote Desktop enabled."
+	} catch {
+		Write-Host "==> Could not enable Remote Desktop automatically ($_). Turn it on in Settings > System > Remote Desktop to use RDP."
+	}
+}
+
 # 3. Enroll and register the logon task.
 if ($Relay) {
-	& $Bin enroll --relay $Relay --relay-secret $RelaySecret --token $Token
+	Invoke-Agent @('enroll', '--relay', $Relay, '--relay-secret', $RelaySecret, '--token', $Token)
 } else {
-	& $Bin enroll --controller $Controller --token $Token
+	Invoke-Agent @('enroll', '--controller', $Controller, '--token', $Token)
 }
-& $Bin install
+Invoke-Agent @('install')
+
+# 4. Enable RDP (unless opted out).
+if (-not $NoRdp) { Enable-RemoteDesktop }
 
 Write-Host "==> Done. $Name is now reachable from your LibreTether controller."
