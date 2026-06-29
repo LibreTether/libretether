@@ -2,12 +2,13 @@
 //! stream to the webview: agent frames are emitted as Tauri events, and input
 //! from the UI is pushed back to the agent.
 //!
-//! Starting a session is synchronous and stop-first: any existing session is
-//! torn down and the new handle is registered before any `.await`, so rapid
-//! start/stop/start sequences (e.g. React StrictMode's double-mount) can't leave
-//! two sessions racing on the same client.
+//! Sessions live on the [`ActiveController`], so they're torn down when the
+//! controller is exited. Starting a session is synchronous and stop-first: any
+//! existing session is torn down and the new handle registered before any
+//! `.await`, so rapid start/stop/start sequences can't leave two racing.
 
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 use libretether_protocol::frame::{read_frame, write_frame};
 use libretether_protocol::{InputEvent, SessionClient, SessionConfig, SessionServer, StreamOpen};
@@ -15,40 +16,35 @@ use tauri::{AppHandle, Emitter};
 use uuid::Uuid;
 
 use crate::error::{AppError, AppResult};
-use crate::state::{AppState, SessionHandle};
+use crate::state::{ActiveController, AppState, SessionHandle};
 
 static SESSION_GEN: AtomicU64 = AtomicU64::new(1);
 
-/// Start (or restart) a live session for `id`. Any existing session is stopped
-/// first. This is synchronous: the stream is opened inside the spawned task, so
-/// the handle is registered atomically. Failures surface to the UI as
-/// `session:error` / `session:closed` events rather than a command error.
-pub fn start(state: AppState, id: Uuid, cfg: SessionConfig) {
-	stop(&state, id);
+/// Start (or restart) a live session for `id` on the active controller.
+pub fn start(state: &AppState, ctrl: Arc<ActiveController>, id: Uuid, cfg: SessionConfig) {
+	stop(&ctrl, id);
 
 	let token = SESSION_GEN.fetch_add(1, Ordering::Relaxed);
 	let (input_tx, input_rx) = tokio::sync::mpsc::unbounded_channel::<SessionClient>();
 	let app = state.0.app.get().cloned();
-	let task = tauri::async_runtime::spawn(drive(state.clone(), id, token, cfg, input_rx, app));
-	state
-		.0
-		.sessions
+	let task = tauri::async_runtime::spawn(drive(ctrl.clone(), id, token, cfg, input_rx, app));
+	ctrl.sessions
 		.lock()
 		.unwrap()
 		.insert(id, SessionHandle { input_tx, task, token });
 }
 
 async fn drive(
-	state: AppState,
+	ctrl: Arc<ActiveController>,
 	id: Uuid,
 	token: u64,
 	cfg: SessionConfig,
 	mut input_rx: tokio::sync::mpsc::UnboundedReceiver<SessionClient>,
 	app: Option<AppHandle>,
 ) {
-	let Some(conn) = state.connection(id) else {
+	let Some(conn) = ctrl.connection(id) else {
 		emit(&app, &format!("session:error:{id}"), "client is offline".to_string());
-		finish(&state, id, token, &app);
+		finish(&ctrl, id, token, &app);
 		return;
 	};
 	let (mut send, mut recv) = match conn.open_bi().await {
@@ -59,14 +55,14 @@ async fn drive(
 				&format!("session:error:{id}"),
 				format!("could not open session: {e}"),
 			);
-			finish(&state, id, token, &app);
+			finish(&ctrl, id, token, &app);
 			return;
 		}
 	};
 	if write_frame(&mut send, &StreamOpen::Session).await.is_err()
 		|| write_frame(&mut send, &SessionClient::Start(cfg)).await.is_err()
 	{
-		finish(&state, id, token, &app);
+		finish(&ctrl, id, token, &app);
 		return;
 	}
 
@@ -102,13 +98,13 @@ async fn drive(
 	}
 
 	writer.abort();
-	finish(&state, id, token, &app);
+	finish(&ctrl, id, token, &app);
 }
 
 /// Remove our handle and notify the UI — but only if we're still the current
 /// session (a newer one may have replaced us).
-fn finish(state: &AppState, id: Uuid, token: u64, app: &Option<AppHandle>) {
-	let mut sessions = state.0.sessions.lock().unwrap();
+fn finish(ctrl: &ActiveController, id: Uuid, token: u64, app: &Option<AppHandle>) {
+	let mut sessions = ctrl.sessions.lock().unwrap();
 	if sessions.get(&id).map(|h| h.token) == Some(token) {
 		sessions.remove(&id);
 		drop(sessions);
@@ -117,8 +113,8 @@ fn finish(state: &AppState, id: Uuid, token: u64, app: &Option<AppHandle>) {
 }
 
 /// Push an input event into a running session.
-pub fn send_input(state: &AppState, id: Uuid, event: InputEvent) -> AppResult<()> {
-	let sessions = state.0.sessions.lock().unwrap();
+pub fn send_input(ctrl: &ActiveController, id: Uuid, event: InputEvent) -> AppResult<()> {
+	let sessions = ctrl.sessions.lock().unwrap();
 	let handle = sessions
 		.get(&id)
 		.ok_or_else(|| AppError::msg("no active session for that client"))?;
@@ -128,10 +124,9 @@ pub fn send_input(state: &AppState, id: Uuid, event: InputEvent) -> AppResult<()
 		.map_err(|_| AppError::msg("session has closed"))
 }
 
-/// Stop a running session, if any. Aborting the task before it is first polled
-/// cancels it before it ever opens a stream to the agent.
-pub fn stop(state: &AppState, id: Uuid) {
-	if let Some(handle) = state.0.sessions.lock().unwrap().remove(&id) {
+/// Stop a running session, if any.
+pub fn stop(ctrl: &ActiveController, id: Uuid) {
+	if let Some(handle) = ctrl.sessions.lock().unwrap().remove(&id) {
 		let _ = handle.input_tx.send(SessionClient::Stop);
 		handle.task.abort();
 	}

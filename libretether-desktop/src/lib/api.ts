@@ -1,16 +1,19 @@
 import { invoke } from "@tauri-apps/api/core"
 import { listen, type UnlistenFn } from "@tauri-apps/api/event"
 import type {
+	ActiveInfo,
 	AgentStatus,
 	ClientDto,
 	ClientOs,
-	ControllerInfo,
+	ControllerKind,
+	ControllerSummary,
 	CreateClientResult,
 	ExecResult,
 	Frame,
 	InputEvent,
 	ScreenshotResult,
-	SessionMeta
+	SessionMeta,
+	Settings
 } from "./types"
 
 // ---------------------------------------------------------------- registry
@@ -41,17 +44,21 @@ export const stopControl = (id: string) => invoke<void>("stop_control", { id })
 export const connectRdp = (id: string) => invoke<void>("connect_rdp", { id })
 export const connectSsh = (id: string) => invoke<void>("connect_ssh", { id })
 
-// ---------------------------------------------------------------- controller
-export const controllerInfo = () => invoke<ControllerInfo>("controller_info")
-export const setControllerSettings = (settings: {
-	advertiseAddr: string | null
-	tailscaleAuthKey: string | null
-	rdpClient: string | null
-	terminal: string | null
-	relayAddr: string | null
-	relayOwnerSecret: string | null
-	relayAgentSecret: string | null
-}) => invoke<void>("set_controller_settings", settings)
+// ---------------------------------------------------------------- controllers
+export const listControllers = () => invoke<ControllerSummary[]>("list_controllers")
+export const createController = (name: string, kind: ControllerKind) =>
+	invoke<ControllerSummary>("create_controller", { kind, name })
+export const updateController = (id: string, name: string, kind: ControllerKind) =>
+	invoke<ControllerSummary>("update_controller", { id, kind, name })
+export const deleteController = (id: string) => invoke<void>("delete_controller", { id })
+export const selectController = (id: string) => invoke<ActiveInfo>("select_controller", { id })
+export const exitController = () => invoke<void>("exit_controller")
+export const activeController = () => invoke<ActiveInfo | null>("active_controller")
+
+// ---------------------------------------------------------------- settings
+export const getSettings = () => invoke<Settings>("get_settings")
+export const setSettings = (rdpClient: string | null, terminal: string | null) =>
+	invoke<void>("set_settings", { rdpClient, terminal })
 export const saveTextFile = (path: string, contents: string) => invoke<void>("save_text_file", { contents, path })
 
 // ---------------------------------------------------------------- events

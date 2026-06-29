@@ -1,4 +1,6 @@
-//! Tauri commands — the surface the React UI calls into.
+//! Tauri commands — the surface the React UI calls into. Controller-management
+//! commands operate on saved profiles; everything else operates on the single
+//! currently-active controller (and errors if none is connected).
 
 use libretether_protocol::{
 	AgentStatus, ControlRequest, ControlResponse, ExecResult, InputEvent, ScreenshotResult, SessionConfig, DEFAULT_PORT,
@@ -8,11 +10,14 @@ use tauri::State;
 use uuid::Uuid;
 
 use crate::error::{AppError, AppResult};
+use crate::link::AgentLink;
 use crate::registry::{Client, ClientOs};
 use crate::server::control_request;
-use crate::state::AppState;
+use crate::state::{ActiveController, AppState, ControllerKind};
 use crate::tailscale::{self, TailscaleInfo};
 use crate::{deploy, session};
+
+// ---------------------------------------------------------------- DTOs
 
 #[derive(Serialize)]
 pub struct ClientDto {
@@ -32,23 +37,35 @@ pub struct CreateClientResult {
 	pub deploy_script: String,
 }
 
+/// A saved controller, for the selection screen. Includes the full `kind` (with
+/// secrets) so the edit form can pre-fill — this is the user's own local config.
 #[derive(Serialize)]
-pub struct ControllerInfo {
-	pub listen_port: u16,
+pub struct ControllerSummary {
+	pub id: String,
+	pub name: String,
+	pub kind: ControllerKind,
 	pub fingerprint: String,
-	pub tailscale: TailscaleInfo,
-	/// Manual override for the address agents dial (empty = use Tailscale).
-	pub advertise_addr: Option<String>,
-	/// Tailscale pre-auth key embedded in deploy scripts (empty = direct mode).
-	pub tailscale_auth_key: Option<String>,
-	/// Preferred RDP client key or custom command.
+	pub machine_count: usize,
+	pub active: bool,
+}
+
+/// Info about the controller that is currently connected.
+#[derive(Serialize)]
+pub struct ActiveInfo {
+	pub id: String,
+	pub name: String,
+	pub kind: ControllerKind,
+	pub fingerprint: String,
+	/// host:port agents dial (direct/tailscale), or the relay address.
+	pub reachable_at: Option<String>,
+	/// Present only for Tailscale controllers.
+	pub tailscale: Option<TailscaleInfo>,
+}
+
+#[derive(Serialize)]
+pub struct SettingsDto {
 	pub rdp_client: Option<String>,
-	/// Preferred terminal launcher for SSH.
 	pub terminal: Option<String>,
-	/// Relay address (empty = listen mode / direct + Tailscale).
-	pub relay_addr: Option<String>,
-	pub relay_owner_secret: Option<String>,
-	pub relay_agent_secret: Option<String>,
 }
 
 fn to_dto(client: &Client, online: bool, status: Option<AgentStatus>) -> ClientDto {
@@ -65,26 +82,7 @@ fn to_dto(client: &Client, online: bool, status: Option<AgentStatus>) -> ClientD
 }
 
 fn parse_id(id: &str) -> AppResult<Uuid> {
-	Uuid::parse_str(id).map_err(|_| AppError::msg("invalid client id"))
-}
-
-/// Build the `host:port` agents should dial: the manual advertise address if
-/// set, otherwise the controller's Tailscale address.
-async fn controller_addr(state: &AppState) -> String {
-	let (override_addr, port) = {
-		let cfg = state.0.config.lock().unwrap();
-		(
-			cfg.advertise_addr.clone().filter(|s| !s.trim().is_empty()),
-			cfg.listen_port,
-		)
-	};
-	if let Some(addr) = override_addr {
-		return with_port(&addr, port);
-	}
-	match tailscale::status().await.address {
-		Some(addr) => format!("{addr}:{port}"),
-		None => format!("<controller-address>:{port}"),
-	}
+	Uuid::parse_str(id).map_err(|_| AppError::msg("invalid id"))
 }
 
 fn with_port(addr: &str, port: u16) -> String {
@@ -95,44 +93,192 @@ fn with_port(addr: &str, port: u16) -> String {
 	}
 }
 
-/// The configured Tailscale pre-auth key (embedded in deploy scripts), if any.
-fn auth_key(state: &AppState) -> Option<String> {
-	state
-		.0
-		.config
-		.lock()
-		.unwrap()
-		.tailscale_auth_key
-		.clone()
-		.filter(|s| !s.trim().is_empty())
+async fn tailscale_addr(port: u16) -> String {
+	match tailscale::status().await.address {
+		Some(addr) => format!("{addr}:{port}"),
+		None => format!("<controller-address>:{port}"),
+	}
 }
 
-/// Build the deploy target from config: relay when a relay is configured, else
-/// a direct/Tailscale controller connection.
-async fn deploy_target(state: &AppState) -> deploy::DeployTarget {
-	let (relay_addr, agent_secret) = {
-		let cfg = state.0.config.lock().unwrap();
-		(
-			cfg.relay().map(|s| with_port(s, DEFAULT_PORT)),
-			cfg.relay_agent_secret.clone().unwrap_or_default(),
-		)
+async fn direct_addr(advertise: Option<String>, port: u16) -> String {
+	match advertise.filter(|s| !s.trim().is_empty()) {
+		Some(addr) => with_port(&addr, port),
+		None => format!("<controller-address>:{port}"),
+	}
+}
+
+/// Build the deploy target for the active controller from its kind.
+async fn deploy_target(ctrl: &ActiveController) -> deploy::DeployTarget {
+	match ctrl.profile.kind.clone() {
+		ControllerKind::Relay {
+			address, agent_secret, ..
+		} => deploy::DeployTarget::Relay {
+			address: with_port(&address, DEFAULT_PORT),
+			agent_secret,
+		},
+		ControllerKind::Direct {
+			advertise_addr,
+			listen_port,
+		} => deploy::DeployTarget::Controller {
+			address: direct_addr(advertise_addr, listen_port).await,
+			auth_key: None,
+		},
+		ControllerKind::Tailscale { auth_key, listen_port } => deploy::DeployTarget::Controller {
+			address: tailscale_addr(listen_port).await,
+			auth_key: auth_key.filter(|s| !s.trim().is_empty()),
+		},
+	}
+}
+
+// ---------------------------------------------------------------- controllers
+
+fn summary(state: &AppState, profile: crate::state::ControllerProfile, active_id: Option<Uuid>) -> ControllerSummary {
+	ControllerSummary {
+		machine_count: state.machine_count(profile.id),
+		active: active_id == Some(profile.id),
+		fingerprint: profile.fingerprint(),
+		id: profile.id.to_string(),
+		name: profile.name,
+		kind: profile.kind,
+	}
+}
+
+#[tauri::command]
+pub async fn list_controllers(state: State<'_, AppState>) -> AppResult<Vec<ControllerSummary>> {
+	let state = state.inner().clone();
+	let active_id = state.active().map(|c| c.profile.id);
+	Ok(state
+		.list_profiles()?
+		.into_iter()
+		.map(|p| summary(&state, p, active_id))
+		.collect())
+}
+
+#[tauri::command]
+pub async fn create_controller(
+	state: State<'_, AppState>,
+	name: String,
+	kind: ControllerKind,
+) -> AppResult<ControllerSummary> {
+	let state = state.inner().clone();
+	let name = name.trim().to_string();
+	if name.is_empty() {
+		return Err(AppError::msg("name cannot be empty"));
+	}
+	let profile = state.create_profile(name, kind)?;
+	Ok(summary(&state, profile, state.active().map(|c| c.profile.id)))
+}
+
+#[tauri::command]
+pub async fn update_controller(
+	state: State<'_, AppState>,
+	id: String,
+	name: String,
+	kind: ControllerKind,
+) -> AppResult<ControllerSummary> {
+	let state = state.inner().clone();
+	let id = parse_id(&id)?;
+	let name = name.trim().to_string();
+	if name.is_empty() {
+		return Err(AppError::msg("name cannot be empty"));
+	}
+	let profile = state.update_profile(id, name, kind)?;
+	Ok(summary(&state, profile, state.active().map(|c| c.profile.id)))
+}
+
+#[tauri::command]
+pub async fn delete_controller(state: State<'_, AppState>, id: String) -> AppResult<()> {
+	let state = state.inner().clone();
+	state.delete_profile(parse_id(&id)?)
+}
+
+#[tauri::command]
+pub async fn select_controller(state: State<'_, AppState>, id: String) -> AppResult<ActiveInfo> {
+	let state = state.inner().clone();
+	let ctrl = state.activate(parse_id(&id)?)?;
+	Ok(active_info(&ctrl).await)
+}
+
+#[tauri::command]
+pub async fn exit_controller(state: State<'_, AppState>) -> AppResult<()> {
+	state.inner().deactivate();
+	Ok(())
+}
+
+#[tauri::command]
+pub async fn active_controller(state: State<'_, AppState>) -> AppResult<Option<ActiveInfo>> {
+	let state = state.inner().clone();
+	match state.active() {
+		Some(ctrl) => Ok(Some(active_info(&ctrl).await)),
+		None => Ok(None),
+	}
+}
+
+async fn active_info(ctrl: &ActiveController) -> ActiveInfo {
+	let p = &ctrl.profile;
+	let (reachable_at, tailscale) = match &p.kind {
+		ControllerKind::Relay { address, .. } => (Some(with_port(address, DEFAULT_PORT)), None),
+		ControllerKind::Direct {
+			advertise_addr,
+			listen_port,
+		} => {
+			let addr = advertise_addr
+				.clone()
+				.filter(|s| !s.trim().is_empty())
+				.map(|a| with_port(&a, *listen_port));
+			(addr, None)
+		}
+		ControllerKind::Tailscale { listen_port, .. } => {
+			let ts = tailscale::status().await;
+			let addr = ts.address.as_ref().map(|a| format!("{a}:{listen_port}"));
+			(addr, Some(ts))
+		}
 	};
-	if let Some(address) = relay_addr {
-		return deploy::DeployTarget::Relay { address, agent_secret };
+	ActiveInfo {
+		id: p.id.to_string(),
+		name: p.name.clone(),
+		kind: p.kind.clone(),
+		fingerprint: p.fingerprint(),
+		reachable_at,
+		tailscale,
 	}
-	deploy::DeployTarget::Controller {
-		address: controller_addr(state).await,
-		auth_key: auth_key(state),
+}
+
+// ---------------------------------------------------------------- settings
+
+#[tauri::command]
+pub async fn get_settings(state: State<'_, AppState>) -> AppResult<SettingsDto> {
+	let s = state.inner().0.settings.lock().unwrap();
+	Ok(SettingsDto {
+		rdp_client: s.rdp_client.clone(),
+		terminal: s.terminal.clone(),
+	})
+}
+
+#[tauri::command]
+pub async fn set_settings(
+	state: State<'_, AppState>,
+	rdp_client: Option<String>,
+	terminal: Option<String>,
+) -> AppResult<()> {
+	let state = state.inner().clone();
+	{
+		let mut s = state.0.settings.lock().unwrap();
+		s.rdp_client = rdp_client.filter(|x| !x.trim().is_empty());
+		s.terminal = terminal.filter(|x| !x.trim().is_empty());
 	}
+	state.save_settings()
 }
 
 // ---------------------------------------------------------------- registry
 
 #[tauri::command]
 pub async fn list_clients(state: State<'_, AppState>) -> AppResult<Vec<ClientDto>> {
-	let state = state.inner().clone();
-	let clients: Vec<Client> = state.0.store.lock().unwrap().list().to_vec();
-	let live = state.0.live.lock().unwrap();
+	let Some(ctrl) = state.inner().active() else {
+		return Ok(Vec::new());
+	};
+	let clients: Vec<Client> = ctrl.store.lock().unwrap().list().to_vec();
+	let live = ctrl.live.lock().unwrap();
 	Ok(clients
 		.iter()
 		.map(|c| {
@@ -145,14 +291,14 @@ pub async fn list_clients(state: State<'_, AppState>) -> AppResult<Vec<ClientDto
 #[tauri::command]
 pub async fn create_client(state: State<'_, AppState>, name: String, os: ClientOs) -> AppResult<CreateClientResult> {
 	let state = state.inner().clone();
+	let ctrl = state.require_active()?;
 	let name = name.trim().to_string();
 	if name.is_empty() {
 		return Err(AppError::msg("name cannot be empty"));
 	}
-	let client = state.0.store.lock().unwrap().create(name, os)?;
+	let client = ctrl.store.lock().unwrap().create(name, os)?;
 	let token = client.enrollment_token.clone().unwrap_or_default();
-	let target = deploy_target(&state).await;
-	let deploy_script = deploy::script(client.os, &token, &target);
+	let deploy_script = deploy::script(client.os, &token, &deploy_target(&ctrl).await);
 	state.notify_changed();
 	Ok(CreateClientResult {
 		client: to_dto(&client, false, None),
@@ -163,13 +309,14 @@ pub async fn create_client(state: State<'_, AppState>, name: String, os: ClientO
 #[tauri::command]
 pub async fn remove_client(state: State<'_, AppState>, id: String) -> AppResult<()> {
 	let state = state.inner().clone();
+	let ctrl = state.require_active()?;
 	let id = parse_id(&id)?;
-	session::stop(&state, id);
-	if let Some(link) = state.connection(id) {
+	session::stop(&ctrl, id);
+	if let Some(link) = ctrl.connection(id) {
 		link.close();
 	}
-	state.0.live.lock().unwrap().remove(&id);
-	state.0.store.lock().unwrap().remove(id)?;
+	ctrl.live.lock().unwrap().remove(&id);
+	ctrl.store.lock().unwrap().remove(id)?;
 	state.notify_changed();
 	Ok(())
 }
@@ -177,45 +324,49 @@ pub async fn remove_client(state: State<'_, AppState>, id: String) -> AppResult<
 #[tauri::command]
 pub async fn rename_client(state: State<'_, AppState>, id: String, name: String) -> AppResult<()> {
 	let state = state.inner().clone();
+	let ctrl = state.require_active()?;
 	let id = parse_id(&id)?;
 	let name = name.trim().to_string();
 	if name.is_empty() {
 		return Err(AppError::msg("name cannot be empty"));
 	}
-	state.0.store.lock().unwrap().rename(id, name)?;
+	ctrl.store.lock().unwrap().rename(id, name)?;
 	state.notify_changed();
 	Ok(())
 }
 
 #[tauri::command]
 pub async fn get_deploy_script(state: State<'_, AppState>, id: String, os: Option<ClientOs>) -> AppResult<String> {
-	let state = state.inner().clone();
+	let ctrl = state.inner().require_active()?;
 	let id = parse_id(&id)?;
 	let (client_os, token) = {
-		let store = state.0.store.lock().unwrap();
+		let store = ctrl.store.lock().unwrap();
 		let c = store.get(id).ok_or(AppError::NotFound)?;
 		(c.os, c.enrollment_token.clone())
 	};
 	let token = token.ok_or_else(|| AppError::msg("client already enrolled — reset its token to re-deploy"))?;
-	let target = deploy_target(&state).await;
-	Ok(deploy::script(os.unwrap_or(client_os), &token, &target))
+	Ok(deploy::script(
+		os.unwrap_or(client_os),
+		&token,
+		&deploy_target(&ctrl).await,
+	))
 }
 
 #[tauri::command]
 pub async fn reset_token(state: State<'_, AppState>, id: String) -> AppResult<CreateClientResult> {
 	let state = state.inner().clone();
+	let ctrl = state.require_active()?;
 	let id = parse_id(&id)?;
-	let token = state.0.store.lock().unwrap().reset_token(id)?;
-	// Resolve the deploy target with no lock held across the await.
-	let target = deploy_target(&state).await;
+	let token = ctrl.store.lock().unwrap().reset_token(id)?;
+	let target = deploy_target(&ctrl).await;
 	let client = {
-		let store = state.0.store.lock().unwrap();
+		let store = ctrl.store.lock().unwrap();
 		store.get(id).ok_or(AppError::NotFound)?.clone()
 	};
 	let deploy_script = deploy::script(client.os, &token, &target);
 	state.notify_changed();
 	Ok(CreateClientResult {
-		client: to_dto(&client, state.is_online(id), None),
+		client: to_dto(&client, ctrl.is_online(id), None),
 		deploy_script,
 	})
 }
@@ -224,12 +375,12 @@ pub async fn reset_token(state: State<'_, AppState>, id: String) -> AppResult<Cr
 
 #[tauri::command]
 pub async fn client_status(state: State<'_, AppState>, id: String) -> AppResult<AgentStatus> {
-	let state = state.inner().clone();
+	let ctrl = state.inner().require_active()?;
 	let id = parse_id(&id)?;
-	let conn = state.connection(id).ok_or(AppError::Offline)?;
+	let conn = ctrl.connection(id).ok_or(AppError::Offline)?;
 	match control_request(&conn, &ControlRequest::Status).await? {
 		ControlResponse::Status(status) => {
-			if let Some(live) = state.0.live.lock().unwrap().get_mut(&id) {
+			if let Some(live) = ctrl.live.lock().unwrap().get_mut(&id) {
 				live.status = Some(status.clone());
 			}
 			Ok(status)
@@ -247,9 +398,9 @@ pub async fn client_exec(
 	args: Vec<String>,
 	timeout_secs: Option<u64>,
 ) -> AppResult<ExecResult> {
-	let state = state.inner().clone();
+	let ctrl = state.inner().require_active()?;
 	let id = parse_id(&id)?;
-	let conn = state.connection(id).ok_or(AppError::Offline)?;
+	let conn = ctrl.connection(id).ok_or(AppError::Offline)?;
 	match control_request(
 		&conn,
 		&ControlRequest::Exec {
@@ -272,9 +423,9 @@ pub async fn client_screenshot(
 	id: String,
 	display: Option<u32>,
 ) -> AppResult<ScreenshotResult> {
-	let state = state.inner().clone();
+	let ctrl = state.inner().require_active()?;
 	let id = parse_id(&id)?;
-	let conn = state.connection(id).ok_or(AppError::Offline)?;
+	let conn = ctrl.connection(id).ok_or(AppError::Offline)?;
 	match control_request(&conn, &ControlRequest::Screenshot { display }).await? {
 		ControlResponse::Screenshot(shot) => Ok(shot),
 		ControlResponse::Error { message } => Err(AppError::Agent(message)),
@@ -293,6 +444,7 @@ pub async fn start_control(
 	max_fps: Option<u8>,
 ) -> AppResult<()> {
 	let state = state.inner().clone();
+	let ctrl = state.require_active()?;
 	let id = parse_id(&id)?;
 	let defaults = SessionConfig::default();
 	let cfg = SessionConfig {
@@ -300,50 +452,26 @@ pub async fn start_control(
 		quality: quality.unwrap_or(defaults.quality),
 		max_fps: max_fps.unwrap_or(defaults.max_fps),
 	};
-	session::start(state, id, cfg);
+	session::start(&state, ctrl, id, cfg);
 	Ok(())
 }
 
 #[tauri::command]
 pub async fn send_input(state: State<'_, AppState>, id: String, event: InputEvent) -> AppResult<()> {
-	let state = state.inner().clone();
-	let id = parse_id(&id)?;
-	session::send_input(&state, id, event)
+	let ctrl = state.inner().require_active()?;
+	session::send_input(&ctrl, parse_id(&id)?, event)
 }
 
 #[tauri::command]
 pub async fn stop_control(state: State<'_, AppState>, id: String) -> AppResult<()> {
-	let state = state.inner().clone();
-	let id = parse_id(&id)?;
-	session::stop(&state, id);
+	let ctrl = state.inner().require_active()?;
+	session::stop(&ctrl, parse_id(&id)?);
 	Ok(())
-}
-
-/// Enable RDP on the client and launch the host's RDP viewer at its tailnet IP.
-#[tauri::command]
-pub async fn connect_rdp(state: State<'_, AppState>, id: String) -> AppResult<()> {
-	let state = state.inner().clone();
-	let id = parse_id(&id)?;
-	let conn = state.connection(id).ok_or(AppError::Offline)?;
-	let info = match control_request(&conn, &ControlRequest::EnableRdp).await? {
-		ControlResponse::Rdp(info) => info,
-		ControlResponse::Error { message } => return Err(AppError::Agent(message)),
-		_ => return Err(AppError::msg("unexpected response")),
-	};
-	// In relay mode the client isn't directly reachable, so tunnel a loopback
-	// port to its RDP server; otherwise dial its tailnet/reported address.
-	let (host, port) = client_endpoint(&conn, info.address.clone(), info.port).await?;
-	let pref = state.0.config.lock().unwrap().rdp_client.clone();
-	crate::rdp::launch(pref.as_deref(), &host, port, &info.username, info.password.as_deref())
 }
 
 /// Resolve `(host, port)` to point a client at — tunneling through the relay
 /// when the agent isn't directly reachable.
-async fn client_endpoint(
-	conn: &crate::link::AgentLink,
-	reported: Option<String>,
-	remote_port: u16,
-) -> AppResult<(String, u16)> {
+async fn client_endpoint(conn: &AgentLink, reported: Option<String>, remote_port: u16) -> AppResult<(String, u16)> {
 	if conn.is_relay() {
 		let local = crate::tunnel::open(conn.clone(), remote_port).await?;
 		return Ok(("127.0.0.1".to_string(), local));
@@ -355,6 +483,23 @@ async fn client_endpoint(
 	Ok((host, remote_port))
 }
 
+/// Enable RDP on the client and launch the host's RDP viewer.
+#[tauri::command]
+pub async fn connect_rdp(state: State<'_, AppState>, id: String) -> AppResult<()> {
+	let state = state.inner().clone();
+	let ctrl = state.require_active()?;
+	let id = parse_id(&id)?;
+	let conn = ctrl.connection(id).ok_or(AppError::Offline)?;
+	let info = match control_request(&conn, &ControlRequest::EnableRdp).await? {
+		ControlResponse::Rdp(info) => info,
+		ControlResponse::Error { message } => return Err(AppError::Agent(message)),
+		_ => return Err(AppError::msg("unexpected response")),
+	};
+	let (host, port) = client_endpoint(&conn, info.address.clone(), info.port).await?;
+	let pref = state.0.settings.lock().unwrap().rdp_client.clone();
+	crate::rdp::launch(pref.as_deref(), &host, port, &info.username, info.password.as_deref())
+}
+
 /// Probe that an SSH server actually answers at `host:port` (through the tunnel
 /// in relay mode) before launching a terminal — otherwise `ssh` just flashes
 /// open and closes with no explanation when the client has no SSH server.
@@ -364,7 +509,6 @@ async fn ssh_reachable(host: &str, port: u16) -> bool {
 	let Ok(Ok(mut stream)) = tokio::time::timeout(std::time::Duration::from_secs(6), connect).await else {
 		return false;
 	};
-	// A real SSH server greets with an "SSH-..." banner as soon as you connect.
 	let mut buf = [0u8; 1];
 	matches!(
 		tokio::time::timeout(std::time::Duration::from_secs(6), stream.read(&mut buf)).await,
@@ -372,12 +516,13 @@ async fn ssh_reachable(host: &str, port: u16) -> bool {
 	)
 }
 
-/// Open a terminal SSH session to a client at its tailnet IP.
+/// Open a terminal SSH session to a client.
 #[tauri::command]
 pub async fn connect_ssh(state: State<'_, AppState>, id: String) -> AppResult<()> {
 	let state = state.inner().clone();
+	let ctrl = state.require_active()?;
 	let id = parse_id(&id)?;
-	let conn = state.connection(id).ok_or(AppError::Offline)?;
+	let conn = ctrl.connection(id).ok_or(AppError::Offline)?;
 	let status = match control_request(&conn, &ControlRequest::Status).await? {
 		ControlResponse::Status(s) => s,
 		ControlResponse::Error { message } => return Err(AppError::Agent(message)),
@@ -390,14 +535,10 @@ pub async fn connect_ssh(state: State<'_, AppState>, id: String) -> AppResult<()
 			status.host.hostname
 		)));
 	}
-	let terminal = state.0.config.lock().unwrap().terminal.clone();
+	let terminal = state.0.settings.lock().unwrap().terminal.clone();
 	crate::ssh::launch(terminal.as_deref(), &host, port, &status.host.username)
 }
 
-// ---------------------------------------------------------------- controller
-
-/// Write text to a path the user picked via the save dialog. Used to save a
-/// generated deploy script; `.sh` files are made executable.
 #[tauri::command]
 pub async fn save_text_file(path: String, contents: String) -> AppResult<()> {
 	std::fs::write(&path, contents)?;
@@ -406,80 +547,5 @@ pub async fn save_text_file(path: String, contents: String) -> AppResult<()> {
 		use std::os::unix::fs::PermissionsExt;
 		let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755));
 	}
-	Ok(())
-}
-
-#[tauri::command]
-pub async fn controller_info(state: State<'_, AppState>) -> AppResult<ControllerInfo> {
-	let state = state.inner().clone();
-	let c = {
-		let cfg = state.0.config.lock().unwrap();
-		ControllerConfigDto {
-			listen_port: cfg.listen_port,
-			fingerprint: cfg.fingerprint(),
-			advertise_addr: cfg.advertise_addr.clone(),
-			tailscale_auth_key: cfg.tailscale_auth_key.clone(),
-			rdp_client: cfg.rdp_client.clone(),
-			terminal: cfg.terminal.clone(),
-			relay_addr: cfg.relay_addr.clone(),
-			relay_owner_secret: cfg.relay_owner_secret.clone(),
-			relay_agent_secret: cfg.relay_agent_secret.clone(),
-		}
-	};
-	Ok(ControllerInfo {
-		listen_port: c.listen_port,
-		fingerprint: c.fingerprint,
-		tailscale: tailscale::status().await,
-		advertise_addr: c.advertise_addr,
-		tailscale_auth_key: c.tailscale_auth_key,
-		rdp_client: c.rdp_client,
-		terminal: c.terminal,
-		relay_addr: c.relay_addr,
-		relay_owner_secret: c.relay_owner_secret,
-		relay_agent_secret: c.relay_agent_secret,
-	})
-}
-
-/// Plain snapshot of config fields, so the lock isn't held across the await.
-struct ControllerConfigDto {
-	listen_port: u16,
-	fingerprint: String,
-	advertise_addr: Option<String>,
-	tailscale_auth_key: Option<String>,
-	rdp_client: Option<String>,
-	terminal: Option<String>,
-	relay_addr: Option<String>,
-	relay_owner_secret: Option<String>,
-	relay_agent_secret: Option<String>,
-}
-
-/// Update the address agents dial and/or the embedded Tailscale auth key. Empty
-/// strings clear the setting.
-#[tauri::command]
-#[allow(clippy::too_many_arguments)]
-pub async fn set_controller_settings(
-	state: State<'_, AppState>,
-	advertise_addr: Option<String>,
-	tailscale_auth_key: Option<String>,
-	rdp_client: Option<String>,
-	terminal: Option<String>,
-	relay_addr: Option<String>,
-	relay_owner_secret: Option<String>,
-	relay_agent_secret: Option<String>,
-) -> AppResult<()> {
-	let state = state.inner().clone();
-	let clean = |s: Option<String>| s.map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
-	{
-		let mut cfg = state.0.config.lock().unwrap();
-		cfg.advertise_addr = clean(advertise_addr);
-		cfg.tailscale_auth_key = clean(tailscale_auth_key);
-		cfg.rdp_client = clean(rdp_client);
-		cfg.terminal = clean(terminal);
-		cfg.relay_addr = clean(relay_addr);
-		cfg.relay_owner_secret = clean(relay_owner_secret);
-		cfg.relay_agent_secret = clean(relay_agent_secret);
-	}
-	state.save_config()?;
-	state.notify_changed();
 	Ok(())
 }

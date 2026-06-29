@@ -38,21 +38,21 @@ pub fn run() {
 		.plugin(tauri_plugin_clipboard_manager::init())
 		.manage(state.clone())
 		.setup(move |app| {
-			// Hand the state an app handle so it can emit change events, then
-			// start the QUIC listener that agents dial into.
+			// Hand the state an app handle so it can emit change events. No
+			// controller serves until the user selects one on the launch screen.
 			state.set_app(app.handle().clone());
-			let serve_state = state.clone();
-			let relay = serve_state.0.config.lock().unwrap().relay().is_some();
-			tauri::async_runtime::spawn(async move {
-				if relay {
-					server::serve_relay(serve_state).await;
-				} else {
-					server::serve(serve_state).await;
-				}
-			});
 			Ok(())
 		})
 		.invoke_handler(tauri::generate_handler![
+			commands::list_controllers,
+			commands::create_controller,
+			commands::update_controller,
+			commands::delete_controller,
+			commands::select_controller,
+			commands::exit_controller,
+			commands::active_controller,
+			commands::get_settings,
+			commands::set_settings,
 			commands::list_clients,
 			commands::create_client,
 			commands::remove_client,
@@ -68,8 +68,6 @@ pub fn run() {
 			commands::connect_rdp,
 			commands::connect_ssh,
 			commands::save_text_file,
-			commands::controller_info,
-			commands::set_controller_settings,
 		])
 		.run(tauri::generate_context!())
 		.expect("error while running LibreTether");

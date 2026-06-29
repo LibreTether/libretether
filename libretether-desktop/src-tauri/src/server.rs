@@ -1,12 +1,14 @@
-//! The controller's connection layer. In direct/Tailscale mode it runs a QUIC
-//! server agents dial into; in relay mode it dials the relay and learns about
-//! agents through presence events. Both paths share [`enroll_and_register`] and
-//! address agents through an [`AgentLink`].
+//! The active controller's connection layer. In direct/Tailscale mode it runs a
+//! QUIC server agents dial into; in relay mode it dials the relay and learns
+//! about agents through presence events. Both paths share [`enroll_and_register`]
+//! and address agents through an [`AgentLink`]. All state lives on the
+//! [`ActiveController`] passed in, so each controller is fully isolated.
 
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::Duration;
 
-use libretether_protocol::crypto::{self, Identity};
+use libretether_protocol::crypto;
 use libretether_protocol::frame::{read_frame, write_frame};
 use libretether_protocol::relay::{RelayAck, RelayEvent, RelayHello, RelayRole};
 use libretether_protocol::{
@@ -17,7 +19,7 @@ use uuid::Uuid;
 
 use crate::error::{AppError, AppResult};
 use crate::link::AgentLink;
-use crate::state::{AppState, LiveConn};
+use crate::state::{ActiveController, AppState, ControllerKind, LiveConn};
 
 fn log(msg: &str) {
 	eprintln!("[libretether] {msg}");
@@ -26,17 +28,15 @@ fn log(msg: &str) {
 // ---------------------------------------------------------------- direct mode
 
 /// Bind the QUIC listener and accept agents forever (direct / Tailscale mode).
-pub async fn serve(state: AppState) {
-	let (cert, key, port) = {
-		let cfg = state.0.config.lock().unwrap();
-		match cfg.cert_key_der() {
-			Ok((c, k)) => (c, k, cfg.listen_port),
-			Err(e) => {
-				log(&format!("invalid controller certificate: {e}"));
-				return;
-			}
+pub async fn serve(state: AppState, ctrl: Arc<ActiveController>) {
+	let (cert, key) = match ctrl.profile.cert_key_der() {
+		Ok(ck) => ck,
+		Err(e) => {
+			log(&format!("invalid controller certificate: {e}"));
+			return;
 		}
 	};
+	let port = ctrl.profile.kind.listen_port();
 
 	let endpoint = match Endpoint::server(tls::server_config(cert, key), SocketAddr::from(([0, 0, 0, 0], port))) {
 		Ok(ep) => ep,
@@ -45,19 +45,20 @@ pub async fn serve(state: AppState) {
 			return;
 		}
 	};
-	log(&format!("listening for agents on udp/{port}"));
+	log(&format!("[{}] listening for agents on udp/{port}", ctrl.profile.name));
 
 	while let Some(incoming) = endpoint.accept().await {
 		let state = state.clone();
+		let ctrl = ctrl.clone();
 		tauri::async_runtime::spawn(async move {
-			if let Err(e) = handle_direct(state, incoming).await {
+			if let Err(e) = handle_direct(state, ctrl, incoming).await {
 				log(&format!("connection error: {e}"));
 			}
 		});
 	}
 }
 
-async fn handle_direct(state: AppState, incoming: quinn::Incoming) -> AppResult<()> {
+async fn handle_direct(state: AppState, ctrl: Arc<ActiveController>, incoming: quinn::Incoming) -> AppResult<()> {
 	let conn = incoming
 		.accept()
 		.map_err(|e| AppError::msg(format!("accept: {e}")))?
@@ -65,9 +66,9 @@ async fn handle_direct(state: AppState, incoming: quinn::Incoming) -> AppResult<
 		.map_err(|e| AppError::msg(format!("handshake: {e}")))?;
 
 	let link = AgentLink::Direct(conn.clone());
-	if let Some(id) = enroll_and_register(state.clone(), link).await? {
+	if let Some(id) = enroll_and_register(&state, &ctrl, link).await? {
 		conn.closed().await;
-		cleanup(&state, id);
+		cleanup(&state, &ctrl, id);
 		log(&format!("agent {id} disconnected"));
 	}
 	Ok(())
@@ -76,27 +77,26 @@ async fn handle_direct(state: AppState, incoming: quinn::Incoming) -> AppResult<
 // ---------------------------------------------------------------- relay mode
 
 /// Dial the relay and track agents through it (relay mode), reconnecting on drop.
-pub async fn serve_relay(state: AppState) {
-	let (relay_addr, owner_secret, pubkey) = {
-		let cfg = state.0.config.lock().unwrap();
-		let Some(addr) = cfg.relay().map(str::to_string) else {
-			log("relay mode selected but no relay address configured");
+pub async fn serve_relay(state: AppState, ctrl: Arc<ActiveController>) {
+	let (relay_addr, owner_secret) = match &ctrl.profile.kind {
+		ControllerKind::Relay {
+			address, owner_secret, ..
+		} => (address.clone(), owner_secret.clone()),
+		_ => {
+			log("relay serve started for a non-relay controller");
 			return;
-		};
-		let pubkey = Identity::from_seed_b64(&cfg.identity_seed)
-			.map(|i| i.public_b64())
-			.unwrap_or_default();
-		(addr, cfg.relay_owner_secret.clone().unwrap_or_default(), pubkey)
+		}
 	};
+	let pubkey = ctrl.profile.public_key();
 
 	let mut backoff = 1u64;
 	loop {
-		match relay_session(&state, &relay_addr, &owner_secret, &pubkey).await {
+		match relay_session(&state, &ctrl, &relay_addr, &owner_secret, &pubkey).await {
 			Ok(()) => backoff = 1,
 			Err(e) => log(&format!("relay error: {e:#}")),
 		}
 		// The relay is gone, so every agent is unreachable.
-		state.0.live.lock().unwrap().clear();
+		ctrl.live.lock().unwrap().clear();
 		state.notify_changed();
 		let wait = backoff.min(5);
 		log(&format!("reconnecting to relay in {wait}s"));
@@ -105,7 +105,13 @@ pub async fn serve_relay(state: AppState) {
 	}
 }
 
-async fn relay_session(state: &AppState, relay_addr: &str, owner_secret: &str, pubkey: &str) -> AppResult<()> {
+async fn relay_session(
+	state: &AppState,
+	ctrl: &Arc<ActiveController>,
+	relay_addr: &str,
+	owner_secret: &str,
+	pubkey: &str,
+) -> AppResult<()> {
 	let addr = resolve(relay_addr).await?;
 	log(&format!("dialing relay at {addr}"));
 	let endpoint = make_client_endpoint(addr)?;
@@ -142,20 +148,21 @@ async fn relay_session(state: &AppState, relay_addr: &str, owner_secret: &str, p
 		match event {
 			RelayEvent::AgentOnline { public_key } => {
 				let state = state.clone();
+				let ctrl = ctrl.clone();
 				let link = AgentLink::Relay {
 					relay: conn.clone(),
 					agent: public_key,
 				};
 				tauri::async_runtime::spawn(async move {
-					if let Err(e) = enroll_and_register(state, link).await {
+					if let Err(e) = enroll_and_register(&state, &ctrl, link).await {
 						log(&format!("enroll via relay failed: {e}"));
 					}
 				});
 			}
 			RelayEvent::AgentOffline { public_key } => {
-				let id = state.0.store.lock().unwrap().id_for_pubkey(&public_key);
+				let id = ctrl.store.lock().unwrap().id_for_pubkey(&public_key);
 				if let Some(id) = id {
-					cleanup(state, id);
+					cleanup(state, ctrl, id);
 				}
 			}
 		}
@@ -191,7 +198,7 @@ async fn resolve(addr: &str) -> AppResult<SocketAddr> {
 
 /// Run the Ed25519 handshake over `link`, enroll/identify the agent, register it
 /// in the live map and pull an initial status. Returns the client id on success.
-async fn enroll_and_register(state: AppState, link: AgentLink) -> AppResult<Option<Uuid>> {
+async fn enroll_and_register(state: &AppState, ctrl: &ActiveController, link: AgentLink) -> AppResult<Option<Uuid>> {
 	let (mut send, mut recv) = link.open_bi().await?;
 	write_frame(&mut send, &StreamOpen::Handshake).await?;
 	let nonce = crypto::random_nonce_b64();
@@ -208,7 +215,7 @@ async fn enroll_and_register(state: AppState, link: AgentLink) -> AppResult<Opti
 	}
 
 	let client_id = {
-		let mut store = state.0.store.lock().unwrap();
+		let mut store = ctrl.store.lock().unwrap();
 		store.authenticate(hello.enrollment_token.as_deref(), &hello.public_key)
 	};
 	let Some(client_id) = client_id else {
@@ -231,7 +238,7 @@ async fn enroll_and_register(state: AppState, link: AgentLink) -> AppResult<Opti
 		hello.host.hostname, hello.host.os
 	));
 
-	state.0.live.lock().unwrap().insert(
+	ctrl.live.lock().unwrap().insert(
 		client_id,
 		LiveConn {
 			link: link.clone(),
@@ -241,7 +248,7 @@ async fn enroll_and_register(state: AppState, link: AgentLink) -> AppResult<Opti
 	state.notify_changed();
 
 	if let Ok(ControlResponse::Status(status)) = control_request(&link, &ControlRequest::Status).await {
-		if let Some(live) = state.0.live.lock().unwrap().get_mut(&client_id) {
+		if let Some(live) = ctrl.live.lock().unwrap().get_mut(&client_id) {
 			live.status = Some(status);
 		}
 		state.notify_changed();
@@ -249,9 +256,9 @@ async fn enroll_and_register(state: AppState, link: AgentLink) -> AppResult<Opti
 	Ok(Some(client_id))
 }
 
-fn cleanup(state: &AppState, id: Uuid) {
-	state.0.live.lock().unwrap().remove(&id);
-	state.0.store.lock().unwrap().touch_seen(id);
+fn cleanup(state: &AppState, ctrl: &ActiveController, id: Uuid) {
+	ctrl.live.lock().unwrap().remove(&id);
+	ctrl.store.lock().unwrap().touch_seen(id);
 	state.notify_changed();
 }
 

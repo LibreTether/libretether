@@ -35,11 +35,11 @@ LibreTether is two programs that talk over [QUIC](https://en.wikipedia.org/wiki/
 
 ### Connection modes
 
-On the **Controller** page you pick how the controller and clients reach each other. None
-of the modes require the client to log in:
+Each controller you create has a **type** that sets how it and its clients reach each other
+(picked when you create the controller on the launch screen). None require the client to log in:
 
-- **Tailscale** — paste a [Tailscale **auth key**](https://tailscale.com/kb/1085/auth-keys)
-  into the controller. Deploy scripts run `tailscale up --authkey=…`, so each client joins
+- **Tailscale** — give the controller a [Tailscale **auth key**](https://tailscale.com/kb/1085/auth-keys).
+  Deploy scripts run `tailscale up --authkey=…`, so each client joins
   your tailnet **non-interactively**. NAT traversal is free (Tailscale's DERP relays). The
   controller listens on its tailnet address; agents dial in.
 - **Direct** — no Tailscale. Agents dial the controller's advertise address, which must be
@@ -58,9 +58,10 @@ of the modes require the client to log in:
    ```
    libretether-relay info       # prints listen address + the two secrets
    ```
-2. On the **Controller** page → **Relay**, enter the relay's `host:port` and the two secrets,
-   save, and restart LibreTether. The controller now dials the relay instead of listening.
-3. Add machines as usual — their deploy scripts now enrol against the relay (no Tailscale,
+2. In the app's launch screen, **New controller → Relay**, give it a name and enter the relay's
+   `host:port` and the two secrets, then **Connect**. The controller dials the relay instead of
+   listening.
+3. Add machines as usual — their deploy scripts enrol against the relay (no Tailscale,
    no exposure). Open UDP 47600 on the cloud host's firewall.
 
 #### Run the relay with Docker
@@ -117,13 +118,13 @@ Every method rides Tailscale straight to the client's private IP — no extra tu
   your host's RDP viewer at the client's tailnet IP. On Linux it drives
   **gnome-remote-desktop** (`grdctl`) with generated credentials, so there's **no per-connect
   consent prompt** and it sidesteps the Wayland portal entirely; on Windows it enables the
-  built-in Remote Desktop service. Choose your viewer on the **Controller** page — FreeRDP,
+  built-in Remote Desktop service. Choose your viewer under **Connection → Host tools** — FreeRDP,
   Remmina, GNOME Connections, or a custom command. Requirements: an RDP client on the
   **controller** (FreeRDP installed by `run setup`) and `gnome-remote-desktop` on **Linux
   clients** (installed by the deploy script). macOS has no built-in RDP server.
 - **SSH** — the **Connect via SSH** button opens your terminal running `ssh` to the client's
-  tailnet IP (as the agent's user). The client needs `sshd`; pick your terminal on the
-  Controller page (or it auto-detects gnome-terminal/konsole/xterm/…).
+  tailnet IP (as the agent's user). The client needs `sshd`; pick your terminal under
+  **Connection → Host tools** (or it auto-detects gnome-terminal/konsole/xterm/…).
 
 ### Security
 

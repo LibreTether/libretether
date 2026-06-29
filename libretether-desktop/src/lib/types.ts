@@ -42,17 +42,36 @@ export interface TailscaleInfo {
 	hostname: string | null
 }
 
-export interface ControllerInfo {
-	listen_port: number
+// A controller's connection type. Field names are snake_case to match the Rust
+// serde enum (tag "type") — the object is sent verbatim to the backend.
+export type ControllerKind =
+	| { type: "direct"; advertise_addr: string | null; listen_port: number }
+	| { type: "tailscale"; auth_key: string | null; listen_port: number }
+	| { type: "relay"; address: string; owner_secret: string; agent_secret: string }
+
+export type ControllerType = ControllerKind["type"]
+
+export interface ControllerSummary {
+	id: string
+	name: string
+	kind: ControllerKind
 	fingerprint: string
-	tailscale: TailscaleInfo
-	advertise_addr: string | null
-	tailscale_auth_key: string | null
+	machine_count: number
+	active: boolean
+}
+
+export interface ActiveInfo {
+	id: string
+	name: string
+	kind: ControllerKind
+	fingerprint: string
+	reachable_at: string | null
+	tailscale: TailscaleInfo | null
+}
+
+export interface Settings {
 	rdp_client: string | null
 	terminal: string | null
-	relay_addr: string | null
-	relay_owner_secret: string | null
-	relay_agent_secret: string | null
 }
 
 export interface ExecResult {

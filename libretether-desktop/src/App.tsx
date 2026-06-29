@@ -2,13 +2,15 @@ import { useCallback, useEffect, useState } from "react"
 import { ControlOverlay } from "./components/ControlOverlay"
 import { ConfirmProvider } from "./components/confirm"
 import { type Page, Sidebar } from "./components/Sidebar"
+import { Spinner } from "./components/ui"
 import * as api from "./lib/api"
 import { ToastProvider, useToast } from "./lib/toast"
-import type { ClientDto } from "./lib/types"
-import { ControllerPage } from "./pages/ControllerPage"
+import type { ActiveInfo, ClientDto } from "./lib/types"
+import { ConnectionPage } from "./pages/ConnectionPage"
+import { ControllerSelect } from "./pages/ControllerSelect"
 import { MachinesPage } from "./pages/MachinesPage"
 
-function Shell() {
+function Shell({ active, onExit }: { active: ActiveInfo; onExit: () => void }) {
 	const toast = useToast()
 	const [page, setPage] = useState<Page>("machines")
 	const [clients, setClients] = useState<ClientDto[]>([])
@@ -30,16 +32,25 @@ function Shell() {
 		}
 	}, [reload])
 
+	const exit = async () => {
+		try {
+			await api.exitController()
+		} catch {
+			/* exiting regardless */
+		}
+		onExit()
+	}
+
 	const onlineCount = clients.filter((c) => c.online).length
 
 	return (
 		<div className="flex h-screen overflow-hidden">
-			<Sidebar onlineCount={onlineCount} onNavigate={setPage} page={page} />
+			<Sidebar active={active} onExit={exit} onlineCount={onlineCount} onNavigate={setPage} page={page} />
 			<main className="flex min-w-0 flex-1 flex-col overflow-hidden">
 				{page === "machines" && (
 					<MachinesPage clients={clients} loading={loading} onControl={setControl} onReload={reload} />
 				)}
-				{page === "controller" && <ControllerPage />}
+				{page === "controller" && <ConnectionPage active={active} />}
 			</main>
 
 			{control && <ControlOverlay client={control} onClose={() => setControl(null)} />}
@@ -47,11 +58,37 @@ function Shell() {
 	)
 }
 
+function Root() {
+	const [active, setActive] = useState<ActiveInfo | null>(null)
+	const [loading, setLoading] = useState(true)
+
+	useEffect(() => {
+		api.activeController()
+			.then(setActive)
+			.catch(() => setActive(null))
+			.finally(() => setLoading(false))
+	}, [])
+
+	if (loading) {
+		return (
+			<div className="grid h-screen place-items-center">
+				<Spinner className="h-6 w-6" />
+			</div>
+		)
+	}
+
+	return active ? (
+		<Shell active={active} onExit={() => setActive(null)} />
+	) : (
+		<ControllerSelect onConnected={setActive} />
+	)
+}
+
 export default function App() {
 	return (
 		<ToastProvider>
 			<ConfirmProvider>
-				<Shell />
+				<Root />
 			</ConfirmProvider>
 		</ToastProvider>
 	)
