@@ -35,6 +35,7 @@ pub async fn open(link: AgentLink, remote_port: u16) -> AppResult<u16> {
 async fn forward(link: AgentLink, remote_port: u16, tcp: TcpStream) -> AppResult<()> {
 	let (mut send, mut recv) = link.open_bi().await?;
 	write_frame(&mut send, &StreamOpen::Tunnel { port: remote_port }).await?;
+	link.authenticate(&mut send).await?;
 
 	let (mut tcp_read, mut tcp_write) = tcp.into_split();
 	// Half-close each direction when its source ends, then wait for BOTH — a

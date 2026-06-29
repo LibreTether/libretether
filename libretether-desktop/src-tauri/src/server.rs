@@ -9,10 +9,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use libretether_protocol::crypto;
-use libretether_protocol::frame::{read_frame, write_frame};
-use libretether_protocol::relay::{RelayAck, RelayEvent, RelayHello, RelayRole};
+use libretether_protocol::frame::{read_frame, read_frame_capped, write_frame, MAX_CONTROL_FRAME};
+use libretether_protocol::relay::{RelayAck, RelayChallenge, RelayEvent, RelayHello, RelayProof, RelayRole};
 use libretether_protocol::{
-	tls, Challenge, ControlRequest, ControlResponse, Hello, HelloAck, StreamOpen, PROTOCOL_VERSION,
+	tls, Challenge, ControlRequest, ControlResponse, Hello, HelloAck, SessionGrant, StreamOpen, PROTOCOL_VERSION,
 };
 use quinn::Endpoint;
 use tauri::Emitter;
@@ -25,6 +25,10 @@ use crate::state::{ActiveController, AppState, ControllerKind, LiveConn};
 /// Relay-connection progress, surfaced to the connecting screen.
 pub const EVENT_RELAY_LOG: &str = "controller:log";
 pub const EVENT_RELAY_CONNECTED: &str = "controller:connected";
+
+/// How long the handshake may take before we drop a connecting peer, so one that
+/// connects and then stalls can't tie up a task indefinitely.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 fn log(msg: &str) {
 	eprintln!("[libretether] {msg}");
@@ -78,7 +82,7 @@ async fn handle_direct(state: AppState, ctrl: Arc<ActiveController>, incoming: q
 		.await
 		.map_err(|e| AppError::msg(format!("handshake: {e}")))?;
 
-	let link = AgentLink::Direct(conn.clone());
+	let link = AgentLink::direct(conn.clone());
 	if let Some(id) = enroll_and_register(&state, &ctrl, link).await? {
 		conn.closed().await;
 		cleanup(&state, &ctrl, id);
@@ -147,7 +151,13 @@ async fn relay_session(
 		},
 	)
 	.await?;
-	let ack: RelayAck = read_frame(&mut recv).await?;
+	// Prove possession of our identity key to the relay.
+	let challenge: RelayChallenge = read_frame_capped(&mut recv, MAX_CONTROL_FRAME).await?;
+	let proof = RelayProof {
+		signature: ctrl.profile.identity()?.sign_b64(challenge.nonce.as_bytes()),
+	};
+	write_frame(&mut send, &proof).await?;
+	let ack: RelayAck = read_frame_capped(&mut recv, MAX_CONTROL_FRAME).await?;
 	if !ack.accepted {
 		return Err(AppError::msg(format!(
 			"relay rejected controller: {}",
@@ -160,15 +170,12 @@ async fn relay_session(
 	}
 
 	loop {
-		let event: RelayEvent = read_frame(&mut recv).await?;
+		let event: RelayEvent = read_frame_capped(&mut recv, MAX_CONTROL_FRAME).await?;
 		match event {
 			RelayEvent::AgentOnline { public_key } => {
 				let state = state.clone();
 				let ctrl = ctrl.clone();
-				let link = AgentLink::Relay {
-					relay: conn.clone(),
-					agent: public_key,
-				};
+				let link = AgentLink::relay(conn.clone(), public_key);
 				tauri::async_runtime::spawn(async move {
 					if let Err(e) = enroll_and_register(&state, &ctrl, link).await {
 						log(&format!("enroll via relay failed: {e}"));
@@ -218,9 +225,22 @@ async fn enroll_and_register(state: &AppState, ctrl: &ActiveController, link: Ag
 	let (mut send, mut recv) = link.open_bi().await?;
 	write_frame(&mut send, &StreamOpen::Handshake).await?;
 	let nonce = crypto::random_nonce_b64();
-	write_frame(&mut send, &Challenge { nonce: nonce.clone() }).await?;
+	write_frame(
+		&mut send,
+		&Challenge {
+			nonce: nonce.clone(),
+			controller_key: ctrl.profile.public_key(),
+		},
+	)
+	.await?;
 
-	let hello: Hello = read_frame(&mut recv).await?;
+	// Read the agent's Hello under a timeout (handshake frames are small), so a
+	// peer that connects and then stalls can't tie up this task.
+	let hello: Hello =
+		match tokio::time::timeout(HANDSHAKE_TIMEOUT, read_frame_capped(&mut recv, MAX_CONTROL_FRAME)).await {
+			Ok(res) => res?,
+			Err(_) => return Ok(None),
+		};
 	if hello.protocol != PROTOCOL_VERSION {
 		reject(&mut send, "protocol version mismatch").await;
 		return Ok(None);
@@ -239,16 +259,31 @@ async fn enroll_and_register(state: &AppState, ctrl: &ActiveController, link: Ag
 		return Ok(None);
 	};
 
+	// Authenticate ourselves to the agent in turn: sign its nonce with our
+	// identity key, which the agent checks against the key it pinned at enrollment.
+	let controller_sig = ctrl.profile.identity()?.sign_b64(hello.agent_nonce.as_bytes());
 	write_frame(
 		&mut send,
 		&HelloAck {
 			accepted: true,
 			reason: None,
 			client_id: Some(client_id.to_string()),
+			controller_sig,
 		},
 	)
 	.await?;
 	let _ = send.finish();
+
+	// Receive the capability token the agent issues for this connection and bind
+	// it to the link, so every control/session/tunnel stream we open is stamped
+	// with it (the agent rejects streams that aren't).
+	let grant: SessionGrant =
+		match tokio::time::timeout(HANDSHAKE_TIMEOUT, read_frame_capped(&mut recv, MAX_CONTROL_FRAME)).await {
+			Ok(res) => res?,
+			Err(_) => return Ok(None),
+		};
+	let link = link.with_token(grant.token);
+
 	log(&format!(
 		"agent {client_id} connected — {} ({})",
 		hello.host.hostname, hello.host.os
@@ -285,6 +320,7 @@ async fn reject(send: &mut quinn::SendStream, reason: &str) {
 			accepted: false,
 			reason: Some(reason.to_string()),
 			client_id: None,
+			controller_sig: String::new(),
 		},
 	)
 	.await;
@@ -296,6 +332,7 @@ async fn reject(send: &mut quinn::SendStream, reason: &str) {
 pub async fn control_request(link: &AgentLink, req: &ControlRequest) -> AppResult<ControlResponse> {
 	let (mut send, mut recv) = link.open_bi().await?;
 	write_frame(&mut send, &StreamOpen::Control).await?;
+	link.authenticate(&mut send).await?;
 	write_frame(&mut send, req).await?;
 	let _ = send.finish();
 	Ok(read_frame::<_, ControlResponse>(&mut recv).await?)

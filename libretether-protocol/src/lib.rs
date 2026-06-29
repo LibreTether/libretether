@@ -16,6 +16,7 @@
 pub mod crypto;
 pub mod frame;
 pub mod relay;
+pub mod secret;
 pub mod tls;
 
 use serde::{Deserialize, Serialize};
@@ -23,8 +24,10 @@ use serde::{Deserialize, Serialize};
 /// ALPN protocol identifier negotiated during the QUIC/TLS handshake.
 pub const ALPN: &[u8] = b"libretether/1";
 
-/// Bumped whenever the wire format changes incompatibly.
-pub const PROTOCOL_VERSION: u32 = 1;
+/// Bumped whenever the wire format changes incompatibly. v2 added mutual
+/// authentication: the controller now proves its identity to the agent
+/// (`Challenge.controller_key` + `HelloAck.controller_sig`).
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// Default UDP port the controller listens on for incoming agents.
 pub const DEFAULT_PORT: u16 = 47600;
@@ -40,10 +43,16 @@ pub struct HostInfo {
 	pub username: String,
 }
 
-/// Server → agent, first message on the handshake stream: a nonce to sign.
+/// Server → agent, first message on the handshake stream: a nonce for the agent
+/// to sign, plus the controller's own Ed25519 public key so the agent can verify
+/// it is talking to the controller it enrolled with (see `HelloAck.controller_sig`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Challenge {
 	pub nonce: String,
+	/// Base64 Ed25519 public key identifying the controller. The agent pins this
+	/// at enrollment and rejects any controller whose key/signature don't match.
+	#[serde(default)]
+	pub controller_key: String,
 }
 
 /// Agent → server: proves identity and (on first connect) enrolls.
@@ -56,8 +65,33 @@ pub struct Hello {
 	pub public_key: String,
 	/// Base64 signature over the challenge nonce.
 	pub signature: String,
+	/// A fresh nonce the controller must sign back, so the agent can authenticate
+	/// the controller in turn (mutual auth).
+	#[serde(default)]
+	pub agent_nonce: String,
 	pub host: HostInfo,
 	pub agent_version: String,
+}
+
+/// Agent → controller, the final handshake message on success: a per-connection
+/// capability token the controller must present (see [`StreamAuth`]) on every
+/// control/session/tunnel stream it later opens.
+///
+/// It is sent only *after* the agent has verified the controller's identity, so
+/// a party that cannot complete the mutual handshake — e.g. someone who merely
+/// holds the relay's owner secret but not the controller's private key — never
+/// learns it, and therefore cannot drive the agent through the relay.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionGrant {
+	pub token: String,
+}
+
+/// Controller → agent, written right after [`StreamOpen`] on every non-handshake
+/// stream: the capability token from the [`SessionGrant`] of the handshake that
+/// authenticated this controller.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StreamAuth {
+	pub token: String,
 }
 
 /// Server → agent: the verdict of the handshake.
@@ -67,6 +101,11 @@ pub struct HelloAck {
 	pub reason: Option<String>,
 	/// The controller-assigned client id, echoed back so the agent can log it.
 	pub client_id: Option<String>,
+	/// Base64 signature over the agent's `agent_nonce`, made with the controller's
+	/// identity key. The agent verifies this against the pinned controller key
+	/// before honouring any control/session/tunnel stream.
+	#[serde(default)]
+	pub controller_sig: String,
 }
 
 // ---------------------------------------------------------------- streams

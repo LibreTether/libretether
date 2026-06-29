@@ -84,7 +84,11 @@ fn which(bin: &str) -> bool {
 
 #[cfg(target_os = "macos")]
 fn launch_macos(ssh: &[String]) -> AppResult<()> {
-	let script = format!("tell application \"Terminal\" to do script \"{}\"", ssh.join(" "));
+	// `username`/`host` are validated upstream, but escape the command into the
+	// AppleScript string literal anyway (backslash + quote) so it can never break
+	// out of `do script "…"` into arbitrary AppleScript / shell.
+	let escaped = ssh.join(" ").replace('\\', "\\\\").replace('"', "\\\"");
+	let script = format!("tell application \"Terminal\" to do script \"{escaped}\"");
 	Command::new("osascript")
 		.arg("-e")
 		.arg(script)
@@ -95,10 +99,16 @@ fn launch_macos(ssh: &[String]) -> AppResult<()> {
 
 #[cfg(target_os = "windows")]
 fn launch_windows(ssh: &[String]) -> AppResult<()> {
-	// Open ssh in a new console window.
-	let mut cmd = Command::new("cmd");
-	cmd.arg("/c").arg("start").arg("").args(ssh);
-	cmd.spawn()
+	use std::os::windows::process::CommandExt;
+	// Launch ssh.exe directly in its own console window (CREATE_NEW_CONSOLE)
+	// rather than via `cmd /c start`, which would interpret cmd metacharacters in
+	// the destination and allow argument injection.
+	const CREATE_NEW_CONSOLE: u32 = 0x0000_0010;
+	let (bin, args) = ssh.split_first().ok_or_else(|| AppError::msg("empty ssh command"))?;
+	Command::new(bin)
+		.args(args)
+		.creation_flags(CREATE_NEW_CONSOLE)
+		.spawn()
 		.map(|_| ())
 		.map_err(|e| AppError::msg(format!("launching ssh: {e}")))
 }

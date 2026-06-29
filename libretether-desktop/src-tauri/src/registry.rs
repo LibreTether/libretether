@@ -3,6 +3,7 @@
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use libretether_protocol::crypto;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -72,12 +73,10 @@ impl ClientStore {
 	}
 
 	fn persist(&self) -> AppResult<()> {
-		if let Some(dir) = self.path.parent() {
-			std::fs::create_dir_all(dir)?;
-		}
 		let raw = serde_json::to_string_pretty(&self.clients)
 			.map_err(|e| AppError::msg(format!("serializing clients: {e}")))?;
-		std::fs::write(&self.path, raw)?;
+		// Holds one-time enrollment tokens — write owner-only.
+		libretether_protocol::secret::write_str(&self.path, &raw)?;
 		Ok(())
 	}
 
@@ -130,7 +129,7 @@ impl ClientStore {
 			if let Some(client) = self
 				.clients
 				.iter_mut()
-				.find(|c| c.enrollment_token.as_deref() == Some(token))
+				.find(|c| c.enrollment_token.as_deref().is_some_and(|t| crypto::ct_eq(t, token)))
 			{
 				client.enrolled = true;
 				client.public_key = Some(public_key.to_string());

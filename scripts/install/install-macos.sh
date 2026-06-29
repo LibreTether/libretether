@@ -20,6 +20,7 @@ CONTROLLER=""
 RELAY=""
 RELAY_SECRET=""
 TAILSCALE_KEY=""
+CONTROLLER_KEY=""
 NAME="$(hostname 2>/dev/null || echo this-mac)"
 
 usage() {
@@ -33,6 +34,7 @@ while [ $# -gt 0 ]; do
 		--relay) RELAY="$2"; shift 2 ;;
 		--relay-secret) RELAY_SECRET="$2"; shift 2 ;;
 		--tailscale-key) TAILSCALE_KEY="$2"; shift 2 ;;
+		--controller-key) CONTROLLER_KEY="$2"; shift 2 ;;
 		--name) NAME="$2"; shift 2 ;;
 		--agent-url) LIBRETETHER_AGENT_URL="$2"; shift 2 ;;
 		-h|--help) usage; exit 0 ;;
@@ -74,11 +76,13 @@ else
 	chmod +x "$BIN"
 fi
 
-# 3. Enroll and install the LaunchAgent.
+# 3. Enroll and install the LaunchAgent. The controller key (when supplied) pins
+#    the controller identity so the agent only accepts that controller.
+if [ -n "$CONTROLLER_KEY" ]; then set -- --controller-key "$CONTROLLER_KEY"; else set --; fi
 if [ -n "$RELAY" ]; then
-	"$BIN" enroll --relay "$RELAY" --relay-secret "$RELAY_SECRET" --token "$TOKEN"
+	"$BIN" enroll --relay "$RELAY" --relay-secret "$RELAY_SECRET" --token "$TOKEN" "$@"
 else
-	"$BIN" enroll --controller "$CONTROLLER" --token "$TOKEN"
+	"$BIN" enroll --controller "$CONTROLLER" --token "$TOKEN" "$@"
 fi
 "$BIN" install
 

@@ -16,10 +16,10 @@ use anyhow::{Context, Result};
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
 use clap::{Parser, Subcommand};
-use libretether_protocol::crypto::random_alnum;
-use libretether_protocol::frame::{read_frame, write_frame};
-use libretether_protocol::relay::{RelayAck, RelayEvent, RelayHello, RelayRole, RouteTo};
-use libretether_protocol::{tls, DEFAULT_PORT};
+use libretether_protocol::crypto::{self, random_alnum};
+use libretether_protocol::frame::{read_frame_capped, write_frame, MAX_CONTROL_FRAME};
+use libretether_protocol::relay::{RelayAck, RelayChallenge, RelayEvent, RelayHello, RelayProof, RelayRole, RouteTo};
+use libretether_protocol::{secret, tls, DEFAULT_PORT};
 use quinn::{Endpoint, RecvStream, SendStream};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::UnboundedSender;
@@ -64,10 +64,9 @@ fn load_or_create(path: &PathBuf) -> Result<ServerConfig> {
 		Ok(raw) => serde_json::from_str(&raw).context("parsing server config"),
 		Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
 			let cfg = ServerConfig::generate();
-			if let Some(dir) = path.parent() {
-				std::fs::create_dir_all(dir)?;
-			}
-			std::fs::write(path, serde_json::to_string_pretty(&cfg)?)?;
+			// The config holds the owner/agent secrets and TLS key — write it
+			// owner-only so other local users on the relay host can't read them.
+			secret::write_str(path, &serde_json::to_string_pretty(&cfg)?)?;
 			Ok(cfg)
 		}
 		Err(e) => Err(e.into()),
@@ -209,13 +208,15 @@ async fn shutdown_signal() {
 async fn handle(relay: Relay, incoming: quinn::Incoming, secrets: &(String, String)) -> Result<()> {
 	let conn = incoming.accept()?.await?;
 	let (mut send, mut recv) = conn.accept_bi().await.context("accept hello stream")?;
-	let hello: RelayHello = read_frame(&mut recv).await?;
+	let hello: RelayHello = read_frame_capped(&mut recv, MAX_CONTROL_FRAME).await?;
 
 	let (expected, role_ok) = match hello.role {
 		RelayRole::Controller => (&secrets.0, "controller"),
 		RelayRole::Agent => (&secrets.1, "agent"),
 	};
-	if &hello.secret != expected {
+	// Constant-time compare so the secret can't be recovered byte-by-byte via
+	// response timing.
+	if !crypto::ct_eq(&hello.secret, expected) {
 		let _ = write_frame(
 			&mut send,
 			&RelayAck {
@@ -226,6 +227,25 @@ async fn handle(relay: Relay, incoming: quinn::Incoming, secrets: &(String, Stri
 		.await;
 		return Ok(());
 	}
+
+	// Prove possession of the presented Ed25519 key before trusting it — in
+	// particular before registering an agent under it for routing, so a holder of
+	// the (shared) agent secret can't hijack another agent's key.
+	let nonce = crypto::random_nonce_b64();
+	write_frame(&mut send, &RelayChallenge { nonce: nonce.clone() }).await?;
+	let proof: RelayProof = read_frame_capped(&mut recv, MAX_CONTROL_FRAME).await?;
+	if !crypto::verify_b64(&hello.public_key, nonce.as_bytes(), &proof.signature) {
+		let _ = write_frame(
+			&mut send,
+			&RelayAck {
+				accepted: false,
+				reason: Some("key ownership proof failed".into()),
+			},
+		)
+		.await;
+		return Ok(());
+	}
+
 	write_frame(
 		&mut send,
 		&RelayAck {
@@ -279,7 +299,7 @@ async fn serve_controller(relay: Relay, conn: quinn::Connection, mut events: Sen
 		};
 		let relay = relay.clone();
 		tokio::spawn(async move {
-			let Ok(route) = read_frame::<_, RouteTo>(&mut c_recv).await else {
+			let Ok(route) = read_frame_capped::<_, RouteTo>(&mut c_recv, MAX_CONTROL_FRAME).await else {
 				return;
 			};
 			let Some(agent) = relay.agent(&route.agent) else {

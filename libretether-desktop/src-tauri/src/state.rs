@@ -136,6 +136,13 @@ impl ControllerProfile {
 			.map(|id| id.public_b64())
 			.unwrap_or_default()
 	}
+
+	/// The controller's signing identity, used to authenticate the controller to
+	/// agents during the handshake.
+	pub fn identity(&self) -> AppResult<Identity> {
+		Identity::from_seed_b64(&self.identity_seed)
+			.ok_or_else(|| AppError::msg("controller has an invalid identity seed"))
+	}
 }
 
 /// Global host preferences, independent of any controller.
@@ -257,10 +264,11 @@ impl AppState {
 
 	fn save_profile(&self, profile: &ControllerProfile) -> AppResult<()> {
 		let dir = self.profile_dir(profile.id);
-		std::fs::create_dir_all(&dir)?;
 		let raw =
 			serde_json::to_string_pretty(profile).map_err(|e| AppError::msg(format!("serializing controller: {e}")))?;
-		std::fs::write(dir.join("controller.json"), raw)?;
+		// Holds the owner/agent secrets, Tailscale auth key, identity seed and TLS
+		// private key — write it owner-only.
+		libretether_protocol::secret::write_str(dir.join("controller.json"), &raw)?;
 		Ok(())
 	}
 

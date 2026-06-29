@@ -62,6 +62,11 @@ enum Command {
 		/// One-time enrollment token from the controller.
 		#[arg(long)]
 		token: String,
+		/// Base64 Ed25519 public key of the controller, pinned so the agent only
+		/// accepts control from that controller. Required (supplied by the deploy
+		/// command) — there is no trust-on-first-use.
+		#[arg(long)]
+		controller_key: String,
 		/// TLS server name to expect (advanced; defaults to libretether.local).
 		#[arg(long, default_value = "libretether.local")]
 		server_name: String,
@@ -87,6 +92,7 @@ async fn main() -> Result<()> {
 			relay,
 			relay_secret,
 			token,
+			controller_key,
 			server_name,
 		} => {
 			let (controller_addr, relay_addr) = match (controller, relay) {
@@ -95,6 +101,9 @@ async fn main() -> Result<()> {
 				(Some(_), Some(_)) => anyhow::bail!("provide only one of --controller or --relay"),
 				(None, None) => anyhow::bail!("provide either --controller or --relay"),
 			};
+			if controller_key.trim().is_empty() {
+				anyhow::bail!("--controller-key must not be empty");
+			}
 			let identity = Identity::generate();
 			let cfg = AgentConfig {
 				controller_addr,
@@ -102,6 +111,7 @@ async fn main() -> Result<()> {
 				relay_secret,
 				server_name,
 				enrollment_token: Some(token),
+				controller_key: Some(controller_key),
 				identity_seed: identity.seed_b64(),
 				client_id: None,
 			};

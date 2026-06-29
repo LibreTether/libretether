@@ -60,6 +60,7 @@ async fn drive(
 		}
 	};
 	if write_frame(&mut send, &StreamOpen::Session).await.is_err()
+		|| conn.authenticate(&mut send).await.is_err()
 		|| write_frame(&mut send, &SessionClient::Start(cfg)).await.is_err()
 	{
 		finish(&ctrl, id, token, &app);

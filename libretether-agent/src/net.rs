@@ -2,6 +2,7 @@
 //! handshake, then service control + session streams until the link drops, with
 //! exponential reconnect backoff.
 
+use std::collections::HashSet;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::net::SocketAddr;
@@ -10,12 +11,18 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
-use libretether_protocol::crypto::Identity;
-use libretether_protocol::frame::{read_frame, write_frame};
-use libretether_protocol::relay::{RelayAck, RelayHello, RelayRole};
-use libretether_protocol::{tls, Challenge, ControlRequest, Hello, HelloAck, StreamOpen, PROTOCOL_VERSION};
+use libretether_protocol::crypto::{self, Identity};
+use libretether_protocol::frame::{read_frame_capped, write_frame, MAX_CONTROL_FRAME};
+use libretether_protocol::relay::{RelayAck, RelayChallenge, RelayHello, RelayProof, RelayRole};
+use libretether_protocol::{
+	tls, Challenge, ControlRequest, Hello, HelloAck, SessionGrant, StreamAuth, StreamOpen, PROTOCOL_VERSION,
+};
 use quinn::{Endpoint, RecvStream, SendStream};
 use tokio::io::AsyncWriteExt;
+
+/// Shared set of capability tokens issued (one per completed handshake) over a
+/// single connection's lifetime; a control/session/tunnel stream must present one.
+type TokenSet = Arc<Mutex<HashSet<String>>>;
 
 use crate::config::AgentConfig;
 use crate::{handlers, host, session};
@@ -154,7 +161,18 @@ async fn connect_relay(endpoint: &Endpoint, addr: SocketAddr, cfg: &AgentConfig)
 		public_key: identity.public_b64(),
 	};
 	write_frame(&mut send, &hello).await.context("sending relay hello")?;
-	let ack: RelayAck = read_frame(&mut recv).await.context("reading relay ack")?;
+	// Prove we hold the private key for the public key we presented, so a holder
+	// of the (shared) agent secret can't register under our routing key.
+	let challenge: RelayChallenge = read_frame_capped(&mut recv, MAX_CONTROL_FRAME)
+		.await
+		.context("reading relay challenge")?;
+	let proof = RelayProof {
+		signature: identity.sign_b64(challenge.nonce.as_bytes()),
+	};
+	write_frame(&mut send, &proof).await.context("sending relay proof")?;
+	let ack: RelayAck = read_frame_capped(&mut recv, MAX_CONTROL_FRAME)
+		.await
+		.context("reading relay ack")?;
 	if !ack.accepted {
 		return Err(anyhow!("relay rejected agent: {}", ack.reason.unwrap_or_default()));
 	}
@@ -178,61 +196,148 @@ async fn serve(conn: quinn::Connection, cfg: &mut AgentConfig, cfg_path: &PathBu
 
 	// Handshake stream is opened by the controller.
 	let (mut send, mut recv) = conn.accept_bi().await.context("accept handshake stream")?;
-	match read_frame::<_, StreamOpen>(&mut recv).await? {
+	match read_frame_capped::<_, StreamOpen>(&mut recv, MAX_CONTROL_FRAME).await? {
 		StreamOpen::Handshake => {}
 		other => return Err(anyhow!("expected handshake stream, got {other:?}")),
 	}
-	let challenge: Challenge = read_frame(&mut recv).await.context("reading challenge")?;
 
 	let identity = cfg.identity()?;
-	let hello = Hello {
-		protocol: PROTOCOL_VERSION,
-		enrollment_token: cfg.enrollment_token.clone(),
-		public_key: identity.public_b64(),
-		signature: identity.sign_b64(challenge.nonce.as_bytes()),
-		host: host::host_info(),
-		agent_version: AGENT_VERSION.to_string(),
-	};
-	write_frame(&mut send, &hello).await.context("sending hello")?;
+	let tokens: TokenSet = Arc::new(Mutex::new(HashSet::new()));
 
-	let ack: HelloAck = read_frame(&mut recv).await.context("reading ack")?;
-	if !ack.accepted {
-		return Err(anyhow!("controller rejected agent: {}", ack.reason.unwrap_or_default()));
-	}
+	// The controller key must have been pinned at enrollment. There is no
+	// trust-on-first-use: an agent without a pinned key must be re-enrolled.
+	let Some(expected) = cfg.controller_key.clone().filter(|k| !k.trim().is_empty()) else {
+		return Err(anyhow!(
+			"no controller key pinned in config — re-enroll with `--controller-key` (re-run the deploy command)"
+		));
+	};
+
+	// Mutual handshake: prove our identity, verify the controller's against the
+	// pinned key, and receive the capability token (issued into `tokens`) that
+	// every later stream must carry.
+	let (_controller_key, client_id) = match verify_and_grant(
+		&mut send,
+		&mut recv,
+		&identity,
+		cfg.enrollment_token.clone(),
+		&expected,
+		&tokens,
+	)
+	.await?
+	{
+		Some(v) => v,
+		None => return Err(anyhow!("controller authentication failed")),
+	};
 	log(&format!(
 		"authenticated as client {}",
-		ack.client_id.clone().unwrap_or_default()
+		client_id.clone().unwrap_or_default()
 	));
 
-	// We're enrolled — burn the one-time token so future runs use only the key.
+	// Burn the one-time enrollment token now that we're enrolled.
 	if cfg.enrollment_token.is_some() {
 		cfg.enrollment_token = None;
-		cfg.client_id = ack.client_id.clone();
+		cfg.client_id = client_id;
 		if let Err(e) = cfg.save(cfg_path) {
 			log(&format!("warning: could not persist enrolled config: {e}"));
 		}
 	}
-	let _ = send.finish();
 
 	// Serve control + session streams until the connection ends. In relay mode
 	// this connection is to the relay and outlives any single controller, so a
 	// reconnecting controller opens a fresh handshake stream here — hand the
-	// identity to each stream so it can re-authenticate (see `reauth`).
+	// identity, pinned key and token set to each stream (see `reauth`).
 	let identity = Arc::new(identity);
+	let controller_key = Arc::new(expected);
 	loop {
 		let (send, recv) = conn.accept_bi().await.map_err(|e| anyhow!("connection ended: {e}"))?;
-		tokio::spawn(handle_stream(send, recv, identity.clone()));
+		tokio::spawn(handle_stream(
+			send,
+			recv,
+			identity.clone(),
+			controller_key.clone(),
+			tokens.clone(),
+		));
 	}
 }
 
-async fn handle_stream(mut send: SendStream, mut recv: RecvStream, identity: Arc<Identity>) {
-	let open = match read_frame::<_, StreamOpen>(&mut recv).await {
+/// The agent side of the mutual handshake on a handshake stream: prove our
+/// identity over the controller's nonce, verify the controller's signature over
+/// our nonce against the expected (pinned) key, and on success issue a fresh
+/// per-connection capability token. Returns `(controller_key, client_id)`, or an
+/// error if the controller is rejected or fails verification.
+async fn verify_and_grant(
+	send: &mut SendStream,
+	recv: &mut RecvStream,
+	identity: &Identity,
+	enrollment_token: Option<String>,
+	expected_key: &str,
+	tokens: &Mutex<HashSet<String>>,
+) -> Result<Option<(String, Option<String>)>> {
+	let challenge: Challenge = read_frame_capped(recv, MAX_CONTROL_FRAME)
+		.await
+		.context("reading challenge")?;
+	let agent_nonce = crypto::random_nonce_b64();
+	let hello = Hello {
+		protocol: PROTOCOL_VERSION,
+		enrollment_token,
+		public_key: identity.public_b64(),
+		signature: identity.sign_b64(challenge.nonce.as_bytes()),
+		agent_nonce: agent_nonce.clone(),
+		host: host::host_info(),
+		agent_version: AGENT_VERSION.to_string(),
+	};
+	write_frame(send, &hello).await.context("sending hello")?;
+
+	let ack: HelloAck = read_frame_capped(recv, MAX_CONTROL_FRAME)
+		.await
+		.context("reading ack")?;
+	if !ack.accepted {
+		return Err(anyhow!("controller rejected agent: {}", ack.reason.unwrap_or_default()));
+	}
+
+	// Authenticate the controller before trusting it with any stream: its key
+	// must match the pinned one and its signature over our nonce must verify.
+	let presented = challenge.controller_key.trim();
+	if !crypto::ct_eq(expected_key, presented) {
+		return Err(anyhow!(
+			"controller key mismatch — refusing connection (possible impersonation)"
+		));
+	}
+	if !crypto::verify_b64(presented, agent_nonce.as_bytes(), &ack.controller_sig) {
+		return Err(anyhow!("controller identity signature invalid — refusing connection"));
+	}
+
+	// Hand the verified controller a capability token for this connection.
+	let token = crypto::random_nonce_b64();
+	tokens.lock().unwrap().insert(token.clone());
+	write_frame(send, &SessionGrant { token })
+		.await
+		.context("sending session grant")?;
+	let _ = send.finish();
+	Ok(Some((presented.to_string(), ack.client_id)))
+}
+
+async fn handle_stream(
+	mut send: SendStream,
+	mut recv: RecvStream,
+	identity: Arc<Identity>,
+	controller_key: Arc<String>,
+	tokens: TokenSet,
+) {
+	let open = match read_frame_capped::<_, StreamOpen>(&mut recv, MAX_CONTROL_FRAME).await {
 		Ok(o) => o,
 		Err(_) => return,
 	};
+	// Handshake streams establish trust; every other stream must present the
+	// capability token from a completed handshake. This is what stops a party
+	// that can reach the agent (e.g. through the relay with only the owner
+	// secret) but cannot complete the mutual handshake from issuing commands.
+	if !matches!(open, StreamOpen::Handshake) && !authed(&mut recv, &tokens).await {
+		return;
+	}
 	match open {
 		StreamOpen::Control => {
-			let req: ControlRequest = match read_frame(&mut recv).await {
+			let req: ControlRequest = match read_frame_capped(&mut recv, MAX_CONTROL_FRAME).await {
 				Ok(r) => r,
 				Err(_) => return,
 			};
@@ -246,43 +351,40 @@ async fn handle_stream(mut send: SendStream, mut recv: RecvStream, identity: Arc
 			}
 		}
 		StreamOpen::Tunnel { port } => tunnel(port, send, recv).await,
-		StreamOpen::Handshake => reauth(send, recv, &identity).await,
+		StreamOpen::Handshake => reauth(send, recv, &identity, &controller_key, &tokens).await,
 	}
+}
+
+/// Read and check the capability token that prefixes a non-handshake stream.
+async fn authed(recv: &mut RecvStream, tokens: &Mutex<HashSet<String>>) -> bool {
+	let auth: StreamAuth = match read_frame_capped(recv, MAX_CONTROL_FRAME).await {
+		Ok(a) => a,
+		Err(_) => return false,
+	};
+	let ok = tokens.lock().unwrap().contains(&auth.token);
+	if !ok {
+		log("rejected stream: missing or invalid capability token");
+	}
+	ok
 }
 
 /// Answer a fresh handshake on an already-serving connection. The relay keeps the
 /// agent connected across controller restarts/reconnects, so a returning
-/// controller re-enrolls by opening a new handshake stream; the one-time token is
-/// long spent, so we identify purely by key. Without this the agent would reject
-/// the stream and stay unreachable until its own process restarted.
-async fn reauth(mut send: SendStream, mut recv: RecvStream, identity: &Identity) {
-	let challenge: Challenge = match read_frame(&mut recv).await {
-		Ok(c) => c,
-		Err(_) => return,
-	};
-	let hello = Hello {
-		protocol: PROTOCOL_VERSION,
-		enrollment_token: None,
-		public_key: identity.public_b64(),
-		signature: identity.sign_b64(challenge.nonce.as_bytes()),
-		host: host::host_info(),
-		agent_version: AGENT_VERSION.to_string(),
-	};
-	if write_frame(&mut send, &hello).await.is_err() {
-		return;
+/// controller re-authenticates by opening a new handshake stream; the one-time
+/// token is long spent, so we identify by key and verify the controller against
+/// the pinned key. A successful re-auth issues a new capability token.
+async fn reauth(
+	mut send: SendStream,
+	mut recv: RecvStream,
+	identity: &Identity,
+	controller_key: &str,
+	tokens: &Mutex<HashSet<String>>,
+) {
+	match verify_and_grant(&mut send, &mut recv, identity, None, controller_key, tokens).await {
+		Ok(Some((_, client_id))) => log(&format!("re-authenticated as client {}", client_id.unwrap_or_default())),
+		Ok(None) => {}
+		Err(e) => log(&format!("controller re-auth rejected: {e:#}")),
 	}
-	match read_frame::<_, HelloAck>(&mut recv).await {
-		Ok(ack) if ack.accepted => log(&format!(
-			"re-authenticated as client {}",
-			ack.client_id.unwrap_or_default()
-		)),
-		Ok(ack) => log(&format!(
-			"controller rejected re-auth: {}",
-			ack.reason.unwrap_or_default()
-		)),
-		Err(_) => {}
-	}
-	let _ = send.finish();
 }
 
 /// Pipe a QUIC stream to a local TCP port (the client's RDP/SSH server) — used

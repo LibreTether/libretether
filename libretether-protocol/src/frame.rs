@@ -10,6 +10,11 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 /// while still rejecting absurd lengths from a misbehaving peer.
 pub const MAX_FRAME: u32 = 64 * 1024 * 1024;
 
+/// Tight cap for small control/handshake/relay frames — everything except live
+/// session frames and screenshots. Keeps a peer (in particular one that has not
+/// authenticated yet) from forcing a large up-front allocation.
+pub const MAX_CONTROL_FRAME: u32 = 1024 * 1024;
+
 fn invalid(msg: impl Into<String>) -> std::io::Error {
 	std::io::Error::new(std::io::ErrorKind::InvalidData, msg.into())
 }
@@ -30,8 +35,20 @@ where
 	Ok(())
 }
 
-/// Read one length-delimited frame and deserialize it from JSON.
+/// Read one length-delimited frame and deserialize it from JSON, rejecting any
+/// frame larger than [`MAX_FRAME`].
 pub async fn read_frame<R, T>(r: &mut R) -> std::io::Result<T>
+where
+	R: AsyncRead + Unpin,
+	T: DeserializeOwned,
+{
+	read_frame_capped(r, MAX_FRAME).await
+}
+
+/// Like [`read_frame`] but rejects any frame larger than `max`. Use a tight
+/// `max` (e.g. [`MAX_CONTROL_FRAME`]) for small control/handshake messages so a
+/// peer can't force a large allocation with a bogus length prefix.
+pub async fn read_frame_capped<R, T>(r: &mut R, max: u32) -> std::io::Result<T>
 where
 	R: AsyncRead + Unpin,
 	T: DeserializeOwned,
@@ -39,8 +56,8 @@ where
 	let mut len = [0u8; 4];
 	r.read_exact(&mut len).await?;
 	let n = u32::from_be_bytes(len);
-	if n > MAX_FRAME {
-		return Err(invalid(format!("frame too large: {n} bytes")));
+	if n > max {
+		return Err(invalid(format!("frame too large: {n} bytes (max {max})")));
 	}
 	let mut buf = vec![0u8; n as usize];
 	r.read_exact(&mut buf).await?;

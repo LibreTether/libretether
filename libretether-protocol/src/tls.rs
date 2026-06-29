@@ -1,10 +1,18 @@
 //! QUIC transport setup.
 //!
-//! The controller presents a self-signed certificate; the agent does not verify
-//! it at the TLS layer. That is deliberate and safe for this design: agents run
-//! over the tailnet (already authenticated + encrypted end-to-end), and the
-//! *application* layer authenticates the agent to the controller via Ed25519.
-//! The TLS layer's job here is just to encrypt the QUIC stream.
+//! The controller presents a self-signed certificate; peers do not verify it at
+//! the TLS layer (`NoVerify`). TLS here only encrypts the QUIC stream — identity
+//! is established at the *application* layer, where authentication is now
+//! **mutual** and not dependent on the network being trusted:
+//!
+//! - the agent proves its identity to the controller (signs the controller's
+//!   challenge nonce; matched against the key pinned at enrollment), and
+//! - the controller proves its identity to the agent (signs the agent's nonce
+//!   with the controller key the agent pinned via `--controller-key`).
+//!
+//! So even on an untrusted path (Direct mode over a port-forward, or through the
+//! relay) an attacker that cannot present the expected certificate-independent
+//! Ed25519 signatures is rejected. See `Challenge`/`Hello`/`HelloAck`.
 
 use std::sync::Arc;
 use std::time::Duration;

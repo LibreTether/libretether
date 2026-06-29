@@ -15,12 +15,22 @@ use crate::registry::ClientOs;
 /// Base URL for the published release assets (installers + agent binaries).
 const RELEASE_BASE: &str = "https://github.com/LibreTether/libretether/releases/latest/download";
 
-/// Where the client should connect, and how it enrols.
+/// Where the client should connect, and how it enrols. `controller_key` is the
+/// controller's Ed25519 public key, pinned into the agent so it only accepts
+/// control from this controller.
 pub enum DeployTarget {
 	/// Dial the controller directly (optionally joining Tailscale first).
-	Controller { address: String, auth_key: Option<String> },
+	Controller {
+		address: String,
+		auth_key: Option<String>,
+		controller_key: String,
+	},
 	/// Dial the relay (`libretether-relay`) with an agent secret.
-	Relay { address: String, agent_secret: String },
+	Relay {
+		address: String,
+		agent_secret: String,
+		controller_key: String,
+	},
 }
 
 /// Render the deploy command for a client: a one-liner that runs the published
@@ -44,48 +54,93 @@ pub fn script(os: ClientOs, token: &str, target: &DeployTarget) -> String {
 	}
 }
 
-/// POSIX-shell installer arguments. Values are single-quoted; tokens, secrets,
-/// addresses and Tailscale keys are alphanumeric / `host:port`, so none can
-/// contain a single quote that would break the quoting.
+/// POSIX-shell installer arguments. Every value is single-quoted with embedded
+/// single quotes escaped, so a stray quote in an operator-entered address/key
+/// can't break out of the quoting into the generated command.
 fn sh_args(token: &str, target: &DeployTarget) -> String {
 	match target {
-		DeployTarget::Relay { address, agent_secret } => {
-			format!("--token '{token}' --relay '{address}' --relay-secret '{agent_secret}'")
-		}
+		DeployTarget::Relay {
+			address,
+			agent_secret,
+			controller_key,
+		} => format!(
+			"--token {} --relay {} --relay-secret {} --controller-key {}",
+			sh_quote(token),
+			sh_quote(address),
+			sh_quote(agent_secret),
+			sh_quote(controller_key),
+		),
 		DeployTarget::Controller {
 			address,
 			auth_key: Some(key),
-		} => {
-			format!("--token '{token}' --controller '{address}' --tailscale-key '{key}'")
-		}
+			controller_key,
+		} => format!(
+			"--token {} --controller {} --tailscale-key {} --controller-key {}",
+			sh_quote(token),
+			sh_quote(address),
+			sh_quote(key),
+			sh_quote(controller_key),
+		),
 		DeployTarget::Controller {
 			address,
 			auth_key: None,
-		} => {
-			format!("--token '{token}' --controller '{address}'")
-		}
+			controller_key,
+		} => format!(
+			"--token {} --controller {} --controller-key {}",
+			sh_quote(token),
+			sh_quote(address),
+			sh_quote(controller_key),
+		),
 	}
 }
 
-/// PowerShell installer arguments (single-quoted literal strings).
+/// PowerShell installer arguments (single-quoted literal strings, embedded
+/// quotes escaped by doubling).
 fn win_args(token: &str, target: &DeployTarget) -> String {
 	match target {
-		DeployTarget::Relay { address, agent_secret } => {
-			format!("-Token '{token}' -Relay '{address}' -RelaySecret '{agent_secret}'")
-		}
+		DeployTarget::Relay {
+			address,
+			agent_secret,
+			controller_key,
+		} => format!(
+			"-Token {} -Relay {} -RelaySecret {} -ControllerKey {}",
+			ps_quote(token),
+			ps_quote(address),
+			ps_quote(agent_secret),
+			ps_quote(controller_key),
+		),
 		DeployTarget::Controller {
 			address,
 			auth_key: Some(key),
-		} => {
-			format!("-Token '{token}' -Controller '{address}' -TailscaleKey '{key}'")
-		}
+			controller_key,
+		} => format!(
+			"-Token {} -Controller {} -TailscaleKey {} -ControllerKey {}",
+			ps_quote(token),
+			ps_quote(address),
+			ps_quote(key),
+			ps_quote(controller_key),
+		),
 		DeployTarget::Controller {
 			address,
 			auth_key: None,
-		} => {
-			format!("-Token '{token}' -Controller '{address}'")
-		}
+			controller_key,
+		} => format!(
+			"-Token {} -Controller {} -ControllerKey {}",
+			ps_quote(token),
+			ps_quote(address),
+			ps_quote(controller_key),
+		),
 	}
+}
+
+/// Single-quote a value for POSIX `sh`, escaping embedded single quotes.
+fn sh_quote(s: &str) -> String {
+	format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// Single-quote a value for PowerShell, escaping embedded single quotes.
+fn ps_quote(s: &str) -> String {
+	format!("'{}'", s.replace('\'', "''"))
 }
 
 #[cfg(test)]
@@ -100,11 +155,14 @@ mod tests {
 		let relay = DeployTarget::Relay {
 			address: "relay.example:47600".into(),
 			agent_secret: "sekret".into(),
+			controller_key: "ckey".into(),
 		};
 		let linux = script(ClientOs::Linux, "tok", &relay);
 		assert!(linux.contains("releases/latest/download/install-linux.sh"), "{linux}");
 		assert!(
-			linux.contains("| sh -s -- --token 'tok' --relay 'relay.example:47600' --relay-secret 'sekret'"),
+			linux.contains(
+				"| sh -s -- --token 'tok' --relay 'relay.example:47600' --relay-secret 'sekret' --controller-key 'ckey'"
+			),
 			"{linux}"
 		);
 		// Bare command — no shebang or comment lines.
@@ -116,12 +174,29 @@ mod tests {
 		let direct = DeployTarget::Controller {
 			address: "ctl:47600".into(),
 			auth_key: Some("tskey-abc".into()),
+			controller_key: "ckey".into(),
 		};
 		let win = script(ClientOs::Windows, "tok", &direct);
 		assert!(win.contains("releases/latest/download/install-windows.ps1"), "{win}");
 		assert!(
-			win.contains("-Token 'tok' -Controller 'ctl:47600' -TailscaleKey 'tskey-abc'"),
+			win.contains("-Token 'tok' -Controller 'ctl:47600' -TailscaleKey 'tskey-abc' -ControllerKey 'ckey'"),
 			"{win}"
 		);
+	}
+
+	// A single quote in an operator-entered address must be escaped, not allowed
+	// to break out of the quoting in the generated one-liner.
+	#[test]
+	fn deploy_escapes_embedded_quotes() {
+		let relay = DeployTarget::Relay {
+			address: "evil';rm -rf ~;'".into(),
+			agent_secret: "sekret".into(),
+			controller_key: "ckey".into(),
+		};
+		let linux = script(ClientOs::Linux, "tok", &relay);
+		assert!(linux.contains(r"'evil'\'';rm -rf ~;'\'''"), "{linux}");
+
+		let win = script(ClientOs::Windows, "tok", &relay);
+		assert!(win.contains("'evil'';rm -rf ~;'''"), "{win}");
 	}
 }

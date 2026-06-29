@@ -61,6 +61,15 @@ pub fn random_alnum(len: usize) -> String {
 	bytes.iter().map(|b| CHARS[*b as usize % CHARS.len()] as char).collect()
 }
 
+/// Constant-time string equality, for comparing secrets and tokens without
+/// leaking a match prefix through early-exit timing. (Length is allowed to leak;
+/// our secrets/tokens are fixed-length.)
+pub fn ct_eq(a: &str, b: &str) -> bool {
+	use subtle::ConstantTimeEq;
+	let (a, b) = (a.as_bytes(), b.as_bytes());
+	a.len() == b.len() && a.ct_eq(b).into()
+}
+
 /// Verify that `sig_b64` is a valid signature of `msg` under `public_b64`.
 pub fn verify_b64(public_b64: &str, msg: &[u8], sig_b64: &str) -> bool {
 	let Some(vk) = decode_pubkey(public_b64) else {

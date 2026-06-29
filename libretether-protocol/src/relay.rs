@@ -28,6 +28,21 @@ pub struct RelayHello {
 	pub public_key: String,
 }
 
+/// Relay → client, after a valid secret: a nonce the client must sign with the
+/// private key for the `public_key` it presented. This proves possession of the
+/// key, so a holder of the (shared) agent secret cannot register under another
+/// agent's public key.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RelayChallenge {
+	pub nonce: String,
+}
+
+/// Client → relay: the signature over [`RelayChallenge::nonce`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RelayProof {
+	pub signature: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RelayAck {
 	pub accepted: bool,

@@ -128,13 +128,27 @@ Every method rides Tailscale straight to the client's private IP — no extra tu
 
 ### Security
 
-- Each agent has its own **Ed25519** keypair; the private seed never leaves the machine.
-- On every connection the controller issues a random nonce and the agent signs it; the
-  controller only accepts a signature matching the public key it recorded at enrollment.
+- Each agent **and** controller has its own **Ed25519** keypair; the private seed never
+  leaves the machine.
+- Authentication is **mutual** on every connection: the controller issues a random nonce
+  and the agent signs it (the controller accepts only a signature matching the public key
+  it recorded at enrollment); the agent issues a nonce back and the controller signs it,
+  and the agent accepts only the controller key it pinned. The controller's key is **required**
+  at enrollment (carried in the deploy command as `--controller-key`) — there is no
+  trust-on-first-use, so an agent without a pinned key must be re-enrolled.
+- Because both directions are verified at the application layer, the link does not rely on
+  the network being trusted — a man-in-the-middle on a Direct-mode port-forward, or a party
+  that merely holds the relay's owner secret, can't impersonate the controller and drive an
+  agent. After a successful handshake the agent issues a per-connection capability token
+  that every control/screen/tunnel stream must carry, so unauthenticated streams (e.g.
+  injected through the relay) are rejected.
 - A **one-time enrollment token** (baked into the deploy script) binds the very first
   connection, then is burned.
+- Config files holding secrets (identity seeds, enrollment tokens, relay/owner secrets, the
+  TLS key) are written owner-only (`0600`).
 - QUIC encrypts the transport (TLS 1.3); on a tailnet the link is end-to-end encrypted on
-  top of that.
+  top of that. In relay mode the relay forwards bytes between the controller and agents and
+  can see the (decrypted) stream contents, so a **trusted relay host** is still assumed.
 
 ## Status
 
@@ -221,8 +235,9 @@ always pulls the matching agent build; `LIBRETETHER_AGENT_BIN` / `LIBRETETHER_AG
 override the binary source.
 
 > Trying it on one machine? You can skip the scripts entirely: run
-> `libretether-agent enroll --controller <addr> --token <token>` then `libretether-agent run`
-> (or `libretether-agent install`) by hand.
+> `libretether-agent enroll --controller <addr> --token <token> --controller-key <key>` then
+> `libretether-agent run` (or `libretether-agent install`) by hand. `--controller-key` is
+> required (the controller's public key — it's in the generated deploy command).
 
 ## Development
 

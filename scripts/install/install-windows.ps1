@@ -13,6 +13,7 @@ param(
 	[string]$Relay,
 	[string]$RelaySecret,
 	[string]$TailscaleKey,
+	[string]$ControllerKey,
 	[string]$Name = $env:COMPUTERNAME,
 	[string]$AgentUrl,
 	[switch]$NoRdp
@@ -82,11 +83,13 @@ function Enable-RemoteDesktop {
 	}
 }
 
-# 3. Enroll and register the logon task.
+# 3. Enroll and register the logon task. The controller key (when supplied) pins
+#    the controller identity so the agent only accepts that controller.
+$KeyArgs = if ($ControllerKey) { @('--controller-key', $ControllerKey) } else { @() }
 if ($Relay) {
-	Invoke-Agent @('enroll', '--relay', $Relay, '--relay-secret', $RelaySecret, '--token', $Token)
+	Invoke-Agent (@('enroll', '--relay', $Relay, '--relay-secret', $RelaySecret, '--token', $Token) + $KeyArgs)
 } else {
-	Invoke-Agent @('enroll', '--controller', $Controller, '--token', $Token)
+	Invoke-Agent (@('enroll', '--controller', $Controller, '--token', $Token) + $KeyArgs)
 }
 Invoke-Agent @('install')
 

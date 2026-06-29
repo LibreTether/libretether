@@ -27,6 +27,13 @@ pub struct AgentConfig {
 	/// One-time token, present until the agent has successfully enrolled.
 	#[serde(default)]
 	pub enrollment_token: Option<String>,
+	/// Base64 Ed25519 public key of the controller this agent trusts, pinned from
+	/// the deploy/enroll arguments. The agent rejects any controller whose
+	/// key/signature don't match this; there is no trust-on-first-use, so an agent
+	/// without it (e.g. an old config) must be re-enrolled. Optional only so an
+	/// old config parses to a clear "re-enroll" error instead of a parse failure.
+	#[serde(default)]
+	pub controller_key: Option<String>,
 	/// Base64 Ed25519 seed — the agent's stable identity.
 	pub identity_seed: String,
 	/// Controller-assigned id, learned at enrollment (informational).
@@ -55,11 +62,11 @@ impl AgentConfig {
 	}
 
 	pub fn save(&self, path: &PathBuf) -> Result<()> {
-		if let Some(dir) = path.parent() {
-			std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
-		}
+		// The config holds the identity seed, enrollment token and relay secret —
+		// write it owner-only so other local users can't read them.
 		let raw = serde_json::to_string_pretty(self)?;
-		std::fs::write(path, raw).with_context(|| format!("writing agent config at {}", path.display()))?;
+		libretether_protocol::secret::write_str(path, &raw)
+			.with_context(|| format!("writing agent config at {}", path.display()))?;
 		Ok(())
 	}
 }

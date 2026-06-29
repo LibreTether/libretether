@@ -109,12 +109,14 @@ async fn direct_addr(advertise: Option<String>, port: u16) -> String {
 
 /// Build the deploy target for the active controller from its kind.
 async fn deploy_target(ctrl: &ActiveController) -> deploy::DeployTarget {
+	let controller_key = ctrl.profile.public_key();
 	match ctrl.profile.kind.clone() {
 		ControllerKind::Relay {
 			address, agent_secret, ..
 		} => deploy::DeployTarget::Relay {
 			address: with_port(&address, DEFAULT_PORT),
 			agent_secret,
+			controller_key,
 		},
 		ControllerKind::Direct {
 			advertise_addr,
@@ -122,11 +124,64 @@ async fn deploy_target(ctrl: &ActiveController) -> deploy::DeployTarget {
 		} => deploy::DeployTarget::Controller {
 			address: direct_addr(advertise_addr, listen_port).await,
 			auth_key: None,
+			controller_key,
 		},
 		ControllerKind::Tailscale { auth_key, listen_port } => deploy::DeployTarget::Controller {
 			address: tailscale_addr(listen_port).await,
 			auth_key: auth_key.filter(|s| !s.trim().is_empty()),
+			controller_key,
 		},
+	}
+}
+
+// ---------------------------------------------------------------- input safety
+
+// Values an agent reports about itself (username, address, RDP password) are
+// untrusted — a malicious or compromised client controls them, and we hand them
+// to external programs (ssh, RDP viewers, the terminal). These validators reject
+// anything outside a conservative safe set so a client can't inject shell /
+// AppleScript / cmd commands into the controller operator's machine.
+
+fn safe_username(s: &str) -> AppResult<String> {
+	let s = s.trim();
+	let ok = !s.is_empty()
+		&& s.len() <= 64
+		&& !s.starts_with('-')
+		&& s.chars()
+			.all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '\\'));
+	if ok {
+		Ok(s.to_string())
+	} else {
+		Err(AppError::msg(format!("client reported an unsafe username ({s:?})")))
+	}
+}
+
+fn safe_host(s: &str) -> AppResult<String> {
+	let s = s.trim();
+	if s.parse::<std::net::IpAddr>().is_ok() {
+		return Ok(s.to_string());
+	}
+	let ok = !s.is_empty()
+		&& s.len() <= 253
+		&& !s.starts_with('-')
+		&& s.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-'));
+	if ok {
+		Ok(s.to_string())
+	} else {
+		Err(AppError::msg(format!("client reported an unsafe address ({s:?})")))
+	}
+}
+
+fn safe_password(s: &str) -> AppResult<String> {
+	let ok = !s.is_empty()
+		&& s.len() <= 128
+		&& !s
+			.chars()
+			.any(|c| c.is_control() || c.is_whitespace() || "'\"@/\\:`$&|;<>(){}".contains(c));
+	if ok {
+		Ok(s.to_string())
+	} else {
+		Err(AppError::msg("client reported an RDP password with unsafe characters"))
 	}
 }
 
@@ -496,8 +551,11 @@ pub async fn connect_rdp(state: State<'_, AppState>, id: String) -> AppResult<()
 		_ => return Err(AppError::msg("unexpected response")),
 	};
 	let (host, port) = client_endpoint(&conn, info.address.clone(), info.port).await?;
+	let host = safe_host(&host)?;
+	let username = safe_username(&info.username)?;
+	let password = info.password.as_deref().map(safe_password).transpose()?;
 	let pref = state.0.settings.lock().unwrap().rdp_client.clone();
-	crate::rdp::launch(pref.as_deref(), &host, port, &info.username, info.password.as_deref())
+	crate::rdp::launch(pref.as_deref(), &host, port, &username, password.as_deref())
 }
 
 /// Probe that an SSH server actually answers at `host:port` (through the tunnel
@@ -529,6 +587,8 @@ pub async fn connect_ssh(state: State<'_, AppState>, id: String) -> AppResult<()
 		_ => return Err(AppError::msg("unexpected response")),
 	};
 	let (host, port) = client_endpoint(&conn, status.tailscale_ip.clone(), 22).await?;
+	let host = safe_host(&host)?;
+	let username = safe_username(&status.host.username)?;
 	if !ssh_reachable(&host, port).await {
 		return Err(AppError::msg(format!(
 			"Couldn't reach an SSH server on {}. Make sure an SSH server (e.g. openssh-server) is installed and running on the client.",
@@ -536,11 +596,23 @@ pub async fn connect_ssh(state: State<'_, AppState>, id: String) -> AppResult<()
 		)));
 	}
 	let terminal = state.0.settings.lock().unwrap().terminal.clone();
-	crate::ssh::launch(terminal.as_deref(), &host, port, &status.host.username)
+	crate::ssh::launch(terminal.as_deref(), &host, port, &username)
 }
 
 #[tauri::command]
 pub async fn save_text_file(path: String, contents: String) -> AppResult<()> {
+	// The path comes from the user's own save dialog, but constrain it anyway so
+	// a compromised webview can't write to arbitrary locations: require an
+	// absolute path with an extension this app actually emits.
+	let p = std::path::Path::new(&path);
+	if !p.is_absolute() {
+		return Err(AppError::msg("refusing to write a non-absolute path"));
+	}
+	if !matches!(p.extension().and_then(|e| e.to_str()), Some("sh" | "ps1" | "txt")) {
+		return Err(AppError::msg(
+			"refusing to write this file type (expected .sh, .ps1 or .txt)",
+		));
+	}
 	std::fs::write(&path, contents)?;
 	#[cfg(unix)]
 	if path.ends_with(".sh") {
