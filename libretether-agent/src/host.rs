@@ -25,8 +25,11 @@ fn os_label() -> String {
 
 /// The agent's first tailnet IPv4, if Tailscale is up.
 pub fn tailscale_ip() -> Option<String> {
+	use crate::proc::NoWindow;
+
 	let out = std::process::Command::new("tailscale")
 		.args(["ip", "-4"])
+		.no_window()
 		.output()
 		.ok()?;
 	if !out.status.success() {

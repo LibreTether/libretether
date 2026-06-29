@@ -10,6 +10,8 @@ use std::process::Command;
 
 use anyhow::{anyhow, Context, Result};
 
+use crate::proc::NoWindow;
+
 fn exe() -> Result<PathBuf> {
 	std::env::current_exe().context("locating the agent executable")
 }
@@ -23,7 +25,7 @@ pub fn uninstall() -> Result<()> {
 }
 
 fn run(cmd: &mut Command) -> Result<()> {
-	let status = cmd.status().with_context(|| format!("running {cmd:?}"))?;
+	let status = cmd.no_window().status().with_context(|| format!("running {cmd:?}"))?;
 	if !status.success() {
 		return Err(anyhow!("command failed ({status}): {cmd:?}"));
 	}
@@ -151,14 +153,23 @@ mod platform {
 		run(Command::new("schtasks").args([
 			"/Create", "/TN", TASK, "/SC", "ONLOGON", "/RL", "LIMITED", "/F", "/TR", &cmd,
 		]))?;
-		let _ = Command::new("schtasks").args(["/Run", "/TN", TASK]).status();
+		let _ = Command::new("schtasks")
+			.args(["/Run", "/TN", TASK])
+			.no_window()
+			.status();
 		println!("Installed logon scheduled task: {TASK}");
 		Ok(())
 	}
 
 	pub fn uninstall() -> Result<()> {
-		let _ = Command::new("schtasks").args(["/End", "/TN", TASK]).status();
-		let _ = Command::new("schtasks").args(["/Delete", "/TN", TASK, "/F"]).status();
+		let _ = Command::new("schtasks")
+			.args(["/End", "/TN", TASK])
+			.no_window()
+			.status();
+		let _ = Command::new("schtasks")
+			.args(["/Delete", "/TN", TASK, "/F"])
+			.no_window()
+			.status();
 		println!("Removed scheduled task: {TASK}");
 		Ok(())
 	}

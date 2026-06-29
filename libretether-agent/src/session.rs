@@ -73,7 +73,13 @@ async fn x11_session(cfg: SessionConfig, mut send: SendStream, mut recv: RecvStr
 						let _ = injector.send(InjectCmd::Event(ev));
 					}
 					Ok(SessionClient::Refresh) | Ok(SessionClient::Start(_)) => {}
-					Ok(SessionClient::Stop) | Err(_) => break,
+					Ok(SessionClient::Stop) => break,
+					// A single undecodable frame should drop that event, not the
+					// whole session — only a real stream error ends the loop.
+					Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
+						crate::net::log(&format!("ignoring malformed session frame: {e}"));
+					}
+					Err(_) => break,
 				}
 			}
 			stop.store(true, Ordering::Relaxed);

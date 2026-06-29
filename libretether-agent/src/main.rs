@@ -18,6 +18,7 @@ mod input;
 mod net;
 #[cfg(target_os = "linux")]
 mod platform;
+mod proc;
 #[cfg(target_os = "linux")]
 mod pwstream;
 mod rdp;

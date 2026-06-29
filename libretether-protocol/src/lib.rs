@@ -195,8 +195,13 @@ impl Default for SessionConfig {
 }
 
 /// Controller → agent, multiplexed on the session stream.
+///
+/// Tagged with `kind` (not `t`): the `Input` variant wraps [`InputEvent`], which
+/// is itself internally tagged with `t`. Sharing the tag key would make
+/// `Input(InputEvent)` serialize a map with two `t` fields, and deserialization
+/// then fails with "duplicate field `t`" — silently breaking all input.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "t", rename_all = "snake_case")]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum SessionClient {
 	Start(SessionConfig),
 	Input(InputEvent),

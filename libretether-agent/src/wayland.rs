@@ -88,7 +88,12 @@ async fn serve(cfg: SessionConfig, mut send: SendStream, recv: RecvStream) -> Re
 					}
 				}
 				Ok(SessionClient::Refresh) | Ok(SessionClient::Start(_)) => {}
-				Ok(SessionClient::Stop) | Err(_) => break,
+				Ok(SessionClient::Stop) => break,
+				// Drop a single undecodable frame rather than ending input.
+				Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
+					crate::net::log(&format!("ignoring malformed session frame: {e}"));
+				}
+				Err(_) => break,
 			}
 		}
 	});
@@ -165,7 +170,7 @@ async fn setup_portal() -> Result<Portal> {
 async fn inject(portal: &Portal, ev: InputEvent) {
 	let session = &portal.session;
 	let rd = &portal.rd;
-	let _ = match ev {
+	let result = match ev {
 		InputEvent::MouseMove { x, y } => {
 			let px = x.clamp(0.0, 1.0) * portal.width as f64;
 			let py = y.clamp(0.0, 1.0) * portal.height as f64;
@@ -209,6 +214,9 @@ async fn inject(portal: &Portal, ev: InputEvent) {
 			Ok(())
 		}
 	};
+	if let Err(e) = result {
+		crate::net::log(&format!("portal input injection failed: {e}"));
+	}
 }
 
 fn key_state(pressed: bool) -> KeyState {

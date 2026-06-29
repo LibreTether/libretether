@@ -69,6 +69,10 @@ async fn exec(program: String, args: Vec<String>, timeout_secs: Option<u64>) -> 
 		.stdin(Stdio::null())
 		.stdout(Stdio::piped())
 		.stderr(Stdio::piped());
+	// Don't flash a console window on Windows — the agent runs windowless, so a
+	// spawned console program would otherwise pop one up on the guest's screen.
+	#[cfg(windows)]
+	cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
 
 	let child = cmd.spawn().map_err(|e| format!("spawning {program}: {e}"))?;
 	let timeout = Duration::from_secs(timeout_secs.unwrap_or(30).clamp(1, 600));

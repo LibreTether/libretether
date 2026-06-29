@@ -142,8 +142,11 @@ fn enable_windows() -> Result<RdpInfo, String> {
 
 #[cfg(target_os = "windows")]
 fn run_ps(script: &str) -> Result<(), String> {
+	use crate::proc::NoWindow;
+
 	let out = Command::new("powershell")
 		.args(["-NoProfile", "-NonInteractive", "-Command", script])
+		.no_window()
 		.output()
 		.map_err(|e| format!("powershell: {e}"))?;
 	if out.status.success() {
