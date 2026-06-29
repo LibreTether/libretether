@@ -17,16 +17,6 @@ pub enum ClientOs {
 	Windows,
 }
 
-impl ClientOs {
-	pub fn as_str(&self) -> &'static str {
-		match self {
-			ClientOs::Linux => "linux",
-			ClientOs::Macos => "macos",
-			ClientOs::Windows => "windows",
-		}
-	}
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Client {
 	pub id: Uuid,
@@ -72,11 +62,24 @@ impl ClientStore {
 		Ok(Self { path, clients })
 	}
 
-	fn persist(&self) -> AppResult<()> {
+	/// Serialize the registry to `(path, json)` for an owner-only write. The
+	/// mutating methods below deliberately do **not** write to disk themselves —
+	/// callers go through [`ActiveController::mutate_store`], which takes this
+	/// snapshot under the store lock and then writes it *after* releasing the lock,
+	/// so the blocking fsync never serializes every other store access.
+	pub fn snapshot(&self) -> AppResult<(PathBuf, String)> {
 		let raw = serde_json::to_string_pretty(&self.clients)
 			.map_err(|e| AppError::msg(format!("serializing clients: {e}")))?;
+		Ok((self.path.clone(), raw))
+	}
+
+	/// Write the registry to disk now (owner-only). Used in tests and any explicit
+	/// save; production mutations persist via [`ActiveController::mutate_store`].
+	#[cfg(test)]
+	fn persist(&self) -> AppResult<()> {
+		let (path, raw) = self.snapshot()?;
 		// Holds one-time enrollment tokens — write owner-only.
-		libretether_protocol::secret::write_str(&self.path, &raw)?;
+		libretether_protocol::secret::write_str(path, &raw)?;
 		Ok(())
 	}
 
@@ -84,11 +87,10 @@ impl ClientStore {
 		&self.clients
 	}
 
-	pub fn create(&mut self, name: String, os: ClientOs) -> AppResult<Client> {
+	pub fn create(&mut self, name: String, os: ClientOs) -> Client {
 		let client = Client::new(name, os);
 		self.clients.push(client.clone());
-		self.persist()?;
-		Ok(client)
+		client
 	}
 
 	pub fn get(&self, id: Uuid) -> Option<&Client> {
@@ -101,13 +103,13 @@ impl ClientStore {
 		if self.clients.len() == before {
 			return Err(AppError::NotFound);
 		}
-		self.persist()
+		Ok(())
 	}
 
 	pub fn rename(&mut self, id: Uuid, name: String) -> AppResult<()> {
 		let client = self.clients.iter_mut().find(|c| c.id == id).ok_or(AppError::NotFound)?;
 		client.name = name;
-		self.persist()
+		Ok(())
 	}
 
 	/// Regenerate the one-time enrollment token (e.g. to re-deploy a client).
@@ -117,12 +119,12 @@ impl ClientStore {
 		client.enrollment_token = Some(token.clone());
 		client.enrolled = false;
 		client.public_key = None;
-		self.persist()?;
 		Ok(token)
 	}
 
 	/// Resolve the agent in an incoming handshake to a client id, enrolling it
-	/// on first contact. Returns the client id when accepted.
+	/// on first contact. Returns the client id when accepted. Mutates in memory
+	/// only — the caller persists the token-burn / last-seen update.
 	pub fn authenticate(&mut self, token: Option<&str>, public_key: &str) -> Option<Uuid> {
 		// First connect: match the one-time token and bind the public key.
 		if let Some(token) = token {
@@ -135,9 +137,7 @@ impl ClientStore {
 				client.public_key = Some(public_key.to_string());
 				client.enrollment_token = None;
 				client.last_seen = Some(now_secs());
-				let id = client.id;
-				let _ = self.persist();
-				return Some(id);
+				return Some(client.id);
 			}
 		}
 		// Reconnect: match the bound public key.
@@ -147,9 +147,7 @@ impl ClientStore {
 			.find(|c| c.public_key.as_deref() == Some(public_key))
 		{
 			client.last_seen = Some(now_secs());
-			let id = client.id;
-			let _ = self.persist();
-			return Some(id);
+			return Some(client.id);
 		}
 		None
 	}
@@ -161,10 +159,14 @@ impl ClientStore {
 			.map(|c| c.id)
 	}
 
-	pub fn touch_seen(&mut self, id: Uuid) {
+	/// Update a client's last-seen timestamp. Returns whether a client matched (so
+	/// the caller only persists when something actually changed).
+	pub fn touch_seen(&mut self, id: Uuid) -> bool {
 		if let Some(client) = self.clients.iter_mut().find(|c| c.id == id) {
 			client.last_seen = Some(now_secs());
-			let _ = self.persist();
+			true
+		} else {
+			false
 		}
 	}
 }
@@ -194,7 +196,7 @@ mod tests {
 	#[test]
 	fn enroll_binds_key_burns_token_then_reconnects_by_key() {
 		let mut store = temp_store();
-		let client = store.create("box".into(), ClientOs::Linux).unwrap();
+		let client = store.create("box".into(), ClientOs::Linux);
 		let token = client.enrollment_token.clone().unwrap();
 		assert!(!client.enrolled && client.public_key.is_none());
 
@@ -219,7 +221,7 @@ mod tests {
 	#[test]
 	fn reset_token_revokes_the_old_key_and_issues_a_new_token() {
 		let mut store = temp_store();
-		let client = store.create("box".into(), ClientOs::Linux).unwrap();
+		let client = store.create("box".into(), ClientOs::Linux);
 		let first = client.enrollment_token.clone().unwrap();
 		store.authenticate(Some(&first), "PUBKEY").unwrap();
 
@@ -252,9 +254,12 @@ mod tests {
 		let path = fresh_path();
 		let id = {
 			let mut store = ClientStore::load(path.clone()).unwrap();
-			let c = store.create("box".into(), ClientOs::Linux).unwrap();
+			let c = store.create("box".into(), ClientOs::Linux);
 			let token = c.enrollment_token.clone().unwrap();
 			store.authenticate(Some(&token), "PUBKEY");
+			// Mutations are now in-memory only; persist explicitly before reloading
+			// (production code persists via ActiveController::mutate_store).
+			store.persist().unwrap();
 			c.id
 		};
 		// A brand-new store loaded from the same file sees the enrolled client.

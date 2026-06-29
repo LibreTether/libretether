@@ -1,19 +1,14 @@
-import { Network, Pencil, Plus, Server, Trash2, Wifi } from "lucide-react"
-import { type ComponentType, useCallback, useEffect, useState } from "react"
+import { Pencil, Plus, Trash2 } from "lucide-react"
+import { useCallback, useEffect, useState } from "react"
 import { ControllerForm } from "../components/ControllerForm"
 import { useConfirm } from "../components/confirm"
 import { RelayConnecting } from "../components/RelayConnecting"
 import { Badge, Button, Spinner } from "../components/ui"
 import * as api from "../lib/api"
+import { CONTROLLER_TYPE_META } from "../lib/meta"
 import { useToast } from "../lib/toast"
-import type { ActiveInfo, ControllerSummary, ControllerType } from "../lib/types"
+import type { ActiveInfo, ControllerSummary } from "../lib/types"
 import { useAsyncAction } from "../lib/useAsyncAction"
-
-const TYPE_META: Record<ControllerType, { label: string; icon: ComponentType<{ className?: string }> }> = {
-	direct: { icon: Network, label: "Direct" },
-	relay: { icon: Server, label: "Relay" },
-	tailscale: { icon: Wifi, label: "Tailscale" }
-}
 
 export function ControllerSelect({ onConnected }: { onConnected: (a: ActiveInfo) => void }) {
 	const toast = useToast()
@@ -95,7 +90,7 @@ export function ControllerSelect({ onConnected }: { onConnected: (a: ActiveInfo)
 					) : (
 						<div className="flex flex-col gap-2.5">
 							{controllers.map((c) => {
-								const meta = TYPE_META[c.kind.type]
+								const meta = CONTROLLER_TYPE_META[c.kind.type]
 								const Icon = meta.icon
 								return (
 									<div

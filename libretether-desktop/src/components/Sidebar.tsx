@@ -1,5 +1,6 @@
 import { LogOut, MonitorSmartphone, Plug, type Radio } from "lucide-react"
 import { cn } from "../lib/cn"
+import { CONTROLLER_TYPE_META } from "../lib/meta"
 import type { ActiveInfo } from "../lib/types"
 
 export type Page = "machines" | "controller"
@@ -28,7 +29,9 @@ export function Sidebar({
 				<img alt="" className="h-8 w-8 rounded-lg" src="/libretether.png" />
 				<div className="min-w-0 leading-tight">
 					<div className="truncate text-sm font-bold text-text">{active.name}</div>
-					<div className="text-[0.7rem] capitalize text-subtle">{active.kind.type} controller</div>
+					<div className="text-[0.7rem] text-subtle">
+						{CONTROLLER_TYPE_META[active.kind.type].label} controller
+					</div>
 				</div>
 			</div>
 

@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
-use libretether_protocol::frame::{read_frame, write_frame};
+use libretether_protocol::frame::{read_frame_capped, write_frame, MAX_CONTROL_FRAME};
 use libretether_protocol::{Frame, FrameEncoding, SessionClient, SessionConfig, SessionServer};
 use quinn::{RecvStream, SendStream};
 
@@ -23,13 +23,19 @@ pub(crate) struct Encoded {
 	pub seq: u64,
 	pub width: u32,
 	pub height: u32,
+	/// Captured monitor's origin in the global desktop space (see [`capture::Capture`]).
+	pub origin_x: i32,
+	pub origin_y: i32,
 	pub jpeg: Vec<u8>,
 }
 
 /// Run a session to completion. The opening [`SessionClient::Start`] is read
 /// here, then the call is dispatched to the right backend for this session.
 pub async fn run(mut send: SendStream, mut recv: RecvStream) -> std::io::Result<()> {
-	let cfg = match read_frame::<_, SessionClient>(&mut recv).await? {
+	// Input/control events are small — cap the read tightly so a buggy or hostile
+	// controller can't force a large allocation on the session stream (frames the
+	// other direction legitimately need the wide cap; these never do).
+	let cfg = match read_frame_capped::<_, SessionClient>(&mut recv, MAX_CONTROL_FRAME).await? {
 		SessionClient::Start(cfg) => cfg,
 		_ => {
 			let _ = write_frame(
@@ -58,17 +64,17 @@ async fn x11_session(cfg: SessionConfig, mut send: SendStream, mut recv: RecvStr
 	crate::x11env::ensure();
 
 	let stop = Arc::new(AtomicBool::new(false));
-	let injector = input::spawn();
+	let (injector, injector_thread) = input::spawn();
 
 	let (frame_tx, mut frame_rx) = tokio::sync::mpsc::channel::<Encoded>(4);
-	spawn_capture(cfg.clone(), stop.clone(), frame_tx);
+	let capture = spawn_capture(cfg.clone(), stop.clone(), frame_tx);
 
 	let reader = {
 		let stop = stop.clone();
 		let injector = injector.clone();
 		tokio::spawn(async move {
 			loop {
-				match read_frame::<_, SessionClient>(&mut recv).await {
+				match read_frame_capped::<_, SessionClient>(&mut recv, MAX_CONTROL_FRAME).await {
 					Ok(SessionClient::Input(ev)) => {
 						let _ = injector.send(InjectCmd::Event(ev));
 					}
@@ -86,13 +92,16 @@ async fn x11_session(cfg: SessionConfig, mut send: SendStream, mut recv: RecvStr
 		})
 	};
 
-	let mut last_geom = (0u32, 0u32);
+	let mut last_geom = (0u32, 0u32, 0i32, 0i32);
 	while let Some(enc) = frame_rx.recv().await {
-		if (enc.width, enc.height) != last_geom {
-			last_geom = (enc.width, enc.height);
+		let geom = (enc.width, enc.height, enc.origin_x, enc.origin_y);
+		if geom != last_geom {
+			last_geom = geom;
 			let _ = injector.send(InjectCmd::Geometry {
 				width: enc.width,
 				height: enc.height,
+				origin_x: enc.origin_x,
+				origin_y: enc.origin_y,
 			});
 			write_frame(
 				&mut send,
@@ -109,10 +118,17 @@ async fn x11_session(cfg: SessionConfig, mut send: SendStream, mut recv: RecvStr
 		}
 	}
 
+	// Wind both worker threads down deterministically: signal stop, drop the frame
+	// receiver so the capture thread's `blocking_send` unblocks, then stop + join
+	// the injector and join the capture thread so neither outlives the session (a
+	// lingering capture loop would contend with the next session for `xcap`).
 	stop.store(true, Ordering::Relaxed);
-	let _ = injector.send(InjectCmd::Stop);
+	drop(frame_rx);
 	let _ = send.finish();
 	reader.abort();
+	let _ = injector.send(InjectCmd::Stop);
+	let _ = injector_thread.join();
+	let _ = capture.join();
 	Ok(())
 }
 
@@ -126,7 +142,11 @@ pub(crate) fn to_frame(enc: &Encoded) -> SessionServer {
 	})
 }
 
-fn spawn_capture(cfg: SessionConfig, stop: Arc<AtomicBool>, tx: tokio::sync::mpsc::Sender<Encoded>) {
+fn spawn_capture(
+	cfg: SessionConfig,
+	stop: Arc<AtomicBool>,
+	tx: tokio::sync::mpsc::Sender<Encoded>,
+) -> std::thread::JoinHandle<()> {
 	std::thread::spawn(move || {
 		let fps = cfg.max_fps.clamp(1, 60) as u64;
 		let interval = Duration::from_millis(1000 / fps);
@@ -141,6 +161,8 @@ fn spawn_capture(cfg: SessionConfig, stop: Arc<AtomicBool>, tx: tokio::sync::mps
 							seq,
 							width: cap.width,
 							height: cap.height,
+							origin_x: cap.origin_x,
+							origin_y: cap.origin_y,
 							jpeg,
 						};
 						if tx.blocking_send(enc).is_err() {
@@ -158,5 +180,5 @@ fn spawn_capture(cfg: SessionConfig, stop: Arc<AtomicBool>, tx: tokio::sync::mps
 				std::thread::sleep(rem);
 			}
 		}
-	});
+	})
 }

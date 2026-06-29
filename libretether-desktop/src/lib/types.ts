@@ -77,6 +77,10 @@ export interface Settings {
 	terminal: string | null
 }
 
+/** The RDP-client preference the Connection page picks between. The preset values
+ *  match what the backend's `rdp.rs` switches on; "custom" means use `rdp_custom`. */
+export type RdpMode = "auto" | "freerdp" | "remmina" | "gnome-connections" | "custom"
+
 export interface ExecResult {
 	code: number | null
 	stdout: string

@@ -36,7 +36,9 @@ macro_rules! expect_response {
 pub struct ClientDto {
 	pub id: String,
 	pub name: String,
-	pub os: String,
+	/// Serializes to the same "linux"/"macos"/"windows" literal the frontend reads,
+	/// but carried as the enum so the conversion stays type-checked end to end.
+	pub os: ClientOs,
 	pub created_at: u64,
 	pub enrolled: bool,
 	pub online: bool,
@@ -85,7 +87,7 @@ fn to_dto(client: &Client, online: bool, status: Option<AgentStatus>) -> ClientD
 	ClientDto {
 		id: client.id.to_string(),
 		name: client.name.clone(),
-		os: client.os.as_str().to_string(),
+		os: client.os,
 		created_at: client.created_at,
 		enrolled: client.enrolled,
 		online,
@@ -98,28 +100,51 @@ fn parse_id(id: &str) -> AppResult<Uuid> {
 	Uuid::parse_str(id).map_err(|_| AppError::msg("invalid id"))
 }
 
+/// Trim a user-entered name and reject a blank one. Shared by the create/rename
+/// commands so the "name cannot be empty" rule lives in one place.
+fn non_empty_name(name: String) -> AppResult<String> {
+	let name = name.trim().to_string();
+	if name.is_empty() {
+		Err(AppError::msg("name cannot be empty"))
+	} else {
+		Ok(name)
+	}
+}
+
+/// The active controller plus a parsed client id — the prelude almost every
+/// per-client command shares (`require_active()? + parse_id()?`).
+fn active_and_id(state: &AppState, id: &str) -> AppResult<(std::sync::Arc<ActiveController>, Uuid)> {
+	Ok((state.require_active()?, parse_id(id)?))
+}
+
 fn with_port(addr: &str, port: u16) -> String {
 	libretether_common::with_default_port(addr, port)
 }
 
-async fn tailscale_addr(port: u16) -> String {
+async fn tailscale_addr(port: u16) -> AppResult<String> {
 	match tailscale::status().await.address {
-		Some(addr) => format!("{addr}:{port}"),
-		None => format!("<controller-address>:{port}"),
+		Some(addr) => Ok(format!("{addr}:{port}")),
+		None => Err(AppError::msg(
+			"Tailscale isn't up, so the controller's tailnet address is unknown — start Tailscale (or switch the controller to Direct/Relay) before deploying clients.",
+		)),
 	}
 }
 
-async fn direct_addr(advertise: Option<String>, port: u16) -> String {
+fn direct_addr(advertise: Option<String>, port: u16) -> AppResult<String> {
 	match advertise.filter(|s| !s.trim().is_empty()) {
-		Some(addr) => with_port(&addr, port),
-		None => format!("<controller-address>:{port}"),
+		Some(addr) => Ok(with_port(&addr, port)),
+		None => Err(AppError::msg(
+			"This controller has no advertise address — set one in the controller settings so clients know where to dial.",
+		)),
 	}
 }
 
-/// Build the deploy target for the active controller from its kind.
-async fn deploy_target(ctrl: &ActiveController) -> deploy::DeployTarget {
+/// Build the deploy target for the active controller from its kind. Fails closed
+/// (rather than emitting a `<controller-address>` placeholder) when the address
+/// can't be determined, so a generated command is always actually runnable.
+async fn deploy_target(ctrl: &ActiveController) -> AppResult<deploy::DeployTarget> {
 	let controller_key = ctrl.profile.public_key();
-	match ctrl.profile.kind.clone() {
+	Ok(match ctrl.profile.kind.clone() {
 		ControllerKind::Relay {
 			address, agent_secret, ..
 		} => deploy::DeployTarget::Relay {
@@ -131,16 +156,16 @@ async fn deploy_target(ctrl: &ActiveController) -> deploy::DeployTarget {
 			advertise_addr,
 			listen_port,
 		} => deploy::DeployTarget::Controller {
-			address: direct_addr(advertise_addr, listen_port).await,
+			address: direct_addr(advertise_addr, listen_port)?,
 			auth_key: None,
 			controller_key,
 		},
 		ControllerKind::Tailscale { auth_key, listen_port } => deploy::DeployTarget::Controller {
-			address: tailscale_addr(listen_port).await,
+			address: tailscale_addr(listen_port).await?,
 			auth_key: auth_key.filter(|s| !s.trim().is_empty()),
 			controller_key,
 		},
-	}
+	})
 }
 
 // ---------------------------------------------------------------- input safety
@@ -194,6 +219,46 @@ fn safe_password(s: &str) -> AppResult<String> {
 	}
 }
 
+/// Validate an operator-entered launcher template (the `rdp_client` / `terminal`
+/// settings). These are split on whitespace and run as `Command::new(first).args(rest)`
+/// — never through a shell — so the risk isn't shell metacharacters but the *binary
+/// position*: a compromised webview (the same threat model `save_text_file` defends
+/// against) could set a template whose program is a `{host}`-style placeholder that
+/// then expands to an agent-reported value and gets executed. Reject a placeholder
+/// or a leading-`-` flag in the program position, plus control chars / absurd
+/// length; the operator is otherwise trusted to name their own viewer/terminal.
+fn safe_launch_template(s: &str) -> AppResult<String> {
+	let s = s.trim();
+	if s.len() > 512 {
+		return Err(AppError::msg("the launcher command is too long"));
+	}
+	if s.chars().any(|c| c.is_control()) {
+		return Err(AppError::msg("the launcher command contains control characters"));
+	}
+	let bin = s
+		.split_whitespace()
+		.next()
+		.ok_or_else(|| AppError::msg("the launcher command is empty"))?;
+	if bin.contains('{') || bin.contains('}') {
+		return Err(AppError::msg(
+			"the launcher command's program must be a literal command, not a {placeholder}",
+		));
+	}
+	if bin.starts_with('-') {
+		return Err(AppError::msg("the launcher command's program can't start with '-'"));
+	}
+	Ok(s.to_string())
+}
+
+/// Trim a launcher setting, treating blank as "unset" and validating a non-blank
+/// value with [`safe_launch_template`].
+fn normalize_template(value: Option<String>) -> AppResult<Option<String>> {
+	match value.map(|x| x.trim().to_string()).filter(|x| !x.is_empty()) {
+		Some(v) => Ok(Some(safe_launch_template(&v)?)),
+		None => Ok(None),
+	}
+}
+
 // ---------------------------------------------------------------- controllers
 
 fn summary(state: &AppState, profile: crate::state::ControllerProfile, active_id: Option<Uuid>) -> ControllerSummary {
@@ -225,11 +290,7 @@ pub async fn create_controller(
 	kind: ControllerKind,
 ) -> AppResult<ControllerSummary> {
 	let state = state.inner().clone();
-	let name = name.trim().to_string();
-	if name.is_empty() {
-		return Err(AppError::msg("name cannot be empty"));
-	}
-	let profile = state.create_profile(name, kind)?;
+	let profile = state.create_profile(non_empty_name(name)?, kind)?;
 	Ok(summary(&state, profile, state.active().map(|c| c.profile.id)))
 }
 
@@ -242,11 +303,7 @@ pub async fn update_controller(
 ) -> AppResult<ControllerSummary> {
 	let state = state.inner().clone();
 	let id = parse_id(&id)?;
-	let name = name.trim().to_string();
-	if name.is_empty() {
-		return Err(AppError::msg("name cannot be empty"));
-	}
-	let profile = state.update_profile(id, name, kind)?;
+	let profile = state.update_profile(id, non_empty_name(name)?, kind)?;
 	Ok(summary(&state, profile, state.active().map(|c| c.profile.id)))
 }
 
@@ -325,11 +382,16 @@ pub async fn set_settings(
 	rdp_client: Option<String>,
 	terminal: Option<String>,
 ) -> AppResult<()> {
+	// Validate before touching state (and before taking the lock): these settings
+	// are later exec'd, so a compromised webview must not be able to point them at
+	// an arbitrary program via a placeholder in the binary position.
+	let rdp_client = normalize_template(rdp_client)?;
+	let terminal = normalize_template(terminal)?;
 	let state = state.inner().clone();
 	{
 		let mut s = state.0.settings.lock().unwrap();
-		s.rdp_client = rdp_client.filter(|x| !x.trim().is_empty());
-		s.terminal = terminal.filter(|x| !x.trim().is_empty());
+		s.rdp_client = rdp_client;
+		s.terminal = terminal;
 	}
 	state.save_settings()
 }
@@ -356,13 +418,14 @@ pub async fn list_clients(state: State<'_, AppState>) -> AppResult<Vec<ClientDto
 pub async fn create_client(state: State<'_, AppState>, name: String, os: ClientOs) -> AppResult<CreateClientResult> {
 	let state = state.inner().clone();
 	let ctrl = state.require_active()?;
-	let name = name.trim().to_string();
-	if name.is_empty() {
-		return Err(AppError::msg("name cannot be empty"));
-	}
-	let client = ctrl.store.lock().unwrap().create(name, os)?;
+	let name = non_empty_name(name)?;
+	// Resolve the deploy target first: if the controller can't say where clients
+	// should dial (e.g. Direct with no advertise address), fail closed *before*
+	// creating a client we couldn't generate a runnable command for.
+	let target = deploy_target(&ctrl).await?;
+	let client = ctrl.mutate_store(|s| Ok(s.create(name, os)))?;
 	let token = client.enrollment_token.clone().unwrap_or_default();
-	let deploy_script = deploy::script(client.os, &token, &deploy_target(&ctrl).await);
+	let deploy_script = deploy::script(client.os, &token, &target);
 	state.notify_changed();
 	Ok(CreateClientResult {
 		client: to_dto(&client, false, None),
@@ -373,15 +436,14 @@ pub async fn create_client(state: State<'_, AppState>, name: String, os: ClientO
 #[tauri::command]
 pub async fn remove_client(state: State<'_, AppState>, id: String) -> AppResult<()> {
 	let state = state.inner().clone();
-	let ctrl = state.require_active()?;
-	let id = parse_id(&id)?;
+	let (ctrl, id) = active_and_id(&state, &id)?;
 	session::stop(&ctrl, id);
 	crate::tunnel::close_for(&ctrl, id);
 	if let Some(link) = ctrl.connection(id) {
 		link.close();
 	}
 	ctrl.live.lock().unwrap().remove(&id);
-	ctrl.store.lock().unwrap().remove(id)?;
+	ctrl.mutate_store(|s| s.remove(id))?;
 	state.notify_changed();
 	Ok(())
 }
@@ -389,41 +451,32 @@ pub async fn remove_client(state: State<'_, AppState>, id: String) -> AppResult<
 #[tauri::command]
 pub async fn rename_client(state: State<'_, AppState>, id: String, name: String) -> AppResult<()> {
 	let state = state.inner().clone();
-	let ctrl = state.require_active()?;
-	let id = parse_id(&id)?;
-	let name = name.trim().to_string();
-	if name.is_empty() {
-		return Err(AppError::msg("name cannot be empty"));
-	}
-	ctrl.store.lock().unwrap().rename(id, name)?;
+	let (ctrl, id) = active_and_id(&state, &id)?;
+	let name = non_empty_name(name)?;
+	ctrl.mutate_store(|s| s.rename(id, name))?;
 	state.notify_changed();
 	Ok(())
 }
 
 #[tauri::command]
 pub async fn get_deploy_script(state: State<'_, AppState>, id: String, os: Option<ClientOs>) -> AppResult<String> {
-	let ctrl = state.inner().require_active()?;
-	let id = parse_id(&id)?;
+	let (ctrl, id) = active_and_id(state.inner(), &id)?;
 	let (client_os, token) = {
 		let store = ctrl.store.lock().unwrap();
 		let c = store.get(id).ok_or(AppError::NotFound)?;
 		(c.os, c.enrollment_token.clone())
 	};
 	let token = token.ok_or(AppError::AlreadyEnrolled)?;
-	Ok(deploy::script(
-		os.unwrap_or(client_os),
-		&token,
-		&deploy_target(&ctrl).await,
-	))
+	let target = deploy_target(&ctrl).await?;
+	Ok(deploy::script(os.unwrap_or(client_os), &token, &target))
 }
 
 #[tauri::command]
 pub async fn reset_token(state: State<'_, AppState>, id: String) -> AppResult<CreateClientResult> {
 	let state = state.inner().clone();
-	let ctrl = state.require_active()?;
-	let id = parse_id(&id)?;
-	let token = ctrl.store.lock().unwrap().reset_token(id)?;
-	let target = deploy_target(&ctrl).await;
+	let (ctrl, id) = active_and_id(&state, &id)?;
+	let token = ctrl.mutate_store(|s| s.reset_token(id))?;
+	let target = deploy_target(&ctrl).await?;
 	let client = {
 		let store = ctrl.store.lock().unwrap();
 		store.get(id).ok_or(AppError::NotFound)?.clone()
@@ -440,8 +493,7 @@ pub async fn reset_token(state: State<'_, AppState>, id: String) -> AppResult<Cr
 
 #[tauri::command]
 pub async fn client_status(state: State<'_, AppState>, id: String) -> AppResult<AgentStatus> {
-	let ctrl = state.inner().require_active()?;
-	let id = parse_id(&id)?;
+	let (ctrl, id) = active_and_id(state.inner(), &id)?;
 	let conn = ctrl.connection(id).ok_or(AppError::Offline)?;
 	let status = expect_response!(&conn, &ControlRequest::Status, ControlResponse::Status)?;
 	if let Some(live) = ctrl.live.lock().unwrap().get_mut(&id) {
@@ -458,9 +510,12 @@ pub async fn client_exec(
 	args: Vec<String>,
 	timeout_secs: Option<u64>,
 ) -> AppResult<ExecResult> {
-	let ctrl = state.inner().require_active()?;
-	let id = parse_id(&id)?;
+	let (ctrl, id) = active_and_id(state.inner(), &id)?;
 	let conn = ctrl.connection(id).ok_or(AppError::Offline)?;
+	// Audit the remote command (this is an arbitrary-command surface by design):
+	// log the target and program + arg count, but not the argument values, which
+	// can carry secrets. Mirrors the connection-event logging in `server.rs`.
+	eprintln!("[libretether] exec on {id}: {program} ({} args)", args.len());
 	expect_response!(
 		&conn,
 		&ControlRequest::Exec {
@@ -478,8 +533,7 @@ pub async fn client_screenshot(
 	id: String,
 	display: Option<u32>,
 ) -> AppResult<ScreenshotResult> {
-	let ctrl = state.inner().require_active()?;
-	let id = parse_id(&id)?;
+	let (ctrl, id) = active_and_id(state.inner(), &id)?;
 	let conn = ctrl.connection(id).ok_or(AppError::Offline)?;
 	expect_response!(
 		&conn,
@@ -499,8 +553,7 @@ pub async fn start_control(
 	max_fps: Option<u8>,
 ) -> AppResult<()> {
 	let state = state.inner().clone();
-	let ctrl = state.require_active()?;
-	let id = parse_id(&id)?;
+	let (ctrl, id) = active_and_id(&state, &id)?;
 	let defaults = SessionConfig::default();
 	let cfg = SessionConfig {
 		display: display.unwrap_or(defaults.display),
@@ -548,8 +601,7 @@ async fn client_endpoint(
 #[tauri::command]
 pub async fn connect_rdp(state: State<'_, AppState>, id: String) -> AppResult<()> {
 	let state = state.inner().clone();
-	let ctrl = state.require_active()?;
-	let id = parse_id(&id)?;
+	let (ctrl, id) = active_and_id(&state, &id)?;
 	let conn = ctrl.connection(id).ok_or(AppError::Offline)?;
 	let info = expect_response!(&conn, &ControlRequest::EnableRdp, ControlResponse::Rdp)?;
 	let (host, port) = client_endpoint(&ctrl, id, &conn, info.address.clone(), info.port).await?;
@@ -579,8 +631,7 @@ async fn ssh_reachable(host: &str, port: u16) -> bool {
 #[tauri::command]
 pub async fn connect_ssh(state: State<'_, AppState>, id: String) -> AppResult<()> {
 	let state = state.inner().clone();
-	let ctrl = state.require_active()?;
-	let id = parse_id(&id)?;
+	let (ctrl, id) = active_and_id(&state, &id)?;
 	let conn = ctrl.connection(id).ok_or(AppError::Offline)?;
 	let status = expect_response!(&conn, &ControlRequest::Status, ControlResponse::Status)?;
 	let (host, port) = client_endpoint(&ctrl, id, &conn, status.tailscale_ip.clone(), 22).await?;
@@ -605,10 +656,22 @@ pub async fn save_text_file(path: String, contents: String) -> AppResult<()> {
 	if !p.is_absolute() {
 		return Err(AppError::msg("refusing to write a non-absolute path"));
 	}
+	// Reject `..` traversal so a path can't be steered up out of where the dialog
+	// pointed (e.g. `/home/user/Downloads/../.config/autostart/x.sh`).
+	if p.components().any(|c| c == std::path::Component::ParentDir) {
+		return Err(AppError::msg("refusing to write a path containing '..'"));
+	}
 	if !matches!(p.extension().and_then(|e| e.to_str()), Some("sh" | "ps1" | "txt")) {
 		return Err(AppError::msg(
 			"refusing to write this file type (expected .sh, .ps1 or .txt)",
 		));
+	}
+	// Don't follow a pre-existing symlink at the destination — that could redirect
+	// the write to a target outside the chosen location.
+	if let Ok(meta) = std::fs::symlink_metadata(p) {
+		if meta.file_type().is_symlink() {
+			return Err(AppError::msg("refusing to overwrite a symlink"));
+		}
 	}
 	std::fs::write(&path, contents)?;
 	#[cfg(unix)]
@@ -723,6 +786,40 @@ mod tests {
 	}
 
 	#[test]
+	fn safe_launch_template_accepts_real_commands_with_placeholder_args() {
+		// A literal program followed by flags and placeholders in the argument
+		// positions is exactly what an operator legitimately configures.
+		assert!(safe_launch_template("gnome-terminal --").is_ok());
+		assert!(safe_launch_template("xterm -e").is_ok());
+		assert!(safe_launch_template("/usr/bin/xfreerdp /v:{host}:{port} /u:{user}").is_ok());
+		assert_eq!(safe_launch_template("  remmina -c  ").unwrap(), "remmina -c");
+	}
+
+	#[test]
+	fn safe_launch_template_rejects_placeholder_or_flag_in_the_binary_position() {
+		// A placeholder as the program would let an agent-reported value become the
+		// executed binary — the core of the finding.
+		assert!(safe_launch_template("{host} /v:1.2.3.4").is_err());
+		assert!(safe_launch_template("{password}").is_err());
+		// A leading-'-' program could be parsed as a flag; control chars / blank / huge.
+		assert!(safe_launch_template("-evil").is_err());
+		assert!(safe_launch_template("").is_err());
+		assert!(safe_launch_template("foo\nbar").is_err());
+		assert!(safe_launch_template(&"x".repeat(513)).is_err());
+	}
+
+	#[test]
+	fn normalize_template_blanks_to_none_and_validates_non_blank() {
+		assert_eq!(normalize_template(None).unwrap(), None);
+		assert_eq!(normalize_template(Some("   ".into())).unwrap(), None);
+		assert_eq!(
+			normalize_template(Some("remmina".into())).unwrap(),
+			Some("remmina".into())
+		);
+		assert!(normalize_template(Some("{host}".into())).is_err());
+	}
+
+	#[test]
 	fn with_port_appends_only_when_missing() {
 		assert_eq!(with_port("1.2.3.4", 47600), "1.2.3.4:47600");
 		assert_eq!(with_port("host.example", 9000), "host.example:9000");
@@ -733,22 +830,17 @@ mod tests {
 	fn active_with(kind: ControllerKind) -> ActiveController {
 		use crate::registry::ClientStore;
 		use crate::state::ControllerProfile;
-		use std::collections::HashMap;
 		use std::sync::atomic::{AtomicU32, Ordering};
-		use std::sync::Mutex;
 		static N: AtomicU32 = AtomicU32::new(0);
 		let path = std::env::temp_dir().join(format!(
 			"lt-cmds-{}-{}.json",
 			std::process::id(),
 			N.fetch_add(1, Ordering::Relaxed)
 		));
-		ActiveController {
-			profile: ControllerProfile::new("test".into(), kind),
-			store: Mutex::new(ClientStore::load(path).unwrap()),
-			live: Mutex::new(HashMap::new()),
-			sessions: Mutex::new(HashMap::new()),
-			tunnels: Mutex::new(HashMap::new()),
-		}
+		ActiveController::new(
+			ControllerProfile::new("test".into(), kind),
+			ClientStore::load(path).unwrap(),
+		)
 	}
 
 	#[tokio::test]
@@ -758,7 +850,7 @@ mod tests {
 			owner_secret: "owner".into(),
 			agent_secret: "agentsecret".into(),
 		});
-		match deploy_target(&ctrl).await {
+		match deploy_target(&ctrl).await.unwrap() {
 			deploy::DeployTarget::Relay {
 				address,
 				agent_secret,
@@ -780,7 +872,7 @@ mod tests {
 			advertise_addr: Some("10.0.0.5".into()),
 			listen_port: 47600,
 		});
-		match deploy_target(&ctrl).await {
+		match deploy_target(&ctrl).await.unwrap() {
 			deploy::DeployTarget::Controller {
 				address,
 				auth_key,
@@ -792,6 +884,51 @@ mod tests {
 			}
 			_ => panic!("direct controller must produce a Controller deploy target"),
 		}
+	}
+
+	#[tokio::test]
+	async fn deploy_target_for_direct_without_an_advertise_addr_fails_closed() {
+		// No advertise address means there's no concrete host to put in the deploy
+		// command — fail closed with a clear message rather than emit a placeholder
+		// that produces a broken installer invocation.
+		let ctrl = active_with(ControllerKind::Direct {
+			advertise_addr: None,
+			listen_port: 47600,
+		});
+		match deploy_target(&ctrl).await {
+			Err(e) => assert!(e.to_string().contains("advertise address"), "unexpected error: {e}"),
+			Ok(_) => panic!("a direct controller with no advertise address must fail closed"),
+		}
+	}
+
+	#[test]
+	fn direct_addr_appends_the_port_or_fails_closed() {
+		assert_eq!(direct_addr(Some("10.0.0.5".into()), 47600).unwrap(), "10.0.0.5:47600");
+		assert_eq!(direct_addr(Some("ctl:22".into()), 47600).unwrap(), "ctl:22");
+		// Missing / blank advertise address fails closed (no placeholder).
+		assert!(direct_addr(None, 47600).is_err());
+		assert!(direct_addr(Some("   ".into()), 47600).is_err());
+	}
+
+	#[test]
+	fn non_empty_name_trims_and_rejects_blank() {
+		assert_eq!(non_empty_name("  box  ".into()).unwrap(), "box");
+		assert!(non_empty_name("".into()).is_err());
+		assert!(non_empty_name("   ".into()).is_err());
+	}
+
+	#[tokio::test]
+	async fn save_text_file_rejects_unsafe_paths() {
+		// Non-absolute, `..` traversal, and disallowed extensions are all refused
+		// before any write happens.
+		assert!(save_text_file("relative.sh".into(), "x".into()).await.is_err());
+		assert!(
+			save_text_file("/home/user/Downloads/../.config/autostart/x.sh".into(), "x".into())
+				.await
+				.is_err()
+		);
+		assert!(save_text_file("/tmp/evil.bashrc".into(), "x".into()).await.is_err());
+		assert!(save_text_file("/tmp/payload.exe".into(), "x".into()).await.is_err());
 	}
 
 	// ------------------------------------------------ frontend wire contract
@@ -887,7 +1024,7 @@ mod tests {
 		let client = ClientDto {
 			id: "id".into(),
 			name: "n".into(),
-			os: "linux".into(),
+			os: ClientOs::Linux,
 			created_at: 0,
 			enrolled: true,
 			online: false,

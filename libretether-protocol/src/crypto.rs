@@ -11,11 +11,23 @@ pub struct Identity {
 	signing: SigningKey,
 }
 
+/// Fill `buf` with cryptographically secure random bytes from the OS.
+///
+/// The single place the OS RNG is touched, so the failure policy lives in one
+/// spot. A failure here is treated as fatal and fail-closed: a security tool must
+/// never proceed with weak/absent randomness for identities, nonces, tokens or
+/// secrets, and `getrandom` only fails in genuinely broken environments (no
+/// `/dev/urandom`, an exhausted fd table, a seccomp sandbox that blocks the
+/// syscall) where there is no safe way to continue.
+pub fn fill_random(buf: &mut [u8]) {
+	getrandom::getrandom(buf).expect("os rng unavailable — cannot generate secure randomness");
+}
+
 impl Identity {
 	/// Generate a brand-new random identity.
 	pub fn generate() -> Self {
 		let mut seed = [0u8; 32];
-		getrandom::getrandom(&mut seed).expect("os rng");
+		fill_random(&mut seed);
 		Self {
 			signing: SigningKey::from_bytes(&seed),
 		}
@@ -49,7 +61,7 @@ impl Identity {
 /// A fresh random 32-byte nonce, base64-encoded — used as a per-connection challenge.
 pub fn random_nonce_b64() -> String {
 	let mut nonce = [0u8; 32];
-	getrandom::getrandom(&mut nonce).expect("os rng");
+	fill_random(&mut nonce);
 	B64.encode(nonce)
 }
 
@@ -64,7 +76,7 @@ pub fn random_alnum(len: usize) -> String {
 	let mut out = String::with_capacity(len);
 	let mut buf = [0u8; 64];
 	while out.len() < len {
-		getrandom::getrandom(&mut buf).expect("os rng");
+		fill_random(&mut buf);
 		for &b in &buf {
 			if b < limit {
 				out.push(CHARS[b as usize % CHARS.len()] as char);
@@ -101,10 +113,24 @@ pub fn verify_b64(public_b64: &str, msg: &[u8], sig_b64: &str) -> bool {
 	vk.verify_strict(msg, &Signature::from_bytes(&sig_arr)).is_ok()
 }
 
+/// Decode a base64 string to exactly `N` bytes, or `None` if it isn't valid
+/// base64 of that length. Shared by the public-key and canonicalization paths so
+/// the fixed-length decode lives in one spot.
+fn decode_fixed<const N: usize>(b64: &str) -> Option<[u8; N]> {
+	B64.decode(b64.trim()).ok()?.try_into().ok()
+}
+
 fn decode_pubkey(public_b64: &str) -> Option<VerifyingKey> {
-	let bytes = B64.decode(public_b64).ok()?;
-	let arr: [u8; 32] = bytes.try_into().ok()?;
-	VerifyingKey::from_bytes(&arr).ok()
+	VerifyingKey::from_bytes(&decode_fixed::<32>(public_b64)?).ok()
+}
+
+/// Canonicalize a base64 Ed25519 public key: decode to the 32 raw key bytes and
+/// re-encode. Two different base64 encodings of the same key (e.g. trailing
+/// whitespace, or a non-canonical encoding accepted on decode) collapse to one
+/// string, so it can be used as a stable routing/identity key. Returns `None` if
+/// the input isn't a valid 32-byte key.
+pub fn canonical_pubkey(public_b64: &str) -> Option<String> {
+	Some(B64.encode(decode_fixed::<32>(public_b64)?))
 }
 
 #[cfg(test)]
@@ -162,6 +188,21 @@ mod tests {
 		assert!(!ct_eq("secret", "secret "));
 		assert!(!ct_eq("", "x"));
 		assert!(ct_eq("", ""));
+	}
+
+	#[test]
+	fn canonical_pubkey_normalizes_and_rejects_invalid_keys() {
+		let id = Identity::generate();
+		let pk = id.public_b64();
+		// A canonical key round-trips to itself.
+		assert_eq!(canonical_pubkey(&pk).as_deref(), Some(pk.as_str()));
+		// Surrounding whitespace collapses to the same canonical string, so two
+		// encodings of the same key can't register/route as distinct peers.
+		assert_eq!(canonical_pubkey(&format!("  {pk}  ")).as_deref(), Some(pk.as_str()));
+		// Wrong length and non-base64 are rejected.
+		assert!(canonical_pubkey(&B64.encode([0u8; 31])).is_none());
+		assert!(canonical_pubkey("not base64!!").is_none());
+		assert!(canonical_pubkey("").is_none());
 	}
 
 	#[test]

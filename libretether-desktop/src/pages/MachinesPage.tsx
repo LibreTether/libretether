@@ -18,9 +18,16 @@ import { PageHeader } from "../components/PageHeader"
 import { Badge, Button, EmptyState, Field, Input, Modal } from "../components/ui"
 import * as api from "../lib/api"
 import { relativeTime } from "../lib/format"
+import { OS_META } from "../lib/meta"
 import { useToast } from "../lib/toast"
 import type { ClientDto, ClientOs } from "../lib/types"
 import { useAsyncAction } from "../lib/useAsyncAction"
+
+const OS_OPTIONS = (Object.keys(OS_META) as ClientOs[]).map((os) => ({
+	icon: <OsIcon className="h-4 w-4" os={os} />,
+	label: OS_META[os].label,
+	value: os
+}))
 
 interface DeployState {
 	name: string
@@ -53,58 +60,80 @@ export function MachinesPage({
 		return () => window.clearInterval(t)
 	}, [])
 
-	const openDeploy = async (client: ClientDto) => {
-		// Decide from the client's own state — not by catching a failure — so an
-		// unrelated error (offline, backend hiccup) can't masquerade as "enrolled"
-		// and drop the user into the destructive reset dialog.
-		if (!client.enrolled) {
-			await action.run("Couldn't get the deploy script", async () => {
-				const script = await api.getDeployScript(client.id, client.os)
-				setDeploy({ name: client.name, os: client.os, script })
-			})
-			return
+	// Per-card, per-action in-flight guard. A single shared `useAsyncAction` would
+	// disable every card at once and give no double-submit protection (the buttons
+	// don't read its `busy`); keying on `${op}:${id}` lets each button on each card
+	// disable independently while its own call is pending. RDP/SSH in particular do
+	// a multi-second reachability probe, so without this a user can fire several.
+	const [pending, setPending] = useState<Record<string, boolean>>({})
+	const runExclusive = async (key: string, fn: () => Promise<unknown>) => {
+		if (pending[key]) return
+		setPending((p) => ({ ...p, [key]: true }))
+		try {
+			await fn()
+		} finally {
+			setPending((p) => ({ ...p, [key]: false }))
 		}
-		// Already enrolled — resetting issues a new one-time token and revokes the
-		// old agent key, so confirm first.
-		const ok = await confirm({
-			confirmLabel: "Reset & re-deploy",
-			message: `${client.name} is already enrolled. Resetting issues a new one-time token and revokes the old agent key. Continue?`,
-			title: "Re-deploy machine",
-			tone: "danger"
-		})
-		if (!ok) return
-		await action.run("Couldn't reset token", async () => {
-			const res = await api.resetToken(client.id)
-			setDeploy({ name: res.client.name, os: res.client.os, script: res.deploy_script })
-			onReload()
-		})
 	}
 
-	const remove = async (client: ClientDto) => {
-		const ok = await confirm({
-			confirmLabel: "Remove",
-			message: `Remove ${client.name}? The agent on that machine will no longer be able to connect.`,
-			title: "Remove machine",
-			tone: "danger"
+	const openDeploy = (client: ClientDto) =>
+		runExclusive(`deploy:${client.id}`, async () => {
+			// Decide from the client's own state — not by catching a failure — so an
+			// unrelated error (offline, backend hiccup) can't masquerade as "enrolled"
+			// and drop the user into the destructive reset dialog.
+			if (!client.enrolled) {
+				await action.run("Couldn't get the deploy script", async () => {
+					const script = await api.getDeployScript(client.id, client.os)
+					setDeploy({ name: client.name, os: client.os, script })
+				})
+				return
+			}
+			// Already enrolled — resetting issues a new one-time token and revokes the
+			// old agent key, so confirm first.
+			const ok = await confirm({
+				confirmLabel: "Reset & re-deploy",
+				message: `${client.name} is already enrolled. Resetting issues a new one-time token and revokes the old agent key. Continue?`,
+				title: "Re-deploy machine",
+				tone: "danger"
+			})
+			if (!ok) return
+			await action.run("Couldn't reset token", async () => {
+				const res = await api.resetToken(client.id)
+				setDeploy({ name: res.client.name, os: res.client.os, script: res.deploy_script })
+				onReload()
+			})
 		})
-		if (!ok) return
-		await action.run("Couldn't remove machine", async () => {
-			await api.removeClient(client.id)
-			onReload()
+
+	const remove = (client: ClientDto) =>
+		runExclusive(`remove:${client.id}`, async () => {
+			const ok = await confirm({
+				confirmLabel: "Remove",
+				message: `Remove ${client.name}? The agent on that machine will no longer be able to connect.`,
+				title: "Remove machine",
+				tone: "danger"
+			})
+			if (!ok) return
+			await action.run("Couldn't remove machine", async () => {
+				await api.removeClient(client.id)
+				onReload()
+			})
 		})
-	}
 
 	const rdp = (client: ClientDto) =>
-		action.run("RDP failed", async () => {
-			await api.connectRdp(client.id)
-			toast.info("Launching RDP", `Opening an RDP session to ${client.name}…`)
-		})
+		runExclusive(`rdp:${client.id}`, () =>
+			action.run("RDP failed", async () => {
+				await api.connectRdp(client.id)
+				toast.info("Launching RDP", `Opening an RDP session to ${client.name}…`)
+			})
+		)
 
 	const ssh = (client: ClientDto) =>
-		action.run("SSH failed", async () => {
-			await api.connectSsh(client.id)
-			toast.info("Opening SSH", `Launching a terminal to ${client.name}…`)
-		})
+		runExclusive(`ssh:${client.id}`, () =>
+			action.run("SSH failed", async () => {
+				await api.connectSsh(client.id)
+				toast.info("Opening SSH", `Launching a terminal to ${client.name}…`)
+			})
+		)
 
 	return (
 		<>
@@ -141,6 +170,7 @@ export function MachinesPage({
 						{clients.map((c) => (
 							<ClientCard
 								client={c}
+								deployBusy={!!pending[`deploy:${c.id}`]}
 								key={c.id}
 								onControl={() => onControl(c)}
 								onDeploy={() => openDeploy(c)}
@@ -148,6 +178,9 @@ export function MachinesPage({
 								onRdp={() => rdp(c)}
 								onRemove={() => remove(c)}
 								onSsh={() => ssh(c)}
+								rdpBusy={!!pending[`rdp:${c.id}`]}
+								removeBusy={!!pending[`remove:${c.id}`]}
+								sshBusy={!!pending[`ssh:${c.id}`]}
 							/>
 						))}
 					</div>
@@ -184,7 +217,11 @@ function ClientCard({
 	onDeploy,
 	onRdp,
 	onRemove,
-	onSsh
+	onSsh,
+	rdpBusy,
+	sshBusy,
+	removeBusy,
+	deployBusy
 }: {
 	client: ClientDto
 	onControl: () => void
@@ -193,6 +230,10 @@ function ClientCard({
 	onRdp: () => void
 	onRemove: () => void
 	onSsh: () => void
+	rdpBusy: boolean
+	sshBusy: boolean
+	removeBusy: boolean
+	deployBusy: boolean
 }) {
 	const { status } = client
 	return (
@@ -235,16 +276,18 @@ function ClientCard({
 					Control
 				</Button>
 				<Button
-					disabled={!client.online}
+					disabled={!client.online || rdpBusy}
 					icon={<ScreenShare className="h-4 w-4" />}
+					loading={rdpBusy}
 					onClick={onRdp}
 					size="icon-sm"
 					title="Connect via RDP"
 					variant="outline"
 				/>
 				<Button
-					disabled={!client.online}
+					disabled={!client.online || sshBusy}
 					icon={<Terminal className="h-4 w-4" />}
+					loading={sshBusy}
 					onClick={onSsh}
 					size="icon-sm"
 					title="Connect via SSH"
@@ -260,6 +303,7 @@ function ClientCard({
 				/>
 				<Button
 					icon={<Rocket className="h-4 w-4" />}
+					loading={deployBusy}
 					onClick={onDeploy}
 					size="icon-sm"
 					title="Deploy script"
@@ -267,6 +311,7 @@ function ClientCard({
 				/>
 				<Button
 					icon={<Trash2 className="h-4 w-4" />}
+					loading={removeBusy}
 					onClick={onRemove}
 					size="icon-sm"
 					title="Remove"
@@ -333,15 +378,7 @@ function CreateModal({
 					/>
 				</Field>
 				<Field hint="Picks the right deploy script for the target." label="Operating system">
-					<Combobox<ClientOs>
-						onChange={setOs}
-						options={[
-							{ icon: <OsIcon className="h-4 w-4" os="linux" />, label: "Linux", value: "linux" },
-							{ icon: <OsIcon className="h-4 w-4" os="macos" />, label: "macOS", value: "macos" },
-							{ icon: <OsIcon className="h-4 w-4" os="windows" />, label: "Windows", value: "windows" }
-						]}
-						value={os}
-					/>
+					<Combobox<ClientOs> onChange={setOs} options={OS_OPTIONS} value={os} />
 				</Field>
 			</div>
 		</Modal>

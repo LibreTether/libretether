@@ -4,6 +4,11 @@ import * as api from "../lib/api"
 import type { ActiveInfo, ControllerSummary } from "../lib/types"
 import { Button } from "./ui"
 
+/** Cap the relay connection log so a long-running / flapping dial can't grow the
+ *  buffer without bound; only the most recent lines matter for diagnostics. */
+const MAX_LOG_LINES = 500
+const appendLog = (prev: string[], line: string) => [...prev, line].slice(-MAX_LOG_LINES)
+
 /** Shown while a relay controller establishes its connection. Streams the
  *  relay's connection log and only hands control to the main screen once the
  *  relay accepts; Cancel tears the attempt down and returns to the launch screen. */
@@ -25,20 +30,20 @@ export function RelayConnecting({
 	useEffect(() => {
 		let alive = true
 		const unlisteners = [
-			api.onControllerLog((line) => alive && setLogs((prev) => [...prev, line])),
+			api.onControllerLog((line) => alive && setLogs((prev) => appendLog(prev, line))),
 			api.onControllerConnected(async () => {
 				if (!alive || cancelled.current) return
 				try {
 					const info = await api.activeController()
 					if (alive && !cancelled.current && info) onConnected(info)
 				} catch (e) {
-					if (alive) setLogs((prev) => [...prev, `error: ${api.errString(e)}`])
+					if (alive) setLogs((prev) => appendLog(prev, `error: ${api.errString(e)}`))
 				}
 			})
 		]
 		// Start serving — this kicks off the relay dial; progress arrives as events.
 		api.selectController(controller.id).catch(
-			(e) => alive && setLogs((prev) => [...prev, `error: ${api.errString(e)}`])
+			(e) => alive && setLogs((prev) => appendLog(prev, `error: ${api.errString(e)}`))
 		)
 		return () => {
 			alive = false

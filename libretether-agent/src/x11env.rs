@@ -11,8 +11,16 @@
 /// `/proc/<pid>/environ`, which the kernel only exposes for our own user's
 /// processes — and fall back to the X socket for the display number.
 ///
-/// Idempotent and cheap once satisfied; a no-op off Linux. Call it before
-/// starting the X11 backends (i.e. before the capture/injector threads spin up).
+/// Idempotent and cheap once satisfied; a no-op off Linux.
+///
+/// `main` calls this **once at startup, before building the async runtime** — i.e.
+/// while the process is still single-threaded — so in the common case (a graphical
+/// session already exists) the one `set_var` happens with no other threads running,
+/// which is the only point at which mutating the process environment is sound. The
+/// later per-session calls (before the capture/injector threads spin up) then find
+/// `applied` already true and do nothing. The residual single-threadedness caveat
+/// applies only to the boot-before-login window, where the startup call finds no
+/// session yet and a later call has to set the env once a session appears.
 #[cfg(target_os = "linux")]
 pub fn ensure() {
 	use std::path::Path;
@@ -23,7 +31,7 @@ pub fn ensure() {
 	// environment once it's been satisfied — `getenv`/`setenv` are not thread-safe,
 	// and the X11 backends read these vars on their own threads. `applied` flips to
 	// true only once the env is fully usable, so an early call before the graphical
-	// session exists still retries later.
+	// session exists still retries later (see the startup call in `main`).
 	static APPLIED: Mutex<bool> = Mutex::new(false);
 	let mut applied = APPLIED.lock().unwrap();
 	if *applied {

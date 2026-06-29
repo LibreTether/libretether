@@ -57,8 +57,18 @@ pub struct RelayAck {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "t", rename_all = "snake_case")]
 pub enum RelayEvent {
-	AgentOnline { public_key: String },
-	AgentOffline { public_key: String },
+	AgentOnline {
+		public_key: String,
+	},
+	AgentOffline {
+		public_key: String,
+	},
+	/// Application-level liveness ping the relay emits periodically. QUIC
+	/// keep-alives only prove the transport is up; a heartbeat proves the relay's
+	/// routing loop is still servicing this controller, so a wedged relay (process
+	/// alive, QUIC answering, but no longer forwarding) is detected by a read
+	/// timeout on the controller instead of stranding every agent as offline.
+	Heartbeat,
 }
 
 /// First frame the controller writes on each *routed* stream it opens to the

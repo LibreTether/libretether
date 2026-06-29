@@ -25,14 +25,27 @@ use libretether_protocol::{secret, tls, DEFAULT_PORT};
 use quinn::{Endpoint, RecvStream, SendStream};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::UnboundedSender;
-use tokio::sync::Semaphore;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 /// Hard ceiling on concurrent connections we'll service at once — beyond this we
 /// shed load rather than spawn unbounded tasks for a UDP-reachable public port.
 const MAX_CONNECTIONS: usize = 1024;
-/// How long a peer has to complete the auth handshake before we drop it, so a
-/// peer that connects and then stalls can't tie up a connection slot.
+/// Slots within [`MAX_CONNECTIONS`] kept out of reach of agents, so the controller
+/// can always connect even while an agent-secret holder opens connections in bulk.
+/// Agents acquire from a pool of `MAX_CONNECTIONS - CONTROLLER_RESERVED`; the
+/// global semaphore (held from accept, before the role is known) still bounds the
+/// total, so authenticated agents can occupy at most that many long-lived slots,
+/// leaving this much headroom for the controller and in-flight handshakes.
+const CONTROLLER_RESERVED: usize = 16;
+/// How long a peer has to complete the QUIC handshake *and* the auth handshake
+/// before we drop it, so a peer that connects and then stalls at either stage
+/// can't tie up a connection slot.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+/// How often the relay emits an application-level heartbeat to the connected
+/// controller, so a wedged relay (QUIC still answering keep-alives, routing loop
+/// stuck) is detected by the controller's read timeout. Must be well under the
+/// controller's read timeout.
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 /// Per-source rate limit: at most this many new connections per IP per window.
 const RATE_LIMIT_PER_WINDOW: u32 = 60;
 const RATE_WINDOW: Duration = Duration::from_secs(10);
@@ -229,6 +242,10 @@ async fn run(cfg: ServerConfig) -> Result<()> {
 	let relay = Relay::default();
 	let secrets = Arc::new((cfg.owner_secret, cfg.agent_secret));
 	let conn_limit = Arc::new(Semaphore::new(MAX_CONNECTIONS));
+	// Agents draw from a smaller pool so they can never consume the controller's
+	// reserved headroom (see CONTROLLER_RESERVED). The role isn't known until after
+	// auth, so this is acquired inside `handle` once the peer proves it's an agent.
+	let agent_limit = Arc::new(Semaphore::new(MAX_CONNECTIONS - CONTROLLER_RESERVED));
 
 	loop {
 		tokio::select! {
@@ -246,9 +263,10 @@ async fn run(cfg: ServerConfig) -> Result<()> {
 				};
 				let relay = relay.clone();
 				let secrets = secrets.clone();
+				let agent_limit = agent_limit.clone();
 				tokio::spawn(async move {
 					let _permit = permit; // released when the connection task ends
-					if let Err(e) = handle(relay, incoming, &secrets).await {
+					if let Err(e) = handle(relay, incoming, &secrets, &agent_limit).await {
 						eprintln!("[libretether-relay] connection error: {e}");
 					}
 				});
@@ -265,20 +283,42 @@ async fn run(cfg: ServerConfig) -> Result<()> {
 	Ok(())
 }
 
-async fn handle(relay: Relay, incoming: quinn::Incoming, secrets: &(String, String)) -> Result<()> {
-	let conn = incoming.accept()?.await?;
-	// Bound the auth handshake so a peer that connects and stalls can't hold a
-	// connection slot indefinitely.
-	let authed = match tokio::time::timeout(HANDSHAKE_TIMEOUT, authenticate(&conn, secrets)).await {
-		Ok(Ok(Some(v))) => v,
-		Ok(Ok(None)) => return Ok(()), // cleanly rejected (bad secret / proof)
-		Ok(Err(e)) => return Err(e),   // I/O error during handshake
-		Err(_) => return Ok(()),       // handshake timed out
+async fn handle(
+	relay: Relay,
+	incoming: quinn::Incoming,
+	secrets: &(String, String),
+	agent_limit: &Arc<Semaphore>,
+) -> Result<()> {
+	// Bound the whole pre-serve phase — the QUIC/TLS handshake AND the app-level
+	// auth — under one timeout. The connection permit is acquired at accept (before
+	// either runs), so a peer that completes the UDP path then stalls at *either*
+	// stage must not be able to hold that permit for longer than HANDSHAKE_TIMEOUT.
+	let pre = tokio::time::timeout(HANDSHAKE_TIMEOUT, async {
+		let conn = incoming.accept()?.await?;
+		let authed = authenticate(&conn, secrets).await?;
+		Ok::<_, anyhow::Error>((conn, authed))
+	})
+	.await;
+	let (conn, authed) = match pre {
+		Ok(Ok((conn, Some(authed)))) => (conn, authed),
+		Ok(Ok((_, None))) => return Ok(()), // cleanly rejected (bad secret / proof)
+		Ok(Err(e)) => return Err(e),        // QUIC or I/O error during the handshake
+		Err(_) => return Ok(()),            // QUIC handshake or auth timed out
 	};
 
 	match authed.role {
 		RelayRole::Controller => serve_controller(relay, conn, authed.send).await,
-		RelayRole::Agent => serve_agent(relay, conn, authed.public_key).await,
+		RelayRole::Agent => {
+			// Reserve controller headroom: agents acquire from the smaller agent pool
+			// so an agent-secret holder opening connections in bulk (even under freshly
+			// minted keys, which the key-ownership proof can't prevent) can't drain the
+			// global pool and lock the controller out. Held for the connection's life.
+			let Ok(permit) = agent_limit.clone().try_acquire_owned() else {
+				eprintln!("[libretether-relay] agent connection refused: at agent capacity");
+				return Ok(());
+			};
+			serve_agent(relay, conn, authed.public_key, permit).await
+		}
 	}
 }
 
@@ -345,10 +385,15 @@ async fn authenticate(conn: &quinn::Connection, secrets: &(String, String)) -> R
 		&hello.public_key.chars().take(8).collect::<String>()
 	);
 
+	// Route on the canonical key bytes, not the raw wire string: two base64
+	// encodings of the same key must resolve to one routing entry. `verify_b64`
+	// already proved it's a real 32-byte key, so canonicalization can't fail here.
+	let public_key = crypto::canonical_pubkey(&hello.public_key).unwrap_or(hello.public_key);
+
 	Ok(Some(Authed {
 		role: hello.role,
 		send,
-		public_key: hello.public_key,
+		public_key,
 	}))
 }
 
@@ -391,6 +436,23 @@ async fn serve_controller(relay: Relay, conn: quinn::Connection, mut events: Sen
 		}
 	});
 
+	// Emit a periodic heartbeat so the controller can tell a healthy-but-idle relay
+	// (no agents changing) from a wedged one. Stops when the event channel closes
+	// (controller gone / `events_task` torn down).
+	let heartbeat = {
+		let tx = tx.clone();
+		tokio::spawn(async move {
+			let mut ticker = tokio::time::interval(HEARTBEAT_INTERVAL);
+			ticker.tick().await; // the first tick fires immediately — skip it
+			loop {
+				ticker.tick().await;
+				if tx.send(RelayEvent::Heartbeat).is_err() {
+					break;
+				}
+			}
+		})
+	};
+
 	// Route each stream the controller opens to the named agent.
 	loop {
 		let (mut c_send, mut c_recv) = match conn.accept_bi().await {
@@ -406,7 +468,8 @@ async fn serve_controller(relay: Relay, conn: quinn::Connection, mut events: Sen
 			// when the addressed agent is gone or its connection is dying, so the
 			// controller gets a prompt, attributable failure instead of an opaque
 			// close it might mistake for a transient relay hiccup.
-			let Some(agent) = relay.agent(&route.agent) else {
+			let agent_key = crypto::canonical_pubkey(&route.agent).unwrap_or(route.agent);
+			let Some(agent) = relay.agent(&agent_key) else {
 				let _ = c_send.reset(AGENT_UNAVAILABLE.into());
 				return;
 			};
@@ -429,12 +492,29 @@ async fn serve_controller(relay: Relay, conn: quinn::Connection, mut events: Sen
 		}
 	}
 	events_task.abort();
+	heartbeat.abort();
 	Ok(())
 }
 
-async fn serve_agent(relay: Relay, conn: quinn::Connection, public_key: String) -> Result<()> {
+/// `_permit` ties an agent-pool slot to this connection's lifetime (see
+/// CONTROLLER_RESERVED): it is released when the connection ends.
+async fn serve_agent(
+	relay: Relay,
+	conn: quinn::Connection,
+	public_key: String,
+	_permit: OwnedSemaphorePermit,
+) -> Result<()> {
 	let conn_id = conn.stable_id();
-	relay.agents.lock().unwrap().insert(public_key.clone(), conn.clone());
+	// Register, displacing any prior connection under this key. An honest agent
+	// holds exactly one connection; force-closing a stale predecessor frees its
+	// slot/permit immediately instead of waiting for its own `closed()` to fire,
+	// and bounds a single identity to one live connection.
+	let previous = relay.agents.lock().unwrap().insert(public_key.clone(), conn.clone());
+	if let Some(prev) = previous {
+		if prev.stable_id() != conn_id {
+			prev.close(0u32.into(), b"replaced by a newer connection for this key");
+		}
+	}
 	relay.notify(RelayEvent::AgentOnline {
 		public_key: public_key.clone(),
 	});
@@ -468,6 +548,12 @@ mod tests {
 	use super::*;
 	use libretether_protocol::crypto::Identity;
 	use std::net::Ipv4Addr;
+
+	/// A standalone agent-pool permit for tests that call `serve_agent` directly
+	/// (in production the permit comes from the shared agent semaphore in `handle`).
+	fn agent_permit() -> OwnedSemaphorePermit {
+		Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap()
+	}
 
 	#[test]
 	fn rate_limiter_allows_a_burst_then_sheds_per_source() {
@@ -713,7 +799,7 @@ mod tests {
 		let (_aep, agent_conn, agent_view) = connect(&relay_ep, addr).await;
 		tokio::spawn({
 			let (relay, key) = (relay.clone(), agent_key.clone());
-			async move { serve_agent(relay, agent_view, key).await }
+			async move { serve_agent(relay, agent_view, key, agent_permit()).await }
 		});
 		wait_until(|| relay.agent(&agent_key).is_some()).await;
 
@@ -837,7 +923,7 @@ mod tests {
 		let id1 = view1.stable_id();
 		tokio::spawn({
 			let (relay, key) = (relay.clone(), key.clone());
-			async move { serve_agent(relay, view1, key).await }
+			async move { serve_agent(relay, view1, key, agent_permit()).await }
 		});
 		wait_until(|| relay.agent(&key).map(|c| c.stable_id()) == Some(id1)).await;
 
@@ -847,7 +933,7 @@ mod tests {
 		assert_ne!(id1, id2);
 		tokio::spawn({
 			let (relay, key) = (relay.clone(), key.clone());
-			async move { serve_agent(relay, view2, key).await }
+			async move { serve_agent(relay, view2, key, agent_permit()).await }
 		});
 		wait_until(|| relay.agent(&key).map(|c| c.stable_id()) == Some(id2)).await;
 
@@ -882,7 +968,7 @@ mod tests {
 		let (_aep, agent_conn, agent_view) = connect(&relay_ep, addr).await;
 		tokio::spawn({
 			let (relay, key) = (relay.clone(), key.clone());
-			async move { serve_agent(relay, agent_view, key).await }
+			async move { serve_agent(relay, agent_view, key, agent_permit()).await }
 		});
 		let online: RelayEvent = with_timeout("online event", read_frame_capped(&mut hello_recv, MAX_CONTROL_FRAME))
 			.await

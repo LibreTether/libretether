@@ -1,6 +1,7 @@
 mod commands;
 mod deploy;
 mod error;
+mod launch;
 mod link;
 mod rdp;
 mod registry;

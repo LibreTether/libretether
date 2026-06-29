@@ -10,7 +10,7 @@ use ashpd::desktop::remote_desktop::{Axis, DeviceType, KeyState, RemoteDesktop, 
 use ashpd::desktop::screencast::{CursorMode, Screencast, SelectSourcesOptions, SourceType};
 use ashpd::desktop::{PersistMode, Session};
 use ashpd::enumflags2::BitFlags;
-use libretether_protocol::frame::{read_frame, write_frame};
+use libretether_protocol::frame::{read_frame_capped, write_frame, MAX_CONTROL_FRAME};
 use libretether_protocol::{InputEvent, MouseButton, SessionClient, SessionConfig, SessionServer};
 use quinn::{RecvStream, SendStream};
 
@@ -81,7 +81,9 @@ async fn serve(cfg: SessionConfig, mut send: SendStream, recv: RecvStream) -> Re
 	let reader = tokio::spawn(async move {
 		let mut recv = recv;
 		loop {
-			match read_frame::<_, SessionClient>(&mut recv).await {
+			// Input/control events are small — cap the read tightly (frames flow the
+			// other direction; these never need the wide cap).
+			match read_frame_capped::<_, SessionClient>(&mut recv, MAX_CONTROL_FRAME).await {
 				Ok(SessionClient::Input(ev)) => {
 					if input_tx.send(ev).is_err() {
 						break;

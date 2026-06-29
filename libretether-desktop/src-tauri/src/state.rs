@@ -182,6 +182,10 @@ pub struct SessionHandle {
 pub struct TunnelHandle {
 	pub local_port: u16,
 	pub task: tauri::async_runtime::JoinHandle<()>,
+	/// Cleared by the accept loop if it ever gives up (e.g. a persistently failing
+	/// listener), so a reuse can detect a dead tunnel and rebuild it rather than
+	/// hand back a local port nothing is accepting on.
+	pub alive: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// The single controller that is currently running.
@@ -192,9 +196,24 @@ pub struct ActiveController {
 	pub sessions: Mutex<HashMap<Uuid, SessionHandle>>,
 	/// Active loopback tunnels keyed by `(client, remote_port)`.
 	pub tunnels: Mutex<HashMap<(Uuid, u16), TunnelHandle>>,
+	/// Serializes registry persisters so their disk writes stay ordered with the
+	/// snapshots they took — without holding the `store` lock across the fsync.
+	persist_lock: Mutex<()>,
 }
 
 impl ActiveController {
+	/// Construct an active controller with empty live state.
+	pub fn new(profile: ControllerProfile, store: ClientStore) -> Self {
+		Self {
+			profile,
+			store: Mutex::new(store),
+			live: Mutex::new(HashMap::new()),
+			sessions: Mutex::new(HashMap::new()),
+			tunnels: Mutex::new(HashMap::new()),
+			persist_lock: Mutex::new(()),
+		}
+	}
+
 	/// Clone out the link for a client, if connected.
 	pub fn connection(&self, id: Uuid) -> Option<AgentLink> {
 		self.live.lock().unwrap().get(&id).map(|c| c.link.clone())
@@ -202,6 +221,46 @@ impl ActiveController {
 
 	pub fn is_online(&self, id: Uuid) -> bool {
 		self.live.lock().unwrap().contains_key(&id)
+	}
+
+	/// Mutate the client registry under the `store` lock, then persist the snapshot
+	/// to disk *after releasing that lock*, so the blocking fsync doesn't serialize
+	/// every other store access (e.g. `list_clients`) or stall the async runtime.
+	///
+	/// The `persist_lock` is held across the whole operation so concurrent persisters
+	/// stay ordered (the on-disk file always reflects the latest mutation), while the
+	/// fsync itself runs with only that lock held — never the `store` lock.
+	pub fn mutate_store<R>(&self, f: impl FnOnce(&mut ClientStore) -> AppResult<R>) -> AppResult<R> {
+		let _persist = self.persist_lock.lock().unwrap();
+		let (result, snapshot) = {
+			let mut store = self.store.lock().unwrap();
+			let result = f(&mut store)?;
+			(result, store.snapshot()?)
+		};
+		let (path, raw) = snapshot;
+		libretether_protocol::secret::write_str(path, &raw)?;
+		Ok(result)
+	}
+
+	/// Like [`Self::mutate_store`] but for callers with no `Result` to bubble (the
+	/// enrollment / last-seen paths): `f` returns `(value, changed)`, the write is
+	/// skipped when nothing changed, and a write failure is logged rather than
+	/// returned — a dropped last-seen update mustn't abort an otherwise-good
+	/// handshake (the agent is still enrolled in memory for this session).
+	pub fn mutate_store_warn<R>(&self, context: &str, f: impl FnOnce(&mut ClientStore) -> (R, bool)) -> R {
+		let _persist = self.persist_lock.lock().unwrap();
+		let (result, snapshot) = {
+			let mut store = self.store.lock().unwrap();
+			let (result, changed) = f(&mut store);
+			let snapshot = if changed { store.snapshot().ok() } else { None };
+			(result, snapshot)
+		};
+		if let Some((path, raw)) = snapshot {
+			if let Err(e) = libretether_protocol::secret::write_str(path, &raw) {
+				eprintln!("[libretether] warning: failed to persist registry after {context}: {e}");
+			}
+		}
+		result
 	}
 }
 
@@ -358,13 +417,7 @@ impl AppState {
 		self.deactivate();
 		let profile = self.load_profile(id)?;
 		let store = ClientStore::load(self.profile_dir(id).join("clients.json"))?;
-		let controller = Arc::new(ActiveController {
-			profile,
-			store: Mutex::new(store),
-			live: Mutex::new(HashMap::new()),
-			sessions: Mutex::new(HashMap::new()),
-			tunnels: Mutex::new(HashMap::new()),
-		});
+		let controller = Arc::new(ActiveController::new(profile, store));
 
 		let state = self.clone();
 		let ctrl = controller.clone();

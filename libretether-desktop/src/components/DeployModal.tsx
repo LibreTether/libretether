@@ -4,16 +4,11 @@ import { Check, Copy, Download, Terminal } from "lucide-react"
 import { useState } from "react"
 import * as api from "../lib/api"
 import { slug } from "../lib/format"
+import { OS_META } from "../lib/meta"
 import { useToast } from "../lib/toast"
 import type { ClientOs } from "../lib/types"
 import { useAsyncAction } from "../lib/useAsyncAction"
 import { Button, Modal } from "./ui"
-
-const RUN_HINT: Record<ClientOs, string> = {
-	linux: "Run this on the client machine you want to control:",
-	macos: "Run this on the client Mac you want to control:",
-	windows: "Run this in PowerShell on the client PC you want to control:"
-}
 
 export function DeployModal({
 	open,
@@ -87,7 +82,7 @@ export function DeployModal({
 				<div className="flex items-start gap-2.5 rounded-xl bg-primary-soft/60 px-3.5 py-3 text-sm text-muted">
 					<Terminal className="mt-0.5 h-4 w-4 shrink-0 text-primary dark:text-primary-strong" />
 					<div>
-						<p className="font-medium text-text">{RUN_HINT[os]}</p>
+						<p className="font-medium text-text">{OS_META[os].runHint}</p>
 						<p className="mt-1 text-xs">
 							It installs the LibreTether agent, enrols it with your controller, and keeps it running on
 							every boot. Runs once — no need to save it first.

@@ -14,6 +14,14 @@ use xcap::Monitor;
 pub struct Capture {
 	pub width: u32,
 	pub height: u32,
+	/// The monitor's top-left origin in the global/virtual-desktop coordinate
+	/// space. Non-zero for any monitor that isn't at the virtual origin (a
+	/// secondary display, or a primary placed right of/below another). Input
+	/// injection uses `enigo`'s absolute (virtual-desktop) coordinates, so it must
+	/// add this origin — otherwise pointer events on such a monitor land on the
+	/// wrong screen.
+	pub origin_x: i32,
+	pub origin_y: i32,
 	pub image: RgbaImage,
 }
 
@@ -38,11 +46,18 @@ pub fn capture(display: u32) -> Result<Capture> {
 	}
 
 	let monitor = pick(&monitors, display)?;
+	let (origin_x, origin_y) = (monitor.x(), monitor.y());
 	let image = monitor
 		.capture_image()
 		.map_err(|e| anyhow!("capturing display {display}: {e}"))?;
 	let (width, height) = (image.width(), image.height());
-	Ok(Capture { width, height, image })
+	Ok(Capture {
+		width,
+		height,
+		origin_x,
+		origin_y,
+		image,
+	})
 }
 
 fn pick(monitors: &[Monitor], display: u32) -> Result<&Monitor> {

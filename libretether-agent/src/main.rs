@@ -81,11 +81,30 @@ enum Command {
 	Uninstall,
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
 	let cli = Cli::parse();
 	let cfg_path = cli.config.clone().unwrap_or_else(default_config_path);
 
+	// For the long-lived `run` service, recover the X11 session's DISPLAY/XAUTHORITY
+	// **now**, while the process is still single-threaded — mutating the process
+	// environment (which `x11env::ensure` does, and which xcap/enigo later read) is
+	// only sound before the async runtime spawns worker threads. In the common case
+	// (a graphical session already exists) this satisfies it once here, so the
+	// per-session `ensure()` calls on runtime threads become no-ops; the per-session
+	// retry remains only for the boot-before-login window, where no session yet
+	// exists for this early call to find.
+	#[cfg(target_os = "linux")]
+	if matches!(cli.command, Command::Run) {
+		x11env::ensure();
+	}
+
+	tokio::runtime::Builder::new_multi_thread()
+		.enable_all()
+		.build()?
+		.block_on(dispatch(cli, cfg_path))
+}
+
+async fn dispatch(cli: Cli, cfg_path: std::path::PathBuf) -> Result<()> {
 	match cli.command {
 		Command::Enroll {
 			controller,

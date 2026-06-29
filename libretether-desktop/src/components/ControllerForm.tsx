@@ -1,6 +1,6 @@
-import { Network, Server, Wifi } from "lucide-react"
 import { useState } from "react"
 import * as api from "../lib/api"
+import { CONTROLLER_TYPE_META } from "../lib/meta"
 import { useToast } from "../lib/toast"
 import type { ControllerKind, ControllerSummary, ControllerType } from "../lib/types"
 import { useAsyncAction } from "../lib/useAsyncAction"
@@ -9,12 +9,8 @@ import { Button, Field, Input, Modal } from "./ui"
 
 const DEFAULT_PORT = 47600
 
-const TYPE_HELP: Record<ControllerType, string> = {
-	direct: "Agents dial this machine directly — over your LAN, an existing VPN, or a port-forward. You provide the address they should reach.",
-	relay: "This controller and every agent dial out to a libretether-relay you run on a public host. Nothing on either end needs to be exposed.",
-	tailscale:
-		"Agents join your tailnet with a pre-auth key, then dial this machine's tailnet address. No ports to expose."
-}
+// Order the type picker explicitly (the metadata map's key order is incidental).
+const TYPE_OPTIONS: ControllerType[] = ["tailscale", "direct", "relay"]
 
 export function ControllerForm({
 	existing,
@@ -42,7 +38,7 @@ export function ControllerForm({
 	const buildKind = (): ControllerKind => {
 		const listen_port = Number.parseInt(port, 10) || DEFAULT_PORT
 		if (type === "direct") return { advertise_addr: advertise.trim() || null, listen_port, type }
-		if (type === "tailscale") return { auth_key: authKey.trim(), listen_port, type }
+		if (type === "tailscale") return { auth_key: authKey.trim() || null, listen_port, type }
 		return {
 			address: relayAddr.trim(),
 			agent_secret: relayAgent.trim(),
@@ -106,14 +102,17 @@ export function ControllerForm({
 					/>
 				</Field>
 
-				<Field hint={TYPE_HELP[type]} label="Type">
+				<Field hint={CONTROLLER_TYPE_META[type].help} label="Type">
 					<Combobox<ControllerType>
 						onChange={setType}
-						options={[
-							{ icon: <Wifi className="h-4 w-4" />, label: "Tailscale", value: "tailscale" },
-							{ icon: <Network className="h-4 w-4" />, label: "Direct", value: "direct" },
-							{ icon: <Server className="h-4 w-4" />, label: "Relay", value: "relay" }
-						]}
+						options={TYPE_OPTIONS.map((t) => {
+							const Icon = CONTROLLER_TYPE_META[t].icon
+							return {
+								icon: <Icon className="h-4 w-4" />,
+								label: CONTROLLER_TYPE_META[t].label,
+								value: t
+							}
+						})}
 						value={type}
 					/>
 				</Field>

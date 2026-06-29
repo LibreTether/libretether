@@ -80,25 +80,90 @@ async fn exec(program: String, args: Vec<String>, timeout_secs: Option<u64>) -> 
 	// spawned console program would otherwise pop one up on the guest's screen.
 	crate::proc::NoWindow::no_window(&mut cmd);
 
-	let child = cmd.spawn().map_err(|e| format!("spawning {program}: {e}"))?;
+	let mut child = cmd.spawn().map_err(|e| format!("spawning {program}: {e}"))?;
 	let timeout = Duration::from_secs(
 		timeout_secs
 			.unwrap_or(DEFAULT_EXEC_TIMEOUT_SECS)
 			.clamp(1, MAX_EXEC_TIMEOUT_SECS),
 	);
 
-	let output = match tokio::time::timeout(timeout, child.wait_with_output()).await {
-		Ok(Ok(out)) => out,
-		Ok(Err(e)) => return Err(format!("running {program}: {e}")),
-		Err(_) => return Err(format!("{program} timed out after {}s", timeout.as_secs())),
+	// Drain stdout/stderr concurrently with the wait, retaining at most MAX_OUTPUT
+	// per stream. `wait_with_output` buffers *all* output in memory, so a command
+	// that emits gigabytes (`yes`, `cat /dev/urandom`) within the timeout window
+	// would OOM the agent — and the oversized response would then exceed the frame
+	// cap and fail to send anyway. We keep draining past the cap (discarding) so a
+	// well-behaved command that simply prints a lot still exits promptly instead of
+	// blocking on a full pipe.
+	let stdout = child.stdout.take();
+	let stderr = child.stderr.take();
+	let collect = async {
+		let out = async {
+			match stdout {
+				Some(s) => read_capped(s, MAX_OUTPUT).await,
+				None => (Vec::new(), false),
+			}
+		};
+		let err = async {
+			match stderr {
+				Some(s) => read_capped(s, MAX_OUTPUT).await,
+				None => (Vec::new(), false),
+			}
+		};
+		tokio::join!(out, err, child.wait())
 	};
 
+	let (stdout, stderr, status) = match tokio::time::timeout(timeout, collect).await {
+		Ok(triple) => triple,
+		Err(_) => return Err(format!("{program} timed out after {}s", timeout.as_secs())),
+	};
+	let status = status.map_err(|e| format!("running {program}: {e}"))?;
+
 	Ok(ExecResult {
-		code: output.status.code(),
-		stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-		stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+		code: status.code(),
+		stdout: decode_output(stdout),
+		stderr: decode_output(stderr),
 		duration_ms: started.elapsed().as_millis() as u64,
 	})
+}
+
+/// Cap on how much of each of a command's stdout/stderr the agent keeps in memory.
+const MAX_OUTPUT: usize = 1024 * 1024;
+
+/// Read `reader` to EOF, retaining at most `cap` bytes (discarding the rest so the
+/// child never blocks on a full pipe). Returns the bytes and whether output was
+/// dropped past the cap.
+async fn read_capped<R>(mut reader: R, cap: usize) -> (Vec<u8>, bool)
+where
+	R: tokio::io::AsyncRead + Unpin,
+{
+	use tokio::io::AsyncReadExt;
+	let mut buf = Vec::new();
+	let mut chunk = [0u8; 8192];
+	let mut truncated = false;
+	loop {
+		match reader.read(&mut chunk).await {
+			Ok(0) | Err(_) => break,
+			Ok(n) => {
+				let room = cap.saturating_sub(buf.len());
+				let take = room.min(n);
+				buf.extend_from_slice(&chunk[..take]);
+				if take < n {
+					truncated = true;
+				}
+			}
+		}
+	}
+	(buf, truncated)
+}
+
+/// Lossily decode captured bytes to a string, appending a marker when the stream
+/// was truncated at [`MAX_OUTPUT`] so the operator knows output was cut.
+fn decode_output((bytes, truncated): (Vec<u8>, bool)) -> String {
+	let mut s = String::from_utf8_lossy(&bytes).into_owned();
+	if truncated {
+		s.push_str("\n…[output truncated at 1 MiB]");
+	}
+	s
 }
 
 async fn screenshot(display: u32) -> Result<ScreenshotResult, String> {
@@ -128,4 +193,28 @@ async fn screenshot(display: u32) -> Result<ScreenshotResult, String> {
 	})
 	.await
 	.map_err(|e| format!("screenshot task failed: {e}"))?
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[tokio::test]
+	async fn read_capped_retains_up_to_the_cap_and_flags_truncation() {
+		// More than the cap: retains exactly `cap` bytes and reports truncation.
+		let data = [b'x'; 100];
+		let (buf, truncated) = read_capped(&data[..], 10).await;
+		assert_eq!(buf.len(), 10);
+		assert!(truncated);
+		// Under the cap: kept whole, not flagged.
+		let (buf, truncated) = read_capped(&b"hello"[..], 10).await;
+		assert_eq!(buf, b"hello");
+		assert!(!truncated);
+	}
+
+	#[test]
+	fn decode_output_appends_a_marker_only_when_truncated() {
+		assert_eq!(decode_output((b"hi".to_vec(), false)), "hi");
+		assert!(decode_output((b"hi".to_vec(), true)).contains("truncated"));
+	}
 }

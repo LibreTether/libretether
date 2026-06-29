@@ -28,6 +28,10 @@ export function ControlOverlay({ client, onClose }: { client: ClientDto; onClose
 	// held Ctrl/Shift or mouse button stays stuck *down* on the remote machine.
 	const pressedKeys = useRef<Set<string>>(new Set())
 	const pressedButtons = useRef<Set<MouseButton>>(new Set())
+	// Timestamp of the last Escape keydown, so a quick double-tap exits the overlay
+	// while a single Escape is forwarded to the remote (a remote-control surface must
+	// be able to send Escape — close vim insert mode, dismiss a dialog, …).
+	const escapeAt = useRef(0)
 
 	const send = useCallback(
 		(event: InputEvent) => {
@@ -97,16 +101,20 @@ export function ControlOverlay({ client, onClose }: { client: ClientDto; onClose
 	// or a toast. Escape closes the overlay; everything else is forwarded.
 	useEffect(() => {
 		const onKeyDown = (e: KeyboardEvent) => {
-			if (e.key === "Escape") {
-				onClose()
-				return
-			}
 			e.preventDefault()
+			// A double-tap of Escape (two presses within 500ms) exits the overlay; a
+			// single Escape falls through and is forwarded to the remote like any key.
+			if (e.key === "Escape" && !e.repeat) {
+				if (e.timeStamp - escapeAt.current < 500) {
+					onClose()
+					return
+				}
+				escapeAt.current = e.timeStamp
+			}
 			pressedKeys.current.add(e.code)
 			send({ code: e.code, pressed: true, t: "key" })
 		}
 		const onKeyUp = (e: KeyboardEvent) => {
-			if (e.key === "Escape") return
 			e.preventDefault()
 			pressedKeys.current.delete(e.code)
 			send({ code: e.code, pressed: false, t: "key" })
@@ -210,7 +218,7 @@ export function ControlOverlay({ client, onClose }: { client: ClientDto; onClose
 					{fps > 0 && ` · ${fps} fps`}
 				</span>
 				<span className="ml-auto flex items-center gap-1.5 text-xs text-white/50">
-					<Keyboard className="h-3.5 w-3.5" /> type to control · Esc to exit
+					<Keyboard className="h-3.5 w-3.5" /> type to control · Esc×2 to exit
 				</span>
 				<button
 					className="ml-2 flex items-center gap-1.5 rounded-lg bg-danger/90 px-3 py-1.5 text-xs font-semibold text-white transition hover:bg-danger"

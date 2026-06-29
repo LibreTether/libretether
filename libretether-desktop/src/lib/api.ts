@@ -75,9 +75,12 @@ export const onSessionClosed = (id: string, cb: () => void): Promise<UnlistenFn>
 export const onSessionError = (id: string, cb: (msg: string) => void): Promise<UnlistenFn> =>
 	listen<string>(`session:error:${id}`, (e) => cb(e.payload))
 
-/** Normalise an error thrown from `invoke` into a readable string. */
+/** Normalise an error thrown from `invoke` into a readable string. Tauri can
+ *  reject with a plain object (e.g. `{ message }`) rather than a string/Error, so
+ *  pull a string `message` out of those instead of yielding "[object Object]". */
 export function errString(e: unknown): string {
 	if (typeof e === "string") return e
 	if (e instanceof Error) return e.message
+	if (e && typeof e === "object" && "message" in e && typeof e.message === "string") return e.message
 	return String(e)
 }

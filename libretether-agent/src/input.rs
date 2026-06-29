@@ -13,17 +13,26 @@ use libretether_protocol::{InputEvent, MouseButton};
 
 /// A command sent to the injector thread.
 pub enum InjectCmd {
-	Geometry { width: u32, height: u32 },
+	Geometry {
+		width: u32,
+		height: u32,
+		/// Captured monitor's origin in the global desktop space — added to the
+		/// scaled coordinate so input lands on the right monitor (see `inject`).
+		origin_x: i32,
+		origin_y: i32,
+	},
 	Event(InputEvent),
 	Stop,
 }
 
-/// Spawn the injector thread and return a sender for [`InjectCmd`]s. The thread
-/// exits on [`InjectCmd::Stop`] or when the sender is dropped.
-pub fn spawn() -> Sender<InjectCmd> {
+/// Spawn the injector thread and return a sender for [`InjectCmd`]s plus its
+/// [`JoinHandle`](std::thread::JoinHandle). The thread exits on [`InjectCmd::Stop`]
+/// or when every sender is dropped; the caller joins the handle at teardown so the
+/// thread (and its `enigo` handles) don't outlive the session.
+pub fn spawn() -> (Sender<InjectCmd>, std::thread::JoinHandle<()>) {
 	let (tx, rx) = std::sync::mpsc::channel::<InjectCmd>();
-	std::thread::spawn(move || run(rx));
-	tx
+	let handle = std::thread::spawn(move || run(rx));
+	(tx, handle)
 }
 
 fn run(rx: Receiver<InjectCmd>) {
@@ -42,17 +51,25 @@ fn run(rx: Receiver<InjectCmd>) {
 	};
 
 	let (mut w, mut h) = (1u32, 1u32);
+	let (mut origin_x, mut origin_y) = (0i32, 0i32);
 	let mut pressed = Pressed::default();
 	while let Ok(cmd) = rx.recv() {
 		match cmd {
-			InjectCmd::Geometry { width, height } => {
+			InjectCmd::Geometry {
+				width,
+				height,
+				origin_x: ox,
+				origin_y: oy,
+			} => {
 				w = width.max(1);
 				h = height.max(1);
+				origin_x = ox;
+				origin_y = oy;
 			}
 			InjectCmd::Stop => break,
 			InjectCmd::Event(ev) => {
 				pressed.track(&ev);
-				if let Err(e) = inject(&mut enigo, ev, w, h) {
+				if let Err(e) = inject(&mut enigo, ev, origin_x, origin_y, w, h) {
 					crate::net::log(&format!("inject error: {e}"));
 				}
 			}
@@ -108,9 +125,18 @@ fn release_all(enigo: &mut Enigo, pressed: &Pressed) {
 	}
 }
 
-fn inject(enigo: &mut Enigo, ev: InputEvent, w: u32, h: u32) -> Result<(), enigo::InputError> {
+fn inject(
+	enigo: &mut Enigo,
+	ev: InputEvent,
+	origin_x: i32,
+	origin_y: i32,
+	w: u32,
+	h: u32,
+) -> Result<(), enigo::InputError> {
 	match ev {
-		InputEvent::MouseMove { x, y } => enigo.move_mouse(norm_to_px(x, w), norm_to_px(y, h), Coordinate::Abs),
+		InputEvent::MouseMove { x, y } => {
+			enigo.move_mouse(axis_px(origin_x, x, w), axis_px(origin_y, y, h), Coordinate::Abs)
+		}
 		InputEvent::MouseButton { button, pressed } => {
 			let dir = if pressed { Direction::Press } else { Direction::Release };
 			enigo.button(map_button(button), dir)
@@ -141,6 +167,16 @@ fn inject(enigo: &mut Enigo, ev: InputEvent, w: u32, h: u32) -> Result<(), enigo
 /// clamps through to `0`, and values outside `[0,1]` saturate to the edges.
 fn norm_to_px(v: f64, extent: u32) -> i32 {
 	(v.clamp(0.0, 1.0) * extent as f64).round() as i32
+}
+
+/// Absolute virtual-desktop pixel for a normalized coordinate: the captured
+/// monitor's `origin` plus the in-monitor offset. `enigo`'s `Coordinate::Abs`
+/// addresses the whole virtual desktop, so without the origin a click on a monitor
+/// that isn't at the virtual origin (a secondary display, or a primary placed
+/// right-of/below another) would land on the wrong screen. `saturating_add` keeps
+/// the result in range for any origin the compositor reports.
+fn axis_px(origin: i32, v: f64, extent: u32) -> i32 {
+	origin.saturating_add(norm_to_px(v, extent))
 }
 
 fn map_button(b: MouseButton) -> Button {
@@ -291,6 +327,21 @@ mod tests {
 		assert_eq!(norm_to_px(1.0, 1920), 1920);
 		assert_eq!(norm_to_px(0.5, 1920), 960);
 		assert_eq!(norm_to_px(0.5, 1081), 541); // rounds, not truncates
+	}
+
+	#[test]
+	fn axis_px_offsets_by_the_monitor_origin() {
+		// A monitor at the virtual origin behaves exactly like norm_to_px.
+		assert_eq!(axis_px(0, 0.0, 1920), 0);
+		assert_eq!(axis_px(0, 0.5, 1920), 960);
+		// A secondary monitor at x-origin 1920: the same normalized x maps into that
+		// monitor's slice of the virtual desktop, not the primary's.
+		assert_eq!(axis_px(1920, 0.0, 1920), 1920);
+		assert_eq!(axis_px(1920, 0.5, 1920), 2880);
+		// A primary placed below another (y-origin 1080).
+		assert_eq!(axis_px(1080, 1.0, 1080), 2160);
+		// A NaN still can't overflow — norm_to_px clamps it to 0, then add the origin.
+		assert_eq!(axis_px(1920, f64::NAN, 1920), 1920);
 	}
 
 	#[test]

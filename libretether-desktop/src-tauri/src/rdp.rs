@@ -6,6 +6,9 @@
 use std::process::Command;
 
 use crate::error::{AppError, AppResult};
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use crate::launch::percent_encode;
+use crate::launch::{spawn, split_template};
 
 /// Launch an RDP viewer connecting to `host:port`. `pref` is the controller's
 /// preferred client ("auto"/"freerdp"/"remmina"/"gnome-connections" or a custom
@@ -64,9 +67,13 @@ fn remmina(host: &str, port: u16, username: &str, password: Option<&str>) -> App
 	if !libretether_common::which("remmina") {
 		return Err(AppError::msg("Remmina not found (install `remmina`)."));
 	}
+	// Percent-encode the userinfo so a `@`/`:`/`/` (or any other reserved byte) in
+	// the username or password can't break out of the URL into a different host or
+	// extra fields — the URL stays well-formed regardless of the credential bytes.
+	let user = percent_encode(username);
 	let url = match password {
-		Some(pw) => format!("rdp://{username}:{pw}@{host}:{port}"),
-		None => format!("rdp://{username}@{host}:{port}"),
+		Some(pw) => format!("rdp://{user}:{}@{host}:{port}", percent_encode(pw)),
+		None => format!("rdp://{user}@{host}:{port}"),
 	};
 	let mut cmd = Command::new("remmina");
 	cmd.arg("-c").arg(url);
@@ -86,26 +93,24 @@ fn gnome_connections(host: &str, port: u16) -> AppResult<()> {
 }
 
 /// Run a user-provided command template, substituting placeholders per token.
+///
+/// The program (first token) is taken **literally** — placeholders are only
+/// substituted into the arguments — so an agent-reported value can never expand
+/// into the binary position (it's validated to be placeholder-free at the settings
+/// boundary too; this is the defence-in-depth half).
 #[cfg(target_os = "linux")]
 fn custom(template: &str, host: &str, port: u16, username: &str, password: Option<&str>) -> AppResult<()> {
-	let mut tokens = template.split_whitespace().map(|tok| {
+	let (bin, tokens) = split_template(template)?;
+	let args = tokens.map(|tok| {
 		tok.replace("{host}", host)
 			.replace("{address}", host)
 			.replace("{port}", &port.to_string())
 			.replace("{user}", username)
 			.replace("{password}", password.unwrap_or(""))
 	});
-	let bin = tokens.next().ok_or_else(|| AppError::msg("empty RDP client command"))?;
-	let mut cmd = Command::new(&bin);
-	cmd.args(tokens);
-	spawn(cmd, &bin)
-}
-
-#[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
-fn spawn(mut cmd: Command, label: &str) -> AppResult<()> {
-	cmd.spawn()
-		.map(|_| ())
-		.map_err(|e| AppError::msg(format!("launching {label}: {e}")))
+	let mut cmd = Command::new(bin);
+	cmd.args(args);
+	spawn(cmd, bin)
 }
 
 #[cfg(target_os = "windows")]
@@ -124,7 +129,12 @@ fn launch_windows(host: &str, port: u16, username: &str, password: Option<&str>)
 
 #[cfg(target_os = "macos")]
 fn launch_macos(host: &str, port: u16, username: &str) -> AppResult<()> {
-	let url = format!("rdp://full%20address=s:{host}:{port}&username=s:{username}");
+	// Percent-encode the username (a query-component value) so a reserved byte can't
+	// break out of the `rdp://…` URL. `host` is validated to a URL-safe set upstream.
+	let url = format!(
+		"rdp://full%20address=s:{host}:{port}&username=s:{}",
+		percent_encode(username)
+	);
 	let mut cmd = Command::new("open");
 	cmd.arg(url);
 	spawn(cmd, "open")

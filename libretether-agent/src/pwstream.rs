@@ -119,6 +119,11 @@ fn run(
 						seq: user_data.seq,
 						width: w,
 						height: h,
+						// The portal delivers one capture stream and absolute pointer
+						// motion references its node, so there is no virtual-desktop
+						// origin to offset by (unlike the multi-monitor X11 path).
+						origin_x: 0,
+						origin_y: 0,
 						jpeg,
 					};
 					match user_data.tx.try_send(enc) {
@@ -211,10 +216,24 @@ fn format_pod() -> Vec<u8> {
 		.into_inner()
 }
 
-/// Convert a packed 32-bit frame to RGBA, honoring the row stride.
+/// Largest frame dimension we'll accept from the compositor, matching the upper
+/// bound offered in the format pod (7680×4320). Caps the allocation `to_rgba`
+/// makes from the compositor-reported (untrusted) size, so a bogus or overflowing
+/// width/height can't trigger a huge or under-sized allocation.
+const MAX_DIM: u32 = 8192;
+
+/// Convert a packed 32-bit frame to RGBA, honoring the row stride. Returns `None`
+/// for an out-of-range size or a buffer too short for the claimed geometry, rather
+/// than allocating wildly or indexing out of bounds.
 fn to_rgba(src: &[u8], stride: usize, w: u32, h: u32, format: VideoFormat) -> Option<RgbaImage> {
+	if w == 0 || h == 0 || w > MAX_DIM || h > MAX_DIM {
+		return None;
+	}
 	let (wi, hi) = (w as usize, h as usize);
-	let mut out = vec![0u8; wi * hi * 4];
+	// Bounded by MAX_DIM above, so this can't overflow, but compute it checked so
+	// the intent is explicit and a future bound change stays safe.
+	let out_len = wi.checked_mul(hi)?.checked_mul(4)?;
+	let mut out = vec![0u8; out_len];
 	// Byte order within each 4-byte source pixel.
 	let (ri, gi, bi) = match format {
 		VideoFormat::BGRx | VideoFormat::BGRA => (2, 1, 0),
@@ -279,5 +298,15 @@ mod tests {
 		// never index out of bounds.
 		assert!(to_rgba(&[1, 2], 4, 1, 1, VideoFormat::RGBx).is_none());
 		assert!(to_rgba(&[0u8; 4], 4, 2, 2, VideoFormat::BGRx).is_none());
+	}
+
+	#[test]
+	fn rejects_an_out_of_range_size_before_allocating() {
+		// A bogus/huge size from a misbehaving compositor must be rejected up front,
+		// not turned into a multi-GB allocation (or an under-allocation that then
+		// indexes out of bounds).
+		assert!(to_rgba(&[0u8; 4], 4, 0, 1, VideoFormat::RGBx).is_none());
+		assert!(to_rgba(&[0u8; 4], 4, 100_000, 100_000, VideoFormat::RGBx).is_none());
+		assert!(to_rgba(&[0u8; 4], 4, u32::MAX, u32::MAX, VideoFormat::RGBx).is_none());
 	}
 }

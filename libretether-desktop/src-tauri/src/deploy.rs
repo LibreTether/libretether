@@ -171,4 +171,23 @@ mod tests {
 		let win = script(ClientOs::Windows, "tok", &relay);
 		assert!(win.contains("'evil'';rm -rf ~;'''"), "{win}");
 	}
+
+	// The Windows one-liner must be wrapped in the `irm | scriptblock` invocation so
+	// it actually runs the fetched installer — the part most likely to break silently
+	// if the wrapper is edited.
+	#[test]
+	fn windows_command_wraps_the_installer_in_a_scriptblock() {
+		let direct = DeployTarget::Controller {
+			address: "ctl:47600".into(),
+			auth_key: None,
+			controller_key: "ckey".into(),
+		};
+		let win = script(ClientOs::Windows, "tok", &direct);
+		assert!(
+			win.starts_with("& ([scriptblock]::Create((irm "),
+			"the PowerShell wrapper must invoke the fetched installer: {win}"
+		);
+		// The closing parens of the scriptblock invocation precede the arguments.
+		assert!(win.contains(".ps1))) -Token 'tok'"), "{win}");
+	}
 }

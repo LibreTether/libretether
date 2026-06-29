@@ -35,16 +35,14 @@ pub fn launch(terminal_pref: Option<&str>, host: &str, port: u16, username: &str
 
 #[cfg(target_os = "linux")]
 fn launch_linux(pref: Option<&str>, ssh: &[String]) -> AppResult<()> {
+	use crate::launch::{spawn, split_template};
+
 	// A user-set launcher template ("gnome-terminal --", "xterm -e", …).
 	if let Some(pref) = pref {
-		let mut parts = pref.split_whitespace();
-		let bin = parts.next().ok_or_else(|| AppError::msg("empty terminal command"))?;
+		let (bin, parts) = split_template(pref)?;
 		let mut cmd = Command::new(bin);
 		cmd.args(parts).args(ssh);
-		return cmd
-			.spawn()
-			.map(|_| ())
-			.map_err(|e| AppError::msg(format!("launching {bin}: {e}")));
+		return spawn(cmd, bin);
 	}
 
 	// Auto-detect a terminal and the flag it uses to run a command.
@@ -62,10 +60,7 @@ fn launch_linux(pref: Option<&str>, ssh: &[String]) -> AppResult<()> {
 		if libretether_common::which(bin) {
 			let mut cmd = Command::new(bin);
 			cmd.args(*prefix).args(ssh);
-			return cmd
-				.spawn()
-				.map(|_| ())
-				.map_err(|e| AppError::msg(format!("launching {bin}: {e}")));
+			return spawn(cmd, bin);
 		}
 	}
 	Err(AppError::msg(

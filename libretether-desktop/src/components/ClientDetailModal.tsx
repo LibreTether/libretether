@@ -55,6 +55,13 @@ export function ClientDetailModal({
 		if (open && client.online) refresh()
 	}, [open, client.online, refresh])
 
+	// Re-sync to the latest pushed status (the parent passes a fresh `client` on
+	// every `clients:changed`); without this the modal shows the snapshot from when
+	// it opened until the user clicks Refresh.
+	useEffect(() => {
+		setStatus(client.status)
+	}, [client.status])
+
 	const run = () => {
 		const parts = tokenizeCommand(cmd)
 		if (parts.length === 0) return

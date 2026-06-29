@@ -1,27 +1,41 @@
 import { writeText } from "@tauri-apps/plugin-clipboard-manager"
-import { Copy, Fingerprint, Network, Save, ScreenShare, Server, Wifi, WifiOff } from "lucide-react"
+import { Copy, Eye, EyeOff, Fingerprint, Network, Save, ScreenShare, Server, Wifi, WifiOff } from "lucide-react"
 import { useEffect, useState } from "react"
 import { Combobox } from "../components/Combobox"
 import { PageHeader } from "../components/PageHeader"
 import { Badge, Button, Field, Input } from "../components/ui"
 import * as api from "../lib/api"
 import { useToast } from "../lib/toast"
-import type { ActiveInfo } from "../lib/types"
+import type { ActiveInfo, RdpMode } from "../lib/types"
 import { useAsyncAction } from "../lib/useAsyncAction"
 
-const RDP_PRESETS = ["", "auto", "freerdp", "remmina", "gnome-connections"]
+const PRESET_MODES: RdpMode[] = ["auto", "freerdp", "remmina", "gnome-connections"]
 
-function CopyRow({ value }: { value: string }) {
+/** A copyable value. For `secret` values the text is masked behind a reveal
+ *  toggle and the copy confirmation doesn't echo the value (it would otherwise
+ *  land in the toast and clipboard-history for a high-value credential). */
+function CopyRow({ value, secret = false }: { value: string; secret?: boolean }) {
 	const toast = useToast()
+	const [revealed, setRevealed] = useState(false)
+	const masked = secret && !revealed
+	const copy = () =>
+		writeText(value)
+			.then(() => toast.success("Copied", secret ? "Copied to clipboard." : value))
+			.catch((e) => toast.error("Copy failed", api.errString(e)))
 	return (
 		<div className="flex items-center gap-2 rounded-xl border border-border bg-surface-2 px-3.5 py-2.5">
-			<code className="flex-1 truncate text-text">{value}</code>
-			<Button
-				icon={<Copy className="h-3.5 w-3.5" />}
-				onClick={() => writeText(value).then(() => toast.success("Copied", value))}
-				size="sm"
-				variant="ghost"
-			>
+			<code className="flex-1 truncate text-text">{masked ? "•".repeat(Math.min(value.length, 24)) : value}</code>
+			{secret && (
+				<Button
+					icon={revealed ? <EyeOff className="h-3.5 w-3.5" /> : <Eye className="h-3.5 w-3.5" />}
+					onClick={() => setRevealed((r) => !r)}
+					size="sm"
+					variant="ghost"
+				>
+					{revealed ? "Hide" : "Show"}
+				</Button>
+			)}
+			<Button icon={<Copy className="h-3.5 w-3.5" />} onClick={copy} size="sm" variant="ghost">
 				Copy
 			</Button>
 		</div>
@@ -31,7 +45,7 @@ function CopyRow({ value }: { value: string }) {
 export function ConnectionPage({ active }: { active: ActiveInfo }) {
 	const toast = useToast()
 	const saveAction = useAsyncAction()
-	const [rdpMode, setRdpMode] = useState("auto")
+	const [rdpMode, setRdpMode] = useState<RdpMode>("auto")
 	const [rdpCustom, setRdpCustom] = useState("")
 	const [terminal, setTerminal] = useState("")
 
@@ -40,7 +54,7 @@ export function ConnectionPage({ active }: { active: ActiveInfo }) {
 			.then((s) => {
 				setTerminal(s.terminal ?? "")
 				const rc = s.rdp_client ?? ""
-				if (RDP_PRESETS.includes(rc)) setRdpMode(rc || "auto")
+				if (rc === "" || (PRESET_MODES as string[]).includes(rc)) setRdpMode((rc || "auto") as RdpMode)
 				else {
 					setRdpMode("custom")
 					setRdpCustom(rc)
@@ -121,10 +135,10 @@ export function ConnectionPage({ active }: { active: ActiveInfo }) {
 								The controller and agents authenticate to <code>libretether-relay</code> with these.
 							</p>
 							<Field label="Owner secret">
-								<CopyRow value={kind.owner_secret} />
+								<CopyRow secret value={kind.owner_secret} />
 							</Field>
 							<Field label="Agent secret">
-								<CopyRow value={kind.agent_secret} />
+								<CopyRow secret value={kind.agent_secret} />
 							</Field>
 						</section>
 					)}
@@ -137,7 +151,7 @@ export function ConnectionPage({ active }: { active: ActiveInfo }) {
 						</div>
 
 						<Field hint="Which client the “Connect via RDP” button launches." label="RDP client">
-							<Combobox
+							<Combobox<RdpMode>
 								onChange={setRdpMode}
 								options={[
 									{ label: "Auto-detect", value: "auto" },

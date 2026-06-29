@@ -1,4 +1,4 @@
-import { useCallback, useState } from "react"
+import { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import * as api from "./api"
 import { useToast } from "./toast"
 
@@ -12,6 +12,16 @@ import { useToast } from "./toast"
 export function useAsyncAction() {
 	const toast = useToast()
 	const [busy, setBusy] = useState(false)
+	// A consumer can unmount (modal closed, navigation away) while an `invoke` is
+	// still in flight; settling `setBusy` then warns and writes to a dead component.
+	// Guard the post-await state writes on whether we're still mounted.
+	const mounted = useRef(true)
+	useEffect(() => {
+		mounted.current = true
+		return () => {
+			mounted.current = false
+		}
+	}, [])
 
 	const run = useCallback(
 		async (errorTitle: string, fn: () => Promise<void>): Promise<boolean> => {
@@ -20,14 +30,16 @@ export function useAsyncAction() {
 				await fn()
 				return true
 			} catch (e) {
-				toast.error(errorTitle, api.errString(e))
+				if (mounted.current) toast.error(errorTitle, api.errString(e))
 				return false
 			} finally {
-				setBusy(false)
+				if (mounted.current) setBusy(false)
 			}
 		},
 		[toast]
 	)
 
-	return { busy, run }
+	// Return a referentially-stable object (changing only when `busy`/`run` do) so
+	// consumers can safely depend on the whole action in effect deps without churn.
+	return useMemo(() => ({ busy, run }), [busy, run])
 }

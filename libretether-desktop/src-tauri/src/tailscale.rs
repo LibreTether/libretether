@@ -1,6 +1,9 @@
 //! Best-effort Tailscale detection so the controller can suggest the address
 //! agents should dial, and surface tailnet status in the UI.
 
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
+
 use serde::Serialize;
 use tokio::process::Command;
 
@@ -24,9 +27,30 @@ impl TailscaleInfo {
 	}
 }
 
-/// Query the local Tailscale daemon. Never fails — returns an "unavailable"
-/// record when Tailscale isn't installed or reachable.
+/// How long a `status()` result is reused before re-probing. `status()` is on the
+/// hot path of listing/activating controllers and shells out twice (locate +
+/// status); a few seconds of caching avoids a process spawn per UI refresh while
+/// staying fresh enough for "is Tailscale up" / address display.
+const CACHE_TTL: Duration = Duration::from_secs(5);
+
+static CACHE: Mutex<Option<(Instant, TailscaleInfo)>> = Mutex::new(None);
+
+/// Query the local Tailscale daemon, reusing a recent result (see [`CACHE_TTL`]).
+/// Never fails — returns an "unavailable" record when Tailscale isn't installed
+/// or reachable.
 pub async fn status() -> TailscaleInfo {
+	if let Some((at, info)) = &*CACHE.lock().unwrap() {
+		if at.elapsed() < CACHE_TTL {
+			return info.clone();
+		}
+	}
+	let info = status_uncached().await;
+	*CACHE.lock().unwrap() = Some((Instant::now(), info.clone()));
+	info
+}
+
+/// The uncached probe. Split out so [`status`] can memoize it.
+async fn status_uncached() -> TailscaleInfo {
 	let Some(bin) = locate().await else {
 		return TailscaleInfo::unavailable();
 	};

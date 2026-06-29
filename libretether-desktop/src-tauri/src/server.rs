@@ -4,9 +4,10 @@
 //! and address agents through an [`AgentLink`]. All state lives on the
 //! [`ActiveController`] passed in, so each controller is fully isolated.
 
+use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use libretether_common::Backoff;
@@ -32,6 +33,14 @@ pub const EVENT_RELAY_CONNECTED: &str = "controller:connected";
 /// How long the handshake may take before we drop a connecting peer, so one that
 /// connects and then stalls can't tie up a task indefinitely.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How long the controller waits for the next relay event (presence or heartbeat)
+/// before treating the relay as wedged and reconnecting. The relay heartbeats
+/// every few seconds, so this is several missed beats — long enough not to trip on
+/// a brief hiccup, short enough that a stuck relay doesn't strand every agent as
+/// "offline" indefinitely. QUIC keep-alives catch a dead transport; this catches a
+/// relay whose routing loop has stalled while its QUIC stack still answers.
+const RELAY_READ_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// Per-registration generation source, so a stale connection's teardown only
 /// evicts its own live entry and not a newer reconnection's (see `cleanup`).
@@ -158,17 +167,39 @@ async fn relay_session(
 		let _ = app.emit(EVENT_RELAY_CONNECTED, ());
 	}
 
+	// Public keys with an enrollment handshake in flight, so a duplicate presence
+	// event (relay flap / replay) doesn't start a second concurrent handshake for
+	// the same agent and race two live-map inserts.
+	let enrolling: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
+
 	loop {
-		let event: RelayEvent = read_frame_capped(&mut recv, MAX_CONTROL_FRAME).await?;
+		// Bound the wait on the next event: the relay heartbeats periodically, so a
+		// gap longer than RELAY_READ_TIMEOUT means the relay's routing loop is wedged
+		// (its QUIC keep-alives may still be answering) — drop and reconnect rather
+		// than leave every agent showing offline forever.
+		let event: RelayEvent =
+			match tokio::time::timeout(RELAY_READ_TIMEOUT, read_frame_capped(&mut recv, MAX_CONTROL_FRAME)).await {
+				Ok(res) => res?,
+				Err(_) => return Err(AppError::msg("relay went quiet (no heartbeat) — reconnecting")),
+			};
 		match event {
+			// Liveness only — proves the relay is still servicing us.
+			RelayEvent::Heartbeat => {}
 			RelayEvent::AgentOnline { public_key } => {
+				// Skip if an enrollment for this agent is already running (de-dup a
+				// presence replay); the in-flight handshake will register it.
+				if !enrolling.lock().unwrap().insert(public_key.clone()) {
+					continue;
+				}
 				let state = state.clone();
 				let ctrl = ctrl.clone();
-				let link = AgentLink::relay(conn.clone(), public_key);
+				let enrolling = enrolling.clone();
+				let link = AgentLink::relay(conn.clone(), public_key.clone());
 				tauri::async_runtime::spawn(async move {
 					if let Err(e) = enroll_and_register(&state, &ctrl, link).await {
 						log(&format!("enroll via relay failed: {e}"));
 					}
+					enrolling.lock().unwrap().remove(&public_key);
 				});
 			}
 			RelayEvent::AgentOffline { public_key } => {
@@ -223,10 +254,12 @@ async fn enroll_and_register(
 		return Ok(None);
 	}
 
-	let client_id = {
-		let mut store = ctrl.store.lock().unwrap();
-		store.authenticate(hello.enrollment_token.as_deref(), &hello.public_key)
-	};
+	// Enroll/identify the agent and persist the token-burn / last-seen update (the
+	// write happens off the store lock; see `mutate_store_warn`).
+	let client_id = ctrl.mutate_store_warn("enrollment", |store| {
+		let id = store.authenticate(hello.enrollment_token.as_deref(), &hello.public_key);
+		(id, id.is_some())
+	});
 	let Some(client_id) = client_id else {
 		reject(&mut send, "unknown agent (no matching enrollment token or key)").await;
 		return Ok(None);
@@ -303,7 +336,7 @@ fn cleanup(state: &AppState, ctrl: &ActiveController, id: Uuid, generation: Opti
 	// Drop any relay tunnels for this client: they hold the now-defunct
 	// connection's capability token, so a reconnect must rebuild them afresh.
 	crate::tunnel::close_for(ctrl, id);
-	ctrl.store.lock().unwrap().touch_seen(id);
+	ctrl.mutate_store_warn("last-seen", |store| ((), store.touch_seen(id)));
 	state.notify_changed();
 }
 
@@ -353,6 +386,10 @@ async fn control_request_inner(link: &AgentLink, req: &ControlRequest) -> AppRes
 	let (mut send, mut recv) = link.open_authenticated(StreamOpen::Control).await?;
 	write_frame(&mut send, req).await?;
 	let _ = send.finish();
+	// A `Screenshot` response carries a full-screen PNG, so this read intentionally
+	// uses the wide `MAX_FRAME` cap (not the 1 MiB control cap). The exposure is one
+	// such allocation per outstanding request from an already-authenticated agent,
+	// and `control_request` wraps every call in a per-request timeout.
 	Ok(read_frame::<_, ControlResponse>(&mut recv).await?)
 }
 
@@ -363,9 +400,7 @@ mod tests {
 	use crate::state::ControllerProfile;
 	use libretether_protocol::crypto::Identity;
 	use libretether_protocol::{AgentStatus, HostInfo, StreamAuth};
-	use std::collections::HashMap;
 	use std::net::Ipv4Addr;
-	use std::sync::Mutex;
 
 	fn temp_dir() -> std::path::PathBuf {
 		use std::sync::atomic::{AtomicU32, Ordering};
@@ -392,18 +427,8 @@ mod tests {
 			},
 		);
 		let mut store = ClientStore::load(dir.join("clients.json")).unwrap();
-		let token = store
-			.create("box".into(), ClientOs::Linux)
-			.unwrap()
-			.enrollment_token
-			.unwrap();
-		let ctrl = ActiveController {
-			profile,
-			store: Mutex::new(store),
-			live: Mutex::new(HashMap::new()),
-			sessions: Mutex::new(HashMap::new()),
-			tunnels: Mutex::new(HashMap::new()),
-		};
+		let token = store.create("box".into(), ClientOs::Linux).enrollment_token.unwrap();
+		let ctrl = ActiveController::new(profile, store);
 		(state, ctrl, token)
 	}
 
