@@ -196,7 +196,13 @@ export function Combobox({
 									)}
 									data-idx={i}
 									key={m.opt.value}
-									onClick={() => choose(m.opt.value)}
+									// Select on mousedown (not click): the popover closes before the
+									// trailing mouseup/click can re-target and re-toggle the trigger,
+									// which otherwise reopens it. preventDefault keeps input focus.
+									onMouseDown={(e) => {
+										e.preventDefault()
+										choose(m.opt.value)
+									}}
 									onMouseMove={() => setActive(i)}
 									type="button"
 								>
