@@ -57,6 +57,12 @@ jobs:
           sudo apt-get install -y pkg-config clang libxdo-dev libxcb1-dev libxrandr-dev libxfixes-dev libdbus-1-dev libpipewire-0.3-dev libxkbcommon-dev
 
       - uses: actions-rust-lang/setup-rust-toolchain@v1.16.1
+        # Don't let the action export RUSTFLAGS (it defaults to "-D warnings"):
+        # an env RUSTFLAGS overrides .cargo/config.toml, so the Windows build
+        # would drop +crt-static and again depend on VCRUNTIME140.dll. Lint
+        # denial is enforced by the separate CI check gate, not the release build.
+        with:
+          rustflags: ""
 
       - name: Build agent + relay
         if: ${{ !matrix.universal }}

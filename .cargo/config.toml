@@ -1,0 +1,17 @@
+# Statically link the Microsoft Visual C++ runtime into Windows (MSVC) builds.
+#
+# By default Rust's MSVC target *dynamically* links the VC++ runtime, so the
+# produced .exe needs VCRUNTIME140.dll / MSVCP140.dll from the "Visual C++
+# Redistributable" — which a stock Windows machine doesn't ship, so the agent
+# fails to launch with "VCRUNTIME140.dll was not found". Linking the CRT
+# statically folds it into the binary, making the agent (and relay) fully
+# self-contained with no runtime to install.
+#
+# Scoped to the MSVC targets only — Linux/macOS builds are untouched. Note: when
+# RUSTFLAGS is set in the environment it overrides these, so CI must not export it
+# (see .github/workflows/release.yml).
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+[target.aarch64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
