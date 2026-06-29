@@ -2360,6 +2360,7 @@ version = "0.9.0"
 dependencies = [
  "base64 0.22.1",
  "dirs",
+ "gtk",
  "libretether-protocol",
  "quinn",
  "serde",

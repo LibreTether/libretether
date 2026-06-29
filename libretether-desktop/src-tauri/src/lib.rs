@@ -10,6 +10,7 @@ mod ssh;
 mod state;
 mod tailscale;
 mod tunnel;
+mod window;
 
 use std::path::PathBuf;
 
@@ -41,6 +42,8 @@ pub fn run() {
 			// Hand the state an app handle so it can emit change events. No
 			// controller serves until the user selects one on the launch screen.
 			state.set_app(app.handle().clone());
+			// Put the native window controls where the user's desktop wants them.
+			window::honor_button_layout(app.handle());
 			Ok(())
 		})
 		.invoke_handler(tauri::generate_handler![
