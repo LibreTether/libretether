@@ -32,7 +32,7 @@ struct Portal {
 /// Entry point used by `session::run` when on Wayland.
 pub async fn run_session(cfg: SessionConfig, send: SendStream, recv: RecvStream) -> std::io::Result<()> {
 	if let Err(e) = serve(cfg, send, recv).await {
-		eprintln!("[libretether-agent] wayland session: {e:#}");
+		crate::net::log(&format!("wayland session: {e:#}"));
 	}
 	Ok(())
 }
@@ -102,9 +102,14 @@ async fn serve(cfg: SessionConfig, mut send: SendStream, recv: RecvStream) -> Re
 	let injector = {
 		let portal = portal.clone();
 		tokio::spawn(async move {
+			let mut pressed = crate::input::Pressed::default();
 			while let Some(ev) = input_rx.recv().await {
+				pressed.track(&ev);
 				inject(&portal, ev).await;
 			}
+			// The input channel closed (session ending) — release anything still held
+			// so a modifier/button down at teardown doesn't stay stuck on the remote.
+			release_all(&portal, &pressed).await;
 		})
 	};
 
@@ -117,11 +122,38 @@ async fn serve(cfg: SessionConfig, mut send: SendStream, recv: RecvStream) -> Re
 	}
 
 	stop.store(true, std::sync::atomic::Ordering::Relaxed);
+	// Abort the reader (drops its `input_tx`), which ends the injector loop and lets
+	// it release any still-held keys/buttons before the portal session closes. Bound
+	// the wait so a wedged portal call can't hang teardown.
 	reader.abort();
-	injector.abort();
+	let _ = tokio::time::timeout(std::time::Duration::from_secs(2), injector).await;
 	let _ = portal.session.close().await;
 	let _ = send.finish();
 	Ok(())
+}
+
+/// Inject a release through the portal for every key/button still held — the
+/// Wayland counterpart to the X11 injector's release-on-teardown.
+async fn release_all(portal: &Portal, pressed: &crate::input::Pressed) {
+	for code in &pressed.keys {
+		if let Some(kc) = evdev_keycode(code) {
+			let _ = portal
+				.rd
+				.notify_keyboard_keycode(&portal.session, kc, KeyState::Released, Default::default())
+				.await;
+		}
+	}
+	for &button in &pressed.buttons {
+		let _ = portal
+			.rd
+			.notify_pointer_button(
+				&portal.session,
+				evdev_button(button),
+				KeyState::Released,
+				Default::default(),
+			)
+			.await;
+	}
 }
 
 async fn setup_portal() -> Result<Portal> {
@@ -247,17 +279,53 @@ pub async fn screenshot() -> Result<(Vec<u8>, u32, u32)> {
 		.await?
 		.response()?;
 	let uri = response.uri().as_str();
-	let path = uri.strip_prefix("file://").unwrap_or(uri);
-	let bytes = std::fs::read(path)?;
+	// The portal returns a percent-encoded `file://` URI, so a path with a space or
+	// other reserved byte (e.g. `/tmp/a%20b.png`) must be decoded before we read it.
+	let path = percent_decode(uri.strip_prefix("file://").unwrap_or(uri));
+	let bytes = std::fs::read(&path)?;
 	let (width, height) = image::load_from_memory(&bytes)
 		.map(|img| (img.width(), img.height()))
 		.unwrap_or((0, 0));
-	let _ = std::fs::remove_file(path);
+	let _ = std::fs::remove_file(&path);
 	Ok((bytes, width, height))
 }
 
-/// Map a W3C `KeyboardEvent.code` to a Linux evdev keycode.
-fn evdev_keycode(code: &str) -> Option<i32> {
+/// Decode `%XX` escapes in a URI path. Leaves a malformed or trailing `%` as-is.
+fn percent_decode(s: &str) -> String {
+	let bytes = s.as_bytes();
+	let mut out = Vec::with_capacity(bytes.len());
+	let mut i = 0;
+	while i < bytes.len() {
+		match (
+			bytes[i],
+			bytes.get(i + 1).and_then(hex_val),
+			bytes.get(i + 2).and_then(hex_val),
+		) {
+			(b'%', Some(hi), Some(lo)) => {
+				out.push(hi << 4 | lo);
+				i += 3;
+			}
+			(b, _, _) => {
+				out.push(b);
+				i += 1;
+			}
+		}
+	}
+	String::from_utf8_lossy(&out).into_owned()
+}
+
+fn hex_val(b: &u8) -> Option<u8> {
+	match b {
+		b'0'..=b'9' => Some(b - b'0'),
+		b'a'..=b'f' => Some(b - b'a' + 10),
+		b'A'..=b'F' => Some(b - b'A' + 10),
+		_ => None,
+	}
+}
+
+/// Map a W3C `KeyboardEvent.code` to a Linux evdev keycode. Kept in lock-step
+/// with the X11 backend's `crate::input::map_key` (see the parity test below).
+pub(crate) fn evdev_keycode(code: &str) -> Option<i32> {
 	let kc = match code {
 		"Escape" => 1,
 		"Digit1" => 2,
@@ -375,5 +443,77 @@ mod tests {
 		assert_eq!(evdev_button(MouseButton::Left), BTN_LEFT);
 		assert_eq!(evdev_button(MouseButton::Right), BTN_RIGHT);
 		assert_eq!(evdev_button(MouseButton::Middle), BTN_MIDDLE);
+	}
+
+	/// Every W3C `KeyboardEvent.code` the controller can send must map on *both*
+	/// backends — otherwise a key works on X11 but silently does nothing on Wayland
+	/// (or vice versa). This is the guard that caught `Insert` missing from the X11
+	/// table; it fails the moment the two tables drift apart.
+	#[test]
+	fn x11_and_wayland_keymaps_agree_on_every_canonical_code() {
+		use crate::input::map_key;
+
+		let mut codes: Vec<String> = Vec::new();
+		codes.extend((b'A'..=b'Z').map(|c| format!("Key{}", c as char)));
+		codes.extend((0..=9).map(|d| format!("Digit{d}")));
+		codes.extend((1..=12).map(|f| format!("F{f}")));
+		codes.extend(
+			[
+				"Enter",
+				"NumpadEnter",
+				"Tab",
+				"Space",
+				"Backspace",
+				"Delete",
+				"Insert",
+				"Escape",
+				"ArrowUp",
+				"ArrowDown",
+				"ArrowLeft",
+				"ArrowRight",
+				"Home",
+				"End",
+				"PageUp",
+				"PageDown",
+				"CapsLock",
+				"ShiftLeft",
+				"ShiftRight",
+				"ControlLeft",
+				"ControlRight",
+				"AltLeft",
+				"AltRight",
+				"MetaLeft",
+				"MetaRight",
+				"Minus",
+				"Equal",
+				"BracketLeft",
+				"BracketRight",
+				"Backslash",
+				"Semicolon",
+				"Quote",
+				"Comma",
+				"Period",
+				"Slash",
+				"Backquote",
+			]
+			.iter()
+			.map(|s| s.to_string()),
+		);
+
+		for code in &codes {
+			assert!(map_key(code).is_some(), "X11 map_key is missing canonical code {code}");
+			assert!(
+				evdev_keycode(code).is_some(),
+				"Wayland evdev_keycode is missing canonical code {code}"
+			);
+		}
+	}
+
+	#[test]
+	fn percent_decode_handles_escapes_and_passthrough() {
+		assert_eq!(percent_decode("/tmp/a%20b.png"), "/tmp/a b.png");
+		assert_eq!(percent_decode("/no/escapes"), "/no/escapes");
+		assert_eq!(percent_decode("/weird%2"), "/weird%2"); // trailing/partial % left as-is
+		assert_eq!(percent_decode("%2F%2f"), "//");
 	}
 }

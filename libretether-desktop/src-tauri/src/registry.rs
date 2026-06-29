@@ -231,4 +231,58 @@ mod tests {
 
 		let _ = std::fs::remove_file(&store.path);
 	}
+
+	/// A fresh, unique store path (the file does not exist yet).
+	fn fresh_path() -> PathBuf {
+		use std::sync::atomic::{AtomicU32, Ordering};
+		static N: AtomicU32 = AtomicU32::new(0);
+		let p = std::env::temp_dir().join(format!(
+			"lt-store-rt-{}-{}.json",
+			std::process::id(),
+			N.fetch_add(1, Ordering::Relaxed)
+		));
+		let _ = std::fs::remove_file(&p);
+		p
+	}
+
+	#[test]
+	fn enrolled_state_survives_a_save_load_cycle() {
+		// The registry holds enrollment tokens + key bindings; it must round-trip
+		// through disk intact (this is what the atomic write protects from torn writes).
+		let path = fresh_path();
+		let id = {
+			let mut store = ClientStore::load(path.clone()).unwrap();
+			let c = store.create("box".into(), ClientOs::Linux).unwrap();
+			let token = c.enrollment_token.clone().unwrap();
+			store.authenticate(Some(&token), "PUBKEY");
+			c.id
+		};
+		// A brand-new store loaded from the same file sees the enrolled client.
+		let reloaded = ClientStore::load(path.clone()).unwrap();
+		let c = reloaded.get(id).expect("client persisted");
+		assert!(c.enrolled);
+		assert_eq!(c.public_key.as_deref(), Some("PUBKEY"));
+		assert!(
+			c.enrollment_token.is_none(),
+			"the burned token stays burned across reloads"
+		);
+		let _ = std::fs::remove_file(&path);
+	}
+
+	#[test]
+	fn loading_a_corrupt_store_fails_loudly_rather_than_emptying() {
+		// A garbled file must surface a clear parse error (fail closed), not be
+		// silently treated as an empty registry that drops every enrolled machine.
+		let path = fresh_path();
+		std::fs::write(&path, "{ this is not valid json").unwrap();
+		let err = match ClientStore::load(path.clone()) {
+			Err(e) => e,
+			Ok(_) => panic!("a corrupt store must fail to load, not parse as empty"),
+		};
+		assert!(
+			format!("{err}").contains("clients.json"),
+			"expected a parse error naming the file, got: {err}"
+		);
+		let _ = std::fs::remove_file(&path);
+	}
 }

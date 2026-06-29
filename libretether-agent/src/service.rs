@@ -53,7 +53,7 @@ mod platform {
 			 After=network-online.target graphical-session.target\n\
 			 Wants=network-online.target\n\n\
 			 [Service]\n\
-			 ExecStart={exe} run --config {config}\n\
+			 ExecStart=\"{exe}\" run --config \"{config}\"\n\
 			 Restart=always\n\
 			 RestartSec=3\n\
 			 # The session is discovered at runtime: DISPLAY/XAUTHORITY for X11 (from\n\

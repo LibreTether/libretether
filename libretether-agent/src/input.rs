@@ -5,6 +5,7 @@
 //! with the current capture geometry, which we use to turn the controller's
 //! normalized (0.0–1.0) pointer coordinates into absolute screen pixels.
 
+use std::collections::HashSet;
 use std::sync::mpsc::{Receiver, Sender};
 
 use enigo::{Axis, Button, Coordinate, Direction, Enigo, Key, Keyboard, Mouse, Settings};
@@ -29,7 +30,7 @@ fn run(rx: Receiver<InjectCmd>) {
 	let mut enigo = match Enigo::new(&Settings::default()) {
 		Ok(e) => e,
 		Err(e) => {
-			eprintln!("[libretether-agent] input injection unavailable: {e}");
+			crate::net::log(&format!("input injection unavailable: {e}"));
 			// Drain so senders don't block, but do nothing.
 			while let Ok(cmd) = rx.recv() {
 				if matches!(cmd, InjectCmd::Stop) {
@@ -41,6 +42,7 @@ fn run(rx: Receiver<InjectCmd>) {
 	};
 
 	let (mut w, mut h) = (1u32, 1u32);
+	let mut pressed = Pressed::default();
 	while let Ok(cmd) = rx.recv() {
 		match cmd {
 			InjectCmd::Geometry { width, height } => {
@@ -49,21 +51,66 @@ fn run(rx: Receiver<InjectCmd>) {
 			}
 			InjectCmd::Stop => break,
 			InjectCmd::Event(ev) => {
+				pressed.track(&ev);
 				if let Err(e) = inject(&mut enigo, ev, w, h) {
-					eprintln!("[libretether-agent] inject error: {e}");
+					crate::net::log(&format!("inject error: {e}"));
 				}
 			}
 		}
+	}
+	// The session is ending (explicit Stop, or the sender was dropped when the
+	// connection died). Release anything still held — a modifier or mouse button
+	// the controller had down at teardown would otherwise stay stuck *pressed* on
+	// the remote machine until someone physically pressed and released it.
+	release_all(&mut enigo, &pressed);
+}
+
+/// The keys and mouse buttons the controller currently holds down, so they can be
+/// released if the session ends mid-press. Shared with the Wayland backend, which
+/// tracks the same way but injects releases through the portal.
+#[derive(Default)]
+pub(crate) struct Pressed {
+	pub(crate) keys: HashSet<String>,
+	pub(crate) buttons: HashSet<MouseButton>,
+}
+
+impl Pressed {
+	/// Fold an input event into the held set: a press records the key/button, a
+	/// release clears it. Non-stateful events (moves, scroll, text) are ignored.
+	pub(crate) fn track(&mut self, ev: &InputEvent) {
+		match ev {
+			InputEvent::Key { code, pressed: true } => {
+				self.keys.insert(code.clone());
+			}
+			InputEvent::Key { code, pressed: false } => {
+				self.keys.remove(code);
+			}
+			InputEvent::MouseButton { button, pressed: true } => {
+				self.buttons.insert(*button);
+			}
+			InputEvent::MouseButton { button, pressed: false } => {
+				self.buttons.remove(button);
+			}
+			_ => {}
+		}
+	}
+}
+
+/// Inject a release for every key/button still held in `pressed` (best-effort).
+fn release_all(enigo: &mut Enigo, pressed: &Pressed) {
+	for code in &pressed.keys {
+		if let Some(key) = map_key(code) {
+			let _ = enigo.key(key, Direction::Release);
+		}
+	}
+	for &button in &pressed.buttons {
+		let _ = enigo.button(map_button(button), Direction::Release);
 	}
 }
 
 fn inject(enigo: &mut Enigo, ev: InputEvent, w: u32, h: u32) -> Result<(), enigo::InputError> {
 	match ev {
-		InputEvent::MouseMove { x, y } => {
-			let px = (x.clamp(0.0, 1.0) * w as f64).round() as i32;
-			let py = (y.clamp(0.0, 1.0) * h as f64).round() as i32;
-			enigo.move_mouse(px, py, Coordinate::Abs)
-		}
+		InputEvent::MouseMove { x, y } => enigo.move_mouse(norm_to_px(x, w), norm_to_px(y, h), Coordinate::Abs),
 		InputEvent::MouseButton { button, pressed } => {
 			let dir = if pressed { Direction::Press } else { Direction::Release };
 			enigo.button(map_button(button), dir)
@@ -88,6 +135,14 @@ fn inject(enigo: &mut Enigo, ev: InputEvent, w: u32, h: u32) -> Result<(), enigo
 	}
 }
 
+/// Map a normalized (0.0–1.0) coordinate to an absolute pixel on an axis of the
+/// given extent. The clamp keeps an out-of-range — or NaN — coordinate from the
+/// (untrusted) controller from producing a wild or overflowing pixel: a NaN
+/// clamps through to `0`, and values outside `[0,1]` saturate to the edges.
+fn norm_to_px(v: f64, extent: u32) -> i32 {
+	(v.clamp(0.0, 1.0) * extent as f64).round() as i32
+}
+
 fn map_button(b: MouseButton) -> Button {
 	match b {
 		MouseButton::Left => Button::Left,
@@ -99,7 +154,11 @@ fn map_button(b: MouseButton) -> Button {
 /// Map a W3C `KeyboardEvent.code` to an `enigo::Key`. Returns `None` for codes we
 /// don't recognise so the caller skips them — injecting a fallback character
 /// (previously a space) for any unmapped key was worse than doing nothing.
-fn map_key(code: &str) -> Option<Key> {
+///
+/// Kept in lock-step with the Wayland backend's `evdev_keycode` (a parity test
+/// asserts every canonical code maps in both), so a key works the same on X11 and
+/// Wayland.
+pub(crate) fn map_key(code: &str) -> Option<Key> {
 	// Letters: "KeyA".."KeyZ".
 	if let Some(letter) = code.strip_prefix("Key") {
 		if letter.len() == 1 {
@@ -127,6 +186,7 @@ fn map_key(code: &str) -> Option<Key> {
 		"Space" => Key::Space,
 		"Backspace" => Key::Backspace,
 		"Delete" => Key::Delete,
+		"Insert" => Key::Insert,
 		"Escape" => Key::Escape,
 		"ArrowUp" => Key::UpArrow,
 		"ArrowDown" => Key::DownArrow,
@@ -216,5 +276,98 @@ mod tests {
 		assert!(matches!(map_button(MouseButton::Left), Button::Left));
 		assert!(matches!(map_button(MouseButton::Right), Button::Right));
 		assert!(matches!(map_button(MouseButton::Middle), Button::Middle));
+	}
+
+	// The held-state tracker is what lets the injector release a key/button that
+	// was still down when the session ended (otherwise it stays stuck on the
+	// remote machine). These pin its accounting.
+
+	// Coordinate mapping runs on every pointer move with controller-supplied (and
+	// therefore untrusted) normalized values — these pin the clamp + rounding and
+	// prove a hostile NaN/out-of-range can't overflow the `as i32` cast.
+	#[test]
+	fn norm_to_px_maps_endpoints_and_midpoint() {
+		assert_eq!(norm_to_px(0.0, 1920), 0);
+		assert_eq!(norm_to_px(1.0, 1920), 1920);
+		assert_eq!(norm_to_px(0.5, 1920), 960);
+		assert_eq!(norm_to_px(0.5, 1081), 541); // rounds, not truncates
+	}
+
+	#[test]
+	fn norm_to_px_clamps_out_of_range_and_nan() {
+		assert_eq!(norm_to_px(-0.5, 1920), 0);
+		assert_eq!(norm_to_px(1.5, 1920), 1920);
+		assert_eq!(norm_to_px(f64::INFINITY, 1920), 1920);
+		assert_eq!(norm_to_px(f64::NEG_INFINITY, 1920), 0);
+		// NaN must not panic or produce garbage — the saturating cast yields 0.
+		assert_eq!(norm_to_px(f64::NAN, 1920), 0);
+	}
+
+	#[test]
+	fn pressed_tracks_keys_down_and_up() {
+		let mut p = Pressed::default();
+		p.track(&InputEvent::Key {
+			code: "ShiftLeft".into(),
+			pressed: true,
+		});
+		p.track(&InputEvent::Key {
+			code: "KeyA".into(),
+			pressed: true,
+		});
+		assert!(p.keys.contains("ShiftLeft") && p.keys.contains("KeyA"));
+		// A release clears just that key.
+		p.track(&InputEvent::Key {
+			code: "KeyA".into(),
+			pressed: false,
+		});
+		assert!(p.keys.contains("ShiftLeft") && !p.keys.contains("KeyA"));
+	}
+
+	#[test]
+	fn pressed_tracks_mouse_buttons_down_and_up() {
+		let mut p = Pressed::default();
+		p.track(&InputEvent::MouseButton {
+			button: MouseButton::Left,
+			pressed: true,
+		});
+		p.track(&InputEvent::MouseButton {
+			button: MouseButton::Right,
+			pressed: true,
+		});
+		assert_eq!(p.buttons.len(), 2);
+		p.track(&InputEvent::MouseButton {
+			button: MouseButton::Left,
+			pressed: false,
+		});
+		assert!(p.buttons.contains(&MouseButton::Right) && !p.buttons.contains(&MouseButton::Left));
+	}
+
+	#[test]
+	fn pressed_ignores_non_stateful_events() {
+		let mut p = Pressed::default();
+		p.track(&InputEvent::MouseMove { x: 0.5, y: 0.5 });
+		p.track(&InputEvent::MouseScroll { dx: 1, dy: -1 });
+		p.track(&InputEvent::Text { text: "hi".into() });
+		assert!(p.keys.is_empty() && p.buttons.is_empty());
+	}
+
+	#[test]
+	fn pressed_leaves_only_still_held_keys_at_teardown() {
+		// A full press/release pair leaves nothing held; a lone press remains, so
+		// release_all only releases what's actually still down.
+		let mut p = Pressed::default();
+		p.track(&InputEvent::Key {
+			code: "KeyA".into(),
+			pressed: true,
+		});
+		p.track(&InputEvent::Key {
+			code: "KeyA".into(),
+			pressed: false,
+		});
+		p.track(&InputEvent::Key {
+			code: "ControlLeft".into(),
+			pressed: true,
+		});
+		assert_eq!(p.keys.iter().collect::<Vec<_>>(), vec!["ControlLeft"]);
 	}
 }

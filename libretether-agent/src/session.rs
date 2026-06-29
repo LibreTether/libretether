@@ -147,10 +147,10 @@ fn spawn_capture(cfg: SessionConfig, stop: Arc<AtomicBool>, tx: tokio::sync::mps
 							break;
 						}
 					}
-					Err(e) => eprintln!("[libretether-agent] encode error: {e}"),
+					Err(e) => crate::net::log(&format!("encode error: {e}")),
 				},
 				Err(e) => {
-					eprintln!("[libretether-agent] capture error: {e}");
+					crate::net::log(&format!("capture error: {e}"));
 					std::thread::sleep(Duration::from_millis(500));
 				}
 			}

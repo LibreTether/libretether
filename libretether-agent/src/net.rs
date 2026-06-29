@@ -11,14 +11,14 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
+use libretether_common::{pipe_bidirectional, Backoff};
 use libretether_protocol::crypto::{self, Identity};
 use libretether_protocol::frame::{read_frame_capped, write_frame, MAX_CONTROL_FRAME};
-use libretether_protocol::relay::{RelayAck, RelayChallenge, RelayHello, RelayProof, RelayRole};
+use libretether_protocol::relay::{client_handshake, RelayRole};
 use libretether_protocol::{
 	tls, Challenge, ControlRequest, Hello, HelloAck, SessionGrant, StreamAuth, StreamOpen, PROTOCOL_VERSION,
 };
 use quinn::{Endpoint, RecvStream, SendStream};
-use tokio::io::AsyncWriteExt;
 
 /// Shared set of capability tokens issued (one per completed handshake) over a
 /// single connection's lifetime; a control/session/tunnel stream must present one.
@@ -85,7 +85,7 @@ pub async fn run(cfg_path: PathBuf) -> Result<()> {
 
 /// Dial + serve forever, reconnecting with capped backoff.
 async fn connect_loop(cfg: &mut AgentConfig, cfg_path: &PathBuf) {
-	let mut backoff = 1u64;
+	let mut backoff = Backoff::new(RECONNECT_MAX_SECS);
 	loop {
 		// `connect_once` only returns once the link is gone (serve loops until the
 		// connection ends), so time how long it lasted: a long, healthy session
@@ -95,12 +95,11 @@ async fn connect_loop(cfg: &mut AgentConfig, cfg_path: &PathBuf) {
 			log(&format!("connection error: {e:#}"));
 		}
 		if started.elapsed() >= Duration::from_secs(RECONNECT_STABLE_SECS) {
-			backoff = 1;
+			backoff.reset();
 		}
-		let wait = backoff.min(RECONNECT_MAX_SECS);
-		log(&format!("reconnecting in {wait}s"));
-		tokio::time::sleep(Duration::from_secs(wait)).await;
-		backoff = (backoff * 2).min(RECONNECT_MAX_SECS);
+		let wait = backoff.next_delay();
+		log(&format!("reconnecting in {}s", wait.as_secs()));
+		tokio::time::sleep(wait).await;
 	}
 }
 
@@ -125,30 +124,18 @@ async fn connect_once(cfg: &mut AgentConfig, cfg_path: &PathBuf) -> Result<()> {
 /// arrive piped through it.
 async fn connect_relay(endpoint: &Endpoint, addr: SocketAddr, cfg: &AgentConfig) -> Result<quinn::Connection> {
 	let conn = dial(endpoint, addr, &cfg.server_name).await?;
-
 	let identity = cfg.identity()?;
-	let (mut send, mut recv) = conn.open_bi().await.context("opening relay hello stream")?;
-	let hello = RelayHello {
-		role: RelayRole::Agent,
-		secret: cfg.relay_secret.clone().unwrap_or_default(),
-		public_key: identity.public_b64(),
-	};
-	write_frame(&mut send, &hello).await.context("sending relay hello")?;
-	// Prove we hold the private key for the public key we presented, so a holder
-	// of the (shared) agent secret can't register under our routing key.
-	let challenge: RelayChallenge = read_frame_capped(&mut recv, MAX_CONTROL_FRAME)
-		.await
-		.context("reading relay challenge")?;
-	let proof = RelayProof {
-		signature: identity.sign_b64(challenge.nonce.as_bytes()),
-	};
-	write_frame(&mut send, &proof).await.context("sending relay proof")?;
-	let ack: RelayAck = read_frame_capped(&mut recv, MAX_CONTROL_FRAME)
-		.await
-		.context("reading relay ack")?;
-	if !ack.accepted {
-		return Err(anyhow!("relay rejected agent: {}", ack.reason.unwrap_or_default()));
-	}
+	// Shared client side of the relay handshake (secret + key-ownership proof). We
+	// don't use the hello stream afterwards — the relay routes the controller's
+	// streams on fresh ones — so the returned halves are dropped.
+	client_handshake(
+		&conn,
+		RelayRole::Agent,
+		cfg.relay_secret.as_deref().unwrap_or_default(),
+		&identity,
+	)
+	.await
+	.context("relay registration")?;
 	log("registered with relay; awaiting controller");
 	Ok(conn)
 }
@@ -179,16 +166,12 @@ async fn serve(conn: quinn::Connection, cfg: &mut AgentConfig, cfg_path: &PathBu
 
 	// The controller key must have been pinned at enrollment. There is no
 	// trust-on-first-use: an agent without a pinned key must be re-enrolled.
-	let Some(expected) = cfg.controller_key.clone().filter(|k| !k.trim().is_empty()) else {
-		return Err(anyhow!(
-			"no controller key pinned in config — re-enroll with `--controller-key` (re-run the deploy command)"
-		));
-	};
+	let expected = cfg.require_controller_key()?;
 
 	// Mutual handshake: prove our identity, verify the controller's against the
 	// pinned key, and receive the capability token (issued into `tokens`) that
 	// every later stream must carry.
-	let (_controller_key, client_id) = match verify_and_grant(
+	let (_controller_key, client_id) = verify_and_grant(
 		&mut send,
 		&mut recv,
 		&identity,
@@ -196,11 +179,7 @@ async fn serve(conn: quinn::Connection, cfg: &mut AgentConfig, cfg_path: &PathBu
 		&expected,
 		&tokens,
 	)
-	.await?
-	{
-		Some(v) => v,
-		None => return Err(anyhow!("controller authentication failed")),
-	};
+	.await?;
 	log(&format!(
 		"authenticated as client {}",
 		client_id.clone().unwrap_or_default()
@@ -245,10 +224,19 @@ async fn verify_and_grant(
 	enrollment_token: Option<String>,
 	expected_key: &str,
 	tokens: &Mutex<HashSet<String>>,
-) -> Result<Option<(String, Option<String>)>> {
+) -> Result<(String, Option<String>)> {
 	let challenge: Challenge = read_frame_capped(recv, MAX_CONTROL_FRAME)
 		.await
 		.context("reading challenge")?;
+	// Fail closed on a version skew, mirroring the controller's `Hello.protocol`
+	// check — the controller and agents are released together, so a mismatch means
+	// one end is stale and must be upgraded (no compatibility shims).
+	if challenge.protocol != PROTOCOL_VERSION {
+		return Err(anyhow!(
+			"controller protocol v{} != agent protocol v{PROTOCOL_VERSION} — upgrade both ends",
+			challenge.protocol
+		));
+	}
 	let agent_nonce = crypto::random_nonce_b64();
 	let hello = Hello {
 		protocol: PROTOCOL_VERSION,
@@ -280,14 +268,21 @@ async fn verify_and_grant(
 		return Err(anyhow!("controller identity signature invalid — refusing connection"));
 	}
 
-	// Hand the verified controller a capability token for this connection.
+	// Hand the verified controller a capability token for this connection. Only the
+	// most recent handshake's token is valid: in relay mode this one connection
+	// outlives many controller sessions, so evict any prior token rather than
+	// letting the set grow unbounded (a displaced controller's streams are dead).
 	let token = crypto::random_nonce_b64();
-	tokens.lock().unwrap().insert(token.clone());
+	{
+		let mut tokens = tokens.lock().unwrap();
+		tokens.clear();
+		tokens.insert(token.clone());
+	}
 	write_frame(send, &SessionGrant { token })
 		.await
 		.context("sending session grant")?;
 	let _ = send.finish();
-	Ok(Some((presented.to_string(), ack.client_id)))
+	Ok((presented.to_string(), ack.client_id))
 }
 
 async fn handle_stream(
@@ -354,30 +349,24 @@ async fn reauth(
 	tokens: &Mutex<HashSet<String>>,
 ) {
 	match verify_and_grant(&mut send, &mut recv, identity, None, controller_key, tokens).await {
-		Ok(Some((_, client_id))) => log(&format!("re-authenticated as client {}", client_id.unwrap_or_default())),
-		Ok(None) => {}
+		Ok((_, client_id)) => log(&format!("re-authenticated as client {}", client_id.unwrap_or_default())),
 		Err(e) => log(&format!("controller re-auth rejected: {e:#}")),
 	}
 }
 
 /// Pipe a QUIC stream to a local TCP port (the client's RDP/SSH server) — used
 /// to reach the client through the relay.
-async fn tunnel(port: u16, mut q_send: SendStream, mut q_recv: RecvStream) {
+///
+/// `port` is chosen by the controller and is not restricted to RDP/SSH: an
+/// authenticated controller can reach any loopback service on the agent host.
+/// This is within the trust model — only a controller that completed the mutual
+/// handshake holds a capability token, and `handle_stream` rejects any tunnel
+/// stream without one — but note the reach is intentionally unrestricted.
+async fn tunnel(port: u16, mut q_send: SendStream, q_recv: RecvStream) {
 	match tokio::net::TcpStream::connect(("127.0.0.1", port)).await {
 		Ok(tcp) => {
-			let (mut tcp_read, mut tcp_write) = tcp.into_split();
-			// Copy each direction independently and half-close it when its source
-			// ends, then wait for BOTH — a shared select! tears the peer direction
-			// down on the first EOF and truncates the stream.
-			let up = async {
-				let _ = tokio::io::copy(&mut q_recv, &mut tcp_write).await;
-				let _ = tcp_write.shutdown().await;
-			};
-			let down = async {
-				let _ = tokio::io::copy(&mut tcp_read, &mut q_send).await;
-				let _ = q_send.finish();
-			};
-			tokio::join!(up, down);
+			let (tcp_read, tcp_write) = tcp.into_split();
+			pipe_bidirectional(q_recv, q_send, tcp_read, tcp_write).await;
 		}
 		Err(e) => {
 			log(&format!("tunnel to 127.0.0.1:{port} failed: {e}"));
@@ -414,7 +403,7 @@ mod tests {
 	}
 
 	/// What `verify_and_grant` resolves to: `(controller_key, client_id)` on success.
-	type VerifyOutcome = Result<Option<(String, Option<String>)>>;
+	type VerifyOutcome = Result<(String, Option<String>)>;
 
 	/// Run the agent's real `verify_and_grant` on the agent (client) side.
 	fn spawn_agent(
@@ -448,6 +437,7 @@ mod tests {
 		write_frame(
 			&mut c_send,
 			&Challenge {
+				protocol: PROTOCOL_VERSION,
 				nonce: nonce.clone(),
 				controller_key: ctrl.public_b64(),
 			},
@@ -474,7 +464,7 @@ mod tests {
 		.unwrap();
 		let grant: SessionGrant = read_frame_capped(&mut c_recv, MAX_CONTROL_FRAME).await.unwrap();
 
-		let (key, client_id) = handle.await.unwrap().unwrap().expect("handshake should succeed");
+		let (key, client_id) = handle.await.unwrap().expect("handshake should succeed");
 		assert_eq!(key, ctrl.public_b64());
 		assert_eq!(client_id.as_deref(), Some("cid-1"));
 		// The token the agent issued (and stored) is exactly the one the controller
@@ -492,11 +482,24 @@ mod tests {
 		signer: &Identity,
 		accepted: bool,
 	) {
+		drive_controller_with_protocol(server, PROTOCOL_VERSION, presented_key, signer, accepted).await
+	}
+
+	/// Like [`drive_dishonest_controller`] but with an explicit protocol version,
+	/// so tests can forge a version skew.
+	async fn drive_controller_with_protocol(
+		server: &quinn::Connection,
+		protocol: u32,
+		presented_key: String,
+		signer: &Identity,
+		accepted: bool,
+	) {
 		let (mut c_send, mut c_recv) = server.open_bi().await.unwrap();
 		let nonce = crypto::random_nonce_b64();
 		write_frame(
 			&mut c_send,
 			&Challenge {
+				protocol,
 				nonce,
 				controller_key: presented_key,
 			},
@@ -534,6 +537,35 @@ mod tests {
 		assert!(
 			tokens.lock().unwrap().is_empty(),
 			"no token issued to an unverified controller"
+		);
+	}
+
+	#[tokio::test]
+	async fn rejects_a_controller_protocol_version_mismatch() {
+		let (_sep, server, _cep, client) = loopback().await;
+		let ctrl = Identity::generate();
+		let tokens: TokenSet = Arc::new(Mutex::new(HashSet::new()));
+
+		let handle = spawn_agent(client, Identity::generate(), ctrl.public_b64(), tokens.clone());
+		// Honest key, but a stale protocol version: the agent must fail closed right
+		// after reading the challenge — before it even sends its Hello — so we only
+		// send the challenge here (there is no Hello to read back).
+		let (mut c_send, _c_recv) = server.open_bi().await.unwrap();
+		write_frame(
+			&mut c_send,
+			&Challenge {
+				protocol: PROTOCOL_VERSION + 1,
+				nonce: crypto::random_nonce_b64(),
+				controller_key: ctrl.public_b64(),
+			},
+		)
+		.await
+		.unwrap();
+
+		assert!(handle.await.unwrap().is_err());
+		assert!(
+			tokens.lock().unwrap().is_empty(),
+			"no token issued to a version-mismatched controller"
 		);
 	}
 

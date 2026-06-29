@@ -327,7 +327,9 @@ impl AppState {
 			let settings = self.0.settings.lock().unwrap();
 			serde_json::to_string_pretty(&*settings).map_err(|e| AppError::msg(format!("serializing settings: {e}")))?
 		};
-		std::fs::write(self.0.config_dir.join("settings.json"), raw)?;
+		// Atomic write (temp + rename) for the same crash-safety the registry gets,
+		// and via `secret::` so this path can't silently regress to a torn write.
+		libretether_protocol::secret::write_str(self.0.config_dir.join("settings.json"), &raw)?;
 		Ok(())
 	}
 
@@ -400,5 +402,89 @@ fn load_settings(dir: &std::path::Path) -> AppResult<Settings> {
 		Ok(raw) => serde_json::from_str(&raw).map_err(|e| AppError::msg(format!("parsing settings.json: {e}"))),
 		Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Settings::default()),
 		Err(e) => Err(AppError::Io(e)),
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	// `validate` is the fail-closed gate on controller settings — a blank Tailscale
+	// auth key or relay secret would otherwise create a controller that can't enrol
+	// agents (or, for a blank secret, a trivially-bypassable one).
+
+	#[test]
+	fn tailscale_requires_a_non_blank_auth_key() {
+		assert!(ControllerKind::Tailscale {
+			auth_key: Some("tskey-abc".into()),
+			listen_port: 47600,
+		}
+		.validate()
+		.is_ok());
+		for bad in [None, Some(String::new()), Some("   ".into())] {
+			assert!(
+				ControllerKind::Tailscale {
+					auth_key: bad.clone(),
+					listen_port: 47600,
+				}
+				.validate()
+				.is_err(),
+				"a missing/blank auth key must be rejected ({bad:?})"
+			);
+		}
+	}
+
+	#[test]
+	fn relay_requires_address_and_both_secrets() {
+		assert!(ControllerKind::Relay {
+			address: "relay.example:47600".into(),
+			owner_secret: "owner".into(),
+			agent_secret: "agent".into(),
+		}
+		.validate()
+		.is_ok());
+		// Any blank field fails closed.
+		for (address, owner, agent) in [
+			("", "owner", "agent"),
+			("relay", "", "agent"),
+			("relay", "owner", ""),
+			("   ", "owner", "agent"),
+		] {
+			assert!(
+				ControllerKind::Relay {
+					address: address.into(),
+					owner_secret: owner.into(),
+					agent_secret: agent.into(),
+				}
+				.validate()
+				.is_err(),
+				"blank relay field must be rejected ({address:?}, {owner:?}, {agent:?})"
+			);
+		}
+	}
+
+	#[test]
+	fn direct_has_no_required_secrets() {
+		assert!(ControllerKind::Direct {
+			advertise_addr: None,
+			listen_port: 47600,
+		}
+		.validate()
+		.is_ok());
+	}
+
+	#[test]
+	fn profile_identity_round_trips_and_fingerprint_is_stable() {
+		let profile = ControllerProfile::new(
+			"test".into(),
+			ControllerKind::Direct {
+				advertise_addr: None,
+				listen_port: 47600,
+			},
+		);
+		// The seed yields a usable identity and a stable public key/fingerprint.
+		let key = profile.identity().unwrap().public_b64();
+		assert_eq!(profile.public_key(), key);
+		assert_eq!(profile.fingerprint(), key.chars().take(12).collect::<String>());
 	}
 }

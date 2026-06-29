@@ -3,6 +3,7 @@ import { useState } from "react"
 import * as api from "../lib/api"
 import { useToast } from "../lib/toast"
 import type { ControllerKind, ControllerSummary, ControllerType } from "../lib/types"
+import { useAsyncAction } from "../lib/useAsyncAction"
 import { Combobox } from "./Combobox"
 import { Button, Field, Input, Modal } from "./ui"
 
@@ -25,6 +26,7 @@ export function ControllerForm({
 	onSaved: () => void
 }) {
 	const toast = useToast()
+	const saveAction = useAsyncAction()
 	const k = existing?.kind
 	const [name, setName] = useState(existing?.name ?? "")
 	const [type, setType] = useState<ControllerType>(k?.type ?? "tailscale")
@@ -36,7 +38,6 @@ export function ControllerForm({
 	const [relayAddr, setRelayAddr] = useState(k?.type === "relay" ? k.address : "")
 	const [relayOwner, setRelayOwner] = useState(k?.type === "relay" ? k.owner_secret : "")
 	const [relayAgent, setRelayAgent] = useState(k?.type === "relay" ? k.agent_secret : "")
-	const [saving, setSaving] = useState(false)
 
 	const buildKind = (): ControllerKind => {
 		const listen_port = Number.parseInt(port, 10) || DEFAULT_PORT
@@ -55,6 +56,14 @@ export function ControllerForm({
 			toast.error("Name your controller")
 			return
 		}
+		// Direct/Tailscale bind a UDP listener, so the port must be a valid 1–65535.
+		if (type !== "relay") {
+			const p = Number(port)
+			if (!Number.isInteger(p) || p < 1 || p > 65535) {
+				toast.error("Invalid listen port", "Enter a port between 1 and 65535.")
+				return
+			}
+		}
 		if (type === "tailscale" && !authKey.trim()) {
 			toast.error("Tailscale controllers require an auth key")
 			return
@@ -63,16 +72,11 @@ export function ControllerForm({
 			toast.error("Relay needs an address, owner secret and agent secret")
 			return
 		}
-		setSaving(true)
-		try {
+		const ok = await saveAction.run("Couldn't save controller", async () => {
 			if (existing) await api.updateController(existing.id, name.trim(), buildKind())
 			else await api.createController(name.trim(), buildKind())
-			onSaved()
-		} catch (e) {
-			toast.error("Couldn't save controller", api.errString(e))
-		} finally {
-			setSaving(false)
-		}
+		})
+		if (ok) onSaved()
 	}
 
 	return (
@@ -82,7 +86,7 @@ export function ControllerForm({
 					<Button onClick={onClose} variant="ghost">
 						Cancel
 					</Button>
-					<Button loading={saving} onClick={save} variant="primary">
+					<Button loading={saveAction.busy} onClick={save} variant="primary">
 						{existing ? "Save changes" : "Create controller"}
 					</Button>
 				</>
@@ -103,8 +107,8 @@ export function ControllerForm({
 				</Field>
 
 				<Field hint={TYPE_HELP[type]} label="Type">
-					<Combobox
-						onChange={(v) => setType(v as ControllerType)}
+					<Combobox<ControllerType>
+						onChange={setType}
 						options={[
 							{ icon: <Wifi className="h-4 w-4" />, label: "Tailscale", value: "tailscale" },
 							{ icon: <Network className="h-4 w-4" />, label: "Direct", value: "direct" },
@@ -178,7 +182,7 @@ export function ControllerForm({
 function PortField({ value, onChange }: { value: string; onChange: (v: string) => void }) {
 	return (
 		<Field hint="UDP port this controller listens on (QUIC). Default 47600." label="Listen port">
-			<Input onChange={(e) => onChange(e.target.value)} placeholder="47600" value={value} />
+			<Input inputMode="numeric" onChange={(e) => onChange(e.target.value)} placeholder="47600" value={value} />
 		</Field>
 	)
 }

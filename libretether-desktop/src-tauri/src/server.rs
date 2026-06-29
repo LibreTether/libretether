@@ -9,9 +9,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use libretether_common::Backoff;
 use libretether_protocol::crypto;
 use libretether_protocol::frame::{read_frame, read_frame_capped, write_frame, MAX_CONTROL_FRAME};
-use libretether_protocol::relay::{RelayAck, RelayChallenge, RelayEvent, RelayHello, RelayProof, RelayRole};
+use libretether_protocol::relay::{self, RelayEvent, RelayRole};
 use libretether_protocol::{
 	tls, Challenge, ControlRequest, ControlResponse, Hello, HelloAck, SessionGrant, StreamOpen,
 	DEFAULT_EXEC_TIMEOUT_SECS, MAX_EXEC_TIMEOUT_SECS, PROTOCOL_VERSION,
@@ -110,21 +111,18 @@ pub async fn serve_relay(state: AppState, ctrl: Arc<ActiveController>) {
 			return;
 		}
 	};
-	let pubkey = ctrl.profile.public_key();
-
-	let mut backoff = 1u64;
+	let mut backoff = Backoff::new(5);
 	loop {
-		match relay_session(&state, &ctrl, &relay_addr, &owner_secret, &pubkey).await {
-			Ok(()) => backoff = 1,
+		match relay_session(&state, &ctrl, &relay_addr, &owner_secret).await {
+			Ok(()) => backoff.reset(),
 			Err(e) => relay_log(&state, &format!("relay error: {e:#}")),
 		}
 		// The relay is gone, so every agent is unreachable.
 		ctrl.live.lock().unwrap().clear();
 		state.notify_changed();
-		let wait = backoff.min(5);
-		relay_log(&state, &format!("reconnecting to relay in {wait}s"));
-		tokio::time::sleep(Duration::from_secs(wait)).await;
-		backoff = (backoff * 2).min(5);
+		let wait = backoff.next_delay();
+		relay_log(&state, &format!("reconnecting to relay in {}s", wait.as_secs()));
+		tokio::time::sleep(wait).await;
 	}
 }
 
@@ -133,7 +131,6 @@ async fn relay_session(
 	ctrl: &Arc<ActiveController>,
 	relay_addr: &str,
 	owner_secret: &str,
-	pubkey: &str,
 ) -> AppResult<()> {
 	let addr = tls::resolve(relay_addr)
 		.await
@@ -146,32 +143,11 @@ async fn relay_session(
 		.await
 		.map_err(|e| AppError::msg(format!("relay handshake: {e}")))?;
 
-	let (mut send, mut recv) = conn
-		.open_bi()
-		.await
-		.map_err(|e| AppError::msg(format!("open relay stream: {e}")))?;
-	write_frame(
-		&mut send,
-		&RelayHello {
-			role: RelayRole::Controller,
-			secret: owner_secret.to_string(),
-			public_key: pubkey.to_string(),
-		},
-	)
-	.await?;
-	// Prove possession of our identity key to the relay.
-	let challenge: RelayChallenge = read_frame_capped(&mut recv, MAX_CONTROL_FRAME).await?;
-	let proof = RelayProof {
-		signature: ctrl.profile.identity()?.sign_b64(challenge.nonce.as_bytes()),
-	};
-	write_frame(&mut send, &proof).await?;
-	let ack: RelayAck = read_frame_capped(&mut recv, MAX_CONTROL_FRAME).await?;
-	if !ack.accepted {
-		return Err(AppError::msg(format!(
-			"relay rejected controller: {}",
-			ack.reason.unwrap_or_default()
-		)));
-	}
+	// Shared client side of the relay handshake (secret + key-ownership proof). We
+	// keep `recv` to read presence events; `_send` stays open for the connection's
+	// life. Our routing key is derived from the identity inside the handshake.
+	let (_send, mut recv) =
+		relay::client_handshake(&conn, RelayRole::Controller, owner_secret, &ctrl.profile.identity()?).await?;
 	relay_log(state, "connected to relay; awaiting agents");
 	if let Some(app) = state.0.app.get() {
 		let _ = app.emit(EVENT_RELAY_CONNECTED, ());
@@ -219,6 +195,7 @@ async fn enroll_and_register(
 	write_frame(
 		&mut send,
 		&Challenge {
+			protocol: PROTOCOL_VERSION,
 			nonce: nonce.clone(),
 			controller_key: ctrl.profile.public_key(),
 		},
@@ -617,5 +594,45 @@ mod tests {
 			.unwrap();
 		assert!(res.is_none(), "an unknown agent must be rejected");
 		assert!(!agent_task.await.unwrap().accepted);
+	}
+
+	#[tokio::test]
+	async fn cleanup_only_evicts_its_own_generation() {
+		let (state, ctrl, _token) = setup();
+		let id = ctrl.store.lock().unwrap().list()[0].id;
+		// A live entry needs a connection for its link; loopback gives a real one.
+		let (_sep, server, _cep, _client) = loopback().await;
+		ctrl.live.lock().unwrap().insert(
+			id,
+			LiveConn {
+				link: AgentLink::direct(server.clone()),
+				status: None,
+				generation: 7,
+			},
+		);
+
+		// A stale teardown (an older generation, e.g. a previous connection that just
+		// noticed it dropped) must NOT evict the newer live entry.
+		cleanup(&state, &ctrl, id, Some(6));
+		assert!(
+			ctrl.is_online(id),
+			"stale-generation cleanup must leave the newer entry in place"
+		);
+
+		// The matching generation is the real owner and does evict.
+		cleanup(&state, &ctrl, id, Some(7));
+		assert!(!ctrl.is_online(id));
+
+		// Relay-mode cleanup (generation `None`) is unconditional.
+		ctrl.live.lock().unwrap().insert(
+			id,
+			LiveConn {
+				link: AgentLink::direct(server.clone()),
+				status: None,
+				generation: 9,
+			},
+		);
+		cleanup(&state, &ctrl, id, None);
+		assert!(!ctrl.is_online(id), "relay-authoritative cleanup always evicts");
 	}
 }

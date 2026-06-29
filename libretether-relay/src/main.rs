@@ -17,7 +17,7 @@ use anyhow::{Context, Result};
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
 use clap::{Parser, Subcommand};
-use libretether_common::shutdown_signal;
+use libretether_common::{pipe_bidirectional, shutdown_signal};
 use libretether_protocol::crypto::{self, random_alnum};
 use libretether_protocol::frame::{read_frame_capped, write_frame, MAX_CONTROL_FRAME};
 use libretether_protocol::relay::{RelayAck, RelayChallenge, RelayEvent, RelayHello, RelayProof, RelayRole, RouteTo};
@@ -124,7 +124,12 @@ impl Relay {
 	/// Fixed-window per-IP rate check: returns false once a source exceeds
 	/// [`RATE_LIMIT_PER_WINDOW`] new connections within [`RATE_WINDOW`].
 	fn allow(&self, ip: IpAddr) -> bool {
-		let now = Instant::now();
+		self.allow_at(ip, Instant::now())
+	}
+
+	/// [`Relay::allow`] with an injectable clock so the window rollover and stale
+	/// eviction are deterministically testable.
+	fn allow_at(&self, ip: IpAddr, now: Instant) -> bool {
 		let mut map = self.limiter.lock().unwrap();
 		// Opportunistically drop stale entries so the map can't grow unbounded.
 		if map.len() > 10_000 {
@@ -419,23 +424,12 @@ async fn serve_agent(relay: Relay, conn: quinn::Connection, public_key: String) 
 }
 
 /// Pipe a controller stream and an agent stream together until both close.
-///
-/// Each direction is copied independently and only *its own* send side is
-/// finished when its source ends; then we wait for BOTH. Tearing both halves
-/// down as soon as one finishes (e.g. `select!`) truncates the reply on a
-/// request/response stream — the controller finishes its send half right after
-/// the request, so the agent's response would be cut off and surface as
-/// "early eof" — and ends live sessions the moment the input half closes.
-async fn pipe(mut c_recv: RecvStream, mut a_send: SendStream, mut a_recv: RecvStream, mut c_send: SendStream) {
-	let up = async {
-		let _ = tokio::io::copy(&mut c_recv, &mut a_send).await;
-		let _ = a_send.finish();
-	};
-	let down = async {
-		let _ = tokio::io::copy(&mut a_recv, &mut c_send).await;
-		let _ = c_send.finish();
-	};
-	tokio::join!(up, down);
+/// Tearing both halves down as soon as one finishes would truncate a
+/// request/response (the controller finishes its send half right after the
+/// request) or end a live session early, so the shared helper waits for both —
+/// see [`libretether_common::pipe_bidirectional`].
+async fn pipe(c_recv: RecvStream, a_send: SendStream, a_recv: RecvStream, c_send: SendStream) {
+	pipe_bidirectional(c_recv, c_send, a_recv, a_send).await;
 }
 
 #[cfg(test)]
@@ -586,5 +580,270 @@ mod tests {
 		assert!(authenticate(&relay_conn, &secrets).await.unwrap().is_none());
 		let (ack, _peer) = peer.await.unwrap();
 		assert!(!ack.accepted);
+	}
+
+	// ------------------------------------------------------------ rate limiter
+
+	#[test]
+	fn rate_limiter_resets_after_the_window_elapses() {
+		let relay = Relay::default();
+		let ip: IpAddr = "203.0.113.9".parse().unwrap();
+		let t0 = Instant::now();
+		// Exhaust the window's budget at a fixed instant.
+		for _ in 0..RATE_LIMIT_PER_WINDOW {
+			assert!(relay.allow_at(ip, t0));
+		}
+		assert!(!relay.allow_at(ip, t0), "shed once the window budget is spent");
+		// A check past the window rolls over to a fresh budget.
+		let t1 = t0 + RATE_WINDOW + Duration::from_millis(1);
+		assert!(relay.allow_at(ip, t1), "a new window grants a fresh budget");
+	}
+
+	#[test]
+	fn rate_limiter_evicts_stale_entries_when_the_map_grows() {
+		let relay = Relay::default();
+		let t0 = Instant::now();
+		// Seed the limiter past its eviction threshold with stale entries.
+		{
+			let mut map = relay.limiter.lock().unwrap();
+			for i in 0..10_001u32 {
+				map.insert(IpAddr::from(std::net::Ipv4Addr::from(i)), (1, t0));
+			}
+		}
+		// A check well past the window triggers the opportunistic retain.
+		let later = t0 + RATE_WINDOW + Duration::from_secs(1);
+		assert!(relay.allow_at("198.51.100.1".parse().unwrap(), later));
+		let len = relay.limiter.lock().unwrap().len();
+		assert!(len < 10_001, "stale entries should be evicted, map still has {len}");
+	}
+
+	// ------------------------------------------------------ routing harness
+
+	/// A relay server endpoint bound to loopback, plus its address.
+	fn relay_server() -> (Endpoint, SocketAddr) {
+		tls::install_crypto_provider();
+		let (cert, key) = tls::self_signed();
+		let ep = Endpoint::server(tls::server_config(cert, key), (Ipv4Addr::LOCALHOST, 0).into()).unwrap();
+		let addr = ep.local_addr().unwrap();
+		(ep, addr)
+	}
+
+	/// Dial `relay_ep` from a fresh client; returns the client endpoint (the caller
+	/// keeps it alive), the client's connection, and the relay's view of it.
+	async fn connect(relay_ep: &Endpoint, addr: SocketAddr) -> (Endpoint, quinn::Connection, quinn::Connection) {
+		let client_ep = tls::client_endpoint(addr).unwrap();
+		let accept = {
+			let ep = relay_ep.clone();
+			tokio::spawn(async move { ep.accept().await.unwrap().accept().unwrap().await.unwrap() })
+		};
+		let client_conn = client_ep.connect(addr, "libretether.local").unwrap().await.unwrap();
+		let relay_view = accept.await.unwrap();
+		(client_ep, client_conn, relay_view)
+	}
+
+	/// Open the controller's "hello" stream and hand back the relay-side send half
+	/// `serve_controller` writes presence events on, plus the client-side recv half
+	/// the controller reads them from. (Auth is exercised separately; this skips it
+	/// to test routing in isolation.)
+	async fn open_events(
+		ctrl_conn: &quinn::Connection,
+		ctrl_view: &quinn::Connection,
+	) -> (quinn::SendStream, quinn::RecvStream) {
+		let (mut hello_send, hello_recv) = ctrl_conn.open_bi().await.unwrap();
+		hello_send.write_all(b"\x00").await.unwrap(); // materialize the stream so the relay accepts it
+		let (events_send, _events_recv) = ctrl_view.accept_bi().await.unwrap();
+		(events_send, hello_recv)
+	}
+
+	/// Poll `cond` until true, failing the test if it never becomes true.
+	async fn wait_until(mut cond: impl FnMut() -> bool) {
+		for _ in 0..400 {
+			if cond() {
+				return;
+			}
+			tokio::time::sleep(Duration::from_millis(5)).await;
+		}
+		panic!("condition was not met within the timeout");
+	}
+
+	async fn with_timeout<T>(label: &str, fut: impl std::future::Future<Output = T>) -> T {
+		tokio::time::timeout(Duration::from_secs(5), fut)
+			.await
+			.unwrap_or_else(|_| panic!("{label} timed out"))
+	}
+
+	#[tokio::test]
+	async fn routes_a_controller_stream_to_the_addressed_agent_both_ways() {
+		let (relay_ep, addr) = relay_server();
+		let relay = Relay::default();
+		let agent_key = "AGENT_PUBKEY".to_string();
+
+		// Register an agent.
+		let (_aep, agent_conn, agent_view) = connect(&relay_ep, addr).await;
+		tokio::spawn({
+			let (relay, key) = (relay.clone(), agent_key.clone());
+			async move { serve_agent(relay, agent_view, key).await }
+		});
+		wait_until(|| relay.agent(&agent_key).is_some()).await;
+
+		// Bring up a controller and start serving it.
+		let (_cep, ctrl_conn, ctrl_view) = connect(&relay_ep, addr).await;
+		let (events_send, _events_recv) = open_events(&ctrl_conn, &ctrl_view).await;
+		tokio::spawn({
+			let relay = relay.clone();
+			async move { serve_controller(relay, ctrl_view, events_send).await }
+		});
+
+		// Controller opens a routed stream to the agent and sends a payload.
+		let (mut rsend, mut rrecv) = ctrl_conn.open_bi().await.unwrap();
+		write_frame(
+			&mut rsend,
+			&RouteTo {
+				agent: agent_key.clone(),
+			},
+		)
+		.await
+		.unwrap();
+		rsend.write_all(b"PING").await.unwrap();
+		let _ = rsend.finish();
+
+		// The agent receives the payload *without* the RouteTo header (the relay
+		// consumed it), then echoes back through the relay to the controller.
+		let (mut asend, mut arecv) = with_timeout("agent accept", agent_conn.accept_bi()).await.unwrap();
+		let got = with_timeout("agent read", arecv.read_to_end(64)).await.unwrap();
+		assert_eq!(
+			got, b"PING",
+			"RouteTo header must be stripped; agent sees only the payload"
+		);
+		asend.write_all(b"PONG").await.unwrap();
+		let _ = asend.finish();
+
+		let back = with_timeout("controller read", rrecv.read_to_end(64)).await.unwrap();
+		assert_eq!(back, b"PONG");
+	}
+
+	#[tokio::test]
+	async fn a_routed_stream_for_an_unknown_agent_is_dropped() {
+		let (relay_ep, addr) = relay_server();
+		let relay = Relay::default();
+
+		let (_cep, ctrl_conn, ctrl_view) = connect(&relay_ep, addr).await;
+		let (events_send, _events_recv) = open_events(&ctrl_conn, &ctrl_view).await;
+		tokio::spawn({
+			let relay = relay.clone();
+			async move { serve_controller(relay, ctrl_view, events_send).await }
+		});
+
+		// Route to an agent that was never registered: the relay drops the stream,
+		// so the controller's read half ends without data.
+		let (mut rsend, mut rrecv) = ctrl_conn.open_bi().await.unwrap();
+		write_frame(&mut rsend, &RouteTo { agent: "GHOST".into() })
+			.await
+			.unwrap();
+		rsend.write_all(b"hello?").await.unwrap();
+		let _ = rsend.finish();
+		let got = with_timeout("read after route-to-unknown", rrecv.read_to_end(64))
+			.await
+			.unwrap();
+		assert!(got.is_empty(), "an unroutable stream yields no data");
+	}
+
+	#[tokio::test]
+	async fn a_new_controller_displaces_and_closes_the_previous_one() {
+		let (relay_ep, addr) = relay_server();
+		let relay = Relay::default();
+
+		// Controller A.
+		let (_aep, ctrl_a, view_a) = connect(&relay_ep, addr).await;
+		let (events_a, _ra) = open_events(&ctrl_a, &view_a).await;
+		tokio::spawn({
+			let relay = relay.clone();
+			async move { serve_controller(relay, view_a, events_a).await }
+		});
+		wait_until(|| relay.controller.lock().unwrap().is_some()).await;
+		let gen_a = relay.controller.lock().unwrap().as_ref().unwrap().generation;
+
+		// Controller B connects and must displace A.
+		let (_bep, ctrl_b, view_b) = connect(&relay_ep, addr).await;
+		let (events_b, _rb) = open_events(&ctrl_b, &view_b).await;
+		tokio::spawn({
+			let relay = relay.clone();
+			async move { serve_controller(relay, view_b, events_b).await }
+		});
+		wait_until(|| relay.controller.lock().unwrap().as_ref().map(|s| s.generation) != Some(gen_a)).await;
+
+		// A's connection is force-closed by the relay (no zombie routing loop).
+		with_timeout("controller A closed", ctrl_a.closed()).await;
+	}
+
+	#[tokio::test]
+	async fn a_reconnecting_agent_keeps_the_newer_connection_registered() {
+		let (relay_ep, addr) = relay_server();
+		let relay = Relay::default();
+		let key = "AGENT".to_string();
+
+		// First connection C1 registers under the key.
+		let (_e1, agent1, view1) = connect(&relay_ep, addr).await;
+		let id1 = view1.stable_id();
+		tokio::spawn({
+			let (relay, key) = (relay.clone(), key.clone());
+			async move { serve_agent(relay, view1, key).await }
+		});
+		wait_until(|| relay.agent(&key).map(|c| c.stable_id()) == Some(id1)).await;
+
+		// C2 (a reconnect) registers under the same key, replacing C1 in the map.
+		let (_e2, agent2, view2) = connect(&relay_ep, addr).await;
+		let id2 = view2.stable_id();
+		assert_ne!(id1, id2);
+		tokio::spawn({
+			let (relay, key) = (relay.clone(), key.clone());
+			async move { serve_agent(relay, view2, key).await }
+		});
+		wait_until(|| relay.agent(&key).map(|c| c.stable_id()) == Some(id2)).await;
+
+		// Now C1 drops. Its teardown must NOT deregister the key — the live
+		// connection is C2 (the stable-id guard). C2 stays reachable.
+		agent1.close(0u32.into(), b"bye");
+		tokio::time::sleep(Duration::from_millis(100)).await;
+		assert_eq!(
+			relay.agent(&key).map(|c| c.stable_id()),
+			Some(id2),
+			"the reconnected agent (C2) must remain registered after the stale C1 drops"
+		);
+		let _ = agent2; // kept alive for the duration of the test
+	}
+
+	#[tokio::test]
+	async fn controller_is_notified_when_an_agent_comes_online_and_goes_offline() {
+		let (relay_ep, addr) = relay_server();
+		let relay = Relay::default();
+
+		// Controller attaches and starts reading presence events.
+		let (_cep, ctrl_conn, ctrl_view) = connect(&relay_ep, addr).await;
+		let (events_send, mut hello_recv) = open_events(&ctrl_conn, &ctrl_view).await;
+		tokio::spawn({
+			let relay = relay.clone();
+			async move { serve_controller(relay, ctrl_view, events_send).await }
+		});
+		wait_until(|| relay.controller.lock().unwrap().is_some()).await;
+
+		// Agent comes online → AgentOnline reaches the controller.
+		let key = "AGENT".to_string();
+		let (_aep, agent_conn, agent_view) = connect(&relay_ep, addr).await;
+		tokio::spawn({
+			let (relay, key) = (relay.clone(), key.clone());
+			async move { serve_agent(relay, agent_view, key).await }
+		});
+		let online: RelayEvent = with_timeout("online event", read_frame_capped(&mut hello_recv, MAX_CONTROL_FRAME))
+			.await
+			.unwrap();
+		assert!(matches!(online, RelayEvent::AgentOnline { public_key } if public_key == key));
+
+		// Agent drops → AgentOffline reaches the controller.
+		agent_conn.close(0u32.into(), b"bye");
+		let offline: RelayEvent = with_timeout("offline event", read_frame_capped(&mut hello_recv, MAX_CONTROL_FRAME))
+			.await
+			.unwrap();
+		assert!(matches!(offline, RelayEvent::AgentOffline { public_key } if public_key == key));
 	}
 }

@@ -35,7 +35,7 @@ struct UserData {
 pub fn spawn(fd: OwnedFd, node_id: u32, quality: u8, max_fps: u8, stop: Arc<AtomicBool>, tx: Sender<Encoded>) {
 	std::thread::spawn(move || {
 		if let Err(e) = run(fd, node_id, quality, max_fps, stop, tx) {
-			eprintln!("[libretether-agent] pipewire capture ended: {e}");
+			crate::net::log(&format!("pipewire capture ended: {e}"));
 		}
 	});
 }
@@ -232,4 +232,52 @@ fn to_rgba(src: &[u8], stride: usize, w: u32, h: u32, format: VideoFormat) -> Op
 		}
 	}
 	RgbaImage::from_raw(w, h, out)
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	// `to_rgba` converts raw compositor bytes (untrusted: sizes/stride come from the
+	// portal) into RGBA. These lock the channel swizzle, the forced-opaque alpha,
+	// the stride handling, and the short-buffer rejection.
+
+	#[test]
+	fn bgr_formats_swap_red_and_blue_rgb_formats_pass_through() {
+		// One pixel, source bytes [10, 20, 30, x].
+		let src = [10u8, 20, 30, 0];
+		// BGRx: source is B,G,R,x → output R,G,B should read R=30, G=20, B=10.
+		let bgrx = to_rgba(&src, 4, 1, 1, VideoFormat::BGRx).unwrap();
+		assert_eq!(bgrx.as_raw().as_slice(), &[30, 20, 10, 255]);
+		// RGBx: already R,G,B,x → unchanged, alpha forced opaque.
+		let rgbx = to_rgba(&src, 4, 1, 1, VideoFormat::RGBx).unwrap();
+		assert_eq!(rgbx.as_raw().as_slice(), &[10, 20, 30, 255]);
+		// BGRA/RGBA select the same swizzle as their x-padded twins.
+		assert_eq!(to_rgba(&src, 4, 1, 1, VideoFormat::BGRA).unwrap().as_raw()[0], 30);
+		assert_eq!(to_rgba(&src, 4, 1, 1, VideoFormat::RGBA).unwrap().as_raw()[0], 10);
+	}
+
+	#[test]
+	fn honors_row_stride_padding() {
+		// 2×2 RGBx with stride 12 = 8 bytes of pixels + 4 bytes of row padding.
+		let mut src = Vec::new();
+		src.extend_from_slice(&[1, 2, 3, 0, 4, 5, 6, 0]); // row 0 pixels
+		src.extend_from_slice(&[99, 99, 99, 99]); // row 0 padding (must be skipped)
+		src.extend_from_slice(&[7, 8, 9, 0, 10, 11, 12, 0]); // row 1 pixels
+		src.extend_from_slice(&[99, 99, 99, 99]); // row 1 padding
+		let img = to_rgba(&src, 12, 2, 2, VideoFormat::RGBx).unwrap();
+		// Output is tightly packed (no padding), alpha opaque, padding bytes absent.
+		assert_eq!(
+			img.as_raw().as_slice(),
+			&[1, 2, 3, 255, 4, 5, 6, 255, 7, 8, 9, 255, 10, 11, 12, 255]
+		);
+	}
+
+	#[test]
+	fn rejects_a_short_buffer_without_panicking() {
+		// Stride claims a full row but the buffer is too small — must return None,
+		// never index out of bounds.
+		assert!(to_rgba(&[1, 2], 4, 1, 1, VideoFormat::RGBx).is_none());
+		assert!(to_rgba(&[0u8; 4], 4, 2, 2, VideoFormat::BGRx).is_none());
+	}
 }

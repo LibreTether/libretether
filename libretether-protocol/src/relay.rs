@@ -10,6 +10,9 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::crypto::Identity;
+use crate::frame::{read_frame_capped, write_frame, MAX_CONTROL_FRAME};
+
 /// Which side of the relay a client is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -64,4 +67,51 @@ pub enum RelayEvent {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RouteTo {
 	pub agent: String,
+}
+
+/// The client side of the relay handshake, shared by the agent and the
+/// controller: open a control stream, present our secret + public key, prove we
+/// hold the private key by signing the relay's nonce, and read the verdict.
+///
+/// On success returns the hello stream's `(send, recv)` halves — the controller
+/// keeps reading presence events on `recv`; the agent simply drops them. A clean
+/// rejection (or any I/O error) is surfaced as an [`std::io::Error`] so both the
+/// agent's `anyhow` and the controller's error type can absorb it with `?`.
+pub async fn client_handshake(
+	conn: &quinn::Connection,
+	role: RelayRole,
+	secret: &str,
+	identity: &Identity,
+) -> std::io::Result<(quinn::SendStream, quinn::RecvStream)> {
+	let (mut send, mut recv) = conn
+		.open_bi()
+		.await
+		.map_err(|e| std::io::Error::new(std::io::ErrorKind::ConnectionRefused, format!("open relay stream: {e}")))?;
+	write_frame(
+		&mut send,
+		&RelayHello {
+			role,
+			secret: secret.to_string(),
+			public_key: identity.public_b64(),
+		},
+	)
+	.await?;
+	// Prove possession of the presented key so a holder of the (shared) secret
+	// can't register under another peer's public key.
+	let challenge: RelayChallenge = read_frame_capped(&mut recv, MAX_CONTROL_FRAME).await?;
+	write_frame(
+		&mut send,
+		&RelayProof {
+			signature: identity.sign_b64(challenge.nonce.as_bytes()),
+		},
+	)
+	.await?;
+	let ack: RelayAck = read_frame_capped(&mut recv, MAX_CONTROL_FRAME).await?;
+	if !ack.accepted {
+		return Err(std::io::Error::new(
+			std::io::ErrorKind::PermissionDenied,
+			format!("relay rejected connection: {}", ack.reason.unwrap_or_default()),
+		));
+	}
+	Ok((send, recv))
 }

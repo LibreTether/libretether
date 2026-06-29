@@ -2,15 +2,15 @@ import { Check, ChevronsUpDown, Search } from "lucide-react"
 import { type KeyboardEvent, type ReactNode, useEffect, useMemo, useRef, useState } from "react"
 import { cn } from "../lib/cn"
 
-export interface ComboOption {
-	value: string
+export interface ComboOption<T extends string = string> {
+	value: T
 	label?: string
 	/** Optional leading icon, shown in both the trigger and the dropdown row. */
 	icon?: ReactNode
 }
 
-interface Match {
-	opt: ComboOption
+interface Match<T extends string> {
+	opt: ComboOption<T>
 	label: string
 	score: number
 	ranges: Set<number>
@@ -55,8 +55,9 @@ function highlight(label: string, ranges: Set<number>): ReactNode {
 }
 
 /** A searchable, keyboard-navigable, fuzzy-matching select. Drop-in replacement
- *  for a native `<select>` across the app. */
-export function Combobox({
+ *  for a native `<select>` across the app. Generic over the value type so callers
+ *  get a typed `onChange` (e.g. `ClientOs`) without casting. */
+export function Combobox<T extends string = string>({
 	value,
 	onChange,
 	options,
@@ -69,9 +70,9 @@ export function Combobox({
 	loading,
 	className
 }: {
-	value: string | null
-	onChange: (value: string) => void
-	options: ComboOption[]
+	value: T | null
+	onChange: (value: T) => void
+	options: ComboOption<T>[]
 	placeholder?: string
 	searchPlaceholder?: string
 	emptyText?: string
@@ -91,8 +92,8 @@ export function Combobox({
 	const selected = useMemo(() => options.find((o) => o.value === value) ?? null, [options, value])
 	const selectedLabel = selected?.label ?? value
 
-	const matches = useMemo<Match[]>(() => {
-		const out: Match[] = []
+	const matches = useMemo<Match<T>[]>(() => {
+		const out: Match<T>[] = []
 		for (const opt of options) {
 			const label = opt.label ?? opt.value
 			const m = fuzzy(query, label)
@@ -101,10 +102,6 @@ export function Combobox({
 		out.sort((a, b) => b.score - a.score || a.label.localeCompare(b.label))
 		return out
 	}, [options, query])
-
-	useEffect(() => {
-		setActive(0)
-	}, [])
 
 	useEffect(() => {
 		if (open) inputRef.current?.focus()
@@ -123,7 +120,7 @@ export function Combobox({
 		listRef.current?.querySelector<HTMLElement>(`[data-idx="${active}"]`)?.scrollIntoView({ block: "nearest" })
 	}, [active])
 
-	const choose = (v: string) => {
+	const choose = (v: T) => {
 		onChange(v)
 		setOpen(false)
 		setQuery("")
@@ -177,7 +174,12 @@ export function Combobox({
 						<Search className="h-4 w-4 shrink-0 text-subtle" />
 						<input
 							className="w-full bg-transparent text-sm text-text outline-none placeholder:text-subtle"
-							onChange={(e) => setQuery(e.target.value)}
+							// Reset the highlight to the top as the query changes, so `active`
+							// can't point past the now-shorter match list (Enter looking dead).
+							onChange={(e) => {
+								setQuery(e.target.value)
+								setActive(0)
+							}}
 							onKeyDown={onKeyDown}
 							placeholder={searchPlaceholder}
 							ref={inputRef}

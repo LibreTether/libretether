@@ -25,9 +25,12 @@ use serde::{Deserialize, Serialize};
 pub const ALPN: &[u8] = b"libretether/1";
 
 /// Bumped whenever the wire format changes incompatibly. v2 added mutual
-/// authentication: the controller now proves its identity to the agent
-/// (`Challenge.controller_key` + `HelloAck.controller_sig`).
-pub const PROTOCOL_VERSION: u32 = 2;
+/// authentication (the controller proves its identity to the agent via
+/// `Challenge.controller_key` + `HelloAck.controller_sig`); v3 made the version
+/// check mutual too — `Challenge.protocol` lets the agent reject a
+/// version-mismatched controller, mirroring the controller's `Hello.protocol`
+/// check, so a skew fails closed on *both* ends (no compatibility shims).
+pub const PROTOCOL_VERSION: u32 = 3;
 
 /// Default UDP port the controller listens on for incoming agents.
 pub const DEFAULT_PORT: u16 = 47600;
@@ -57,10 +60,15 @@ pub struct HostInfo {
 /// it is talking to the controller it enrolled with (see `HelloAck.controller_sig`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Challenge {
+	/// The controller's [`PROTOCOL_VERSION`]. The agent rejects a mismatch with a
+	/// clear "upgrade both ends" error before issuing any capability token, so a
+	/// version skew fails closed instead of failing in confusing ways downstream.
+	/// Mandatory (no serde default) — a frame missing it is a protocol violation.
+	pub protocol: u32,
 	pub nonce: String,
 	/// Base64 Ed25519 public key identifying the controller. The agent pins this
 	/// at enrollment and rejects any controller whose key/signature don't match.
-	/// Mandatory: a v2 controller always sends it, so a frame missing it is a
+	/// Mandatory: a v2+ controller always sends it, so a frame missing it is a
 	/// protocol violation and is rejected at parse time (no compatibility shim).
 	pub controller_key: String,
 }
@@ -294,7 +302,7 @@ pub enum FrameEncoding {
 }
 
 /// Pointer buttons the controller can drive.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MouseButton {
 	Left,
@@ -356,8 +364,10 @@ mod tests {
 	// shims. This is the regression guard for that rule.
 	#[test]
 	fn handshake_frames_reject_missing_mutual_auth_fields() {
-		// Challenge without `controller_key`.
-		assert!(serde_json::from_str::<Challenge>(r#"{"nonce":"n"}"#).is_err());
+		// Challenge without `controller_key` (and without `protocol`).
+		assert!(serde_json::from_str::<Challenge>(r#"{"protocol":3,"nonce":"n"}"#).is_err());
+		// Challenge without `protocol` — the v3 version field is mandatory too.
+		assert!(serde_json::from_str::<Challenge>(r#"{"nonce":"n","controller_key":"ck"}"#).is_err());
 		// HelloAck without `controller_sig` (the Option fields may be absent).
 		assert!(serde_json::from_str::<HelloAck>(r#"{"accepted":true}"#).is_err());
 		// Hello without `agent_nonce`.
@@ -369,10 +379,12 @@ mod tests {
 	#[test]
 	fn complete_handshake_frames_round_trip() {
 		let challenge = Challenge {
+			protocol: PROTOCOL_VERSION,
 			nonce: "n".into(),
 			controller_key: "ck".into(),
 		};
 		let back: Challenge = round_trip(&challenge);
+		assert_eq!(back.protocol, PROTOCOL_VERSION);
 		assert_eq!(back.nonce, "n");
 		assert_eq!(back.controller_key, "ck");
 

@@ -2,10 +2,12 @@ import { writeText } from "@tauri-apps/plugin-clipboard-manager"
 import { Copy, Fingerprint, Network, Save, ScreenShare, Server, Wifi, WifiOff } from "lucide-react"
 import { useEffect, useState } from "react"
 import { Combobox } from "../components/Combobox"
+import { PageHeader } from "../components/PageHeader"
 import { Badge, Button, Field, Input } from "../components/ui"
 import * as api from "../lib/api"
 import { useToast } from "../lib/toast"
 import type { ActiveInfo } from "../lib/types"
+import { useAsyncAction } from "../lib/useAsyncAction"
 
 const RDP_PRESETS = ["", "auto", "freerdp", "remmina", "gnome-connections"]
 
@@ -28,10 +30,10 @@ function CopyRow({ value }: { value: string }) {
 
 export function ConnectionPage({ active }: { active: ActiveInfo }) {
 	const toast = useToast()
+	const saveAction = useAsyncAction()
 	const [rdpMode, setRdpMode] = useState("auto")
 	const [rdpCustom, setRdpCustom] = useState("")
 	const [terminal, setTerminal] = useState("")
-	const [saving, setSaving] = useState(false)
 
 	useEffect(() => {
 		api.getSettings()
@@ -48,16 +50,9 @@ export function ConnectionPage({ active }: { active: ActiveInfo }) {
 	}, [toast])
 
 	const savePrefs = async () => {
-		setSaving(true)
 		const rdpClient = rdpMode === "custom" ? rdpCustom.trim() || null : rdpMode === "auto" ? null : rdpMode
-		try {
-			await api.setSettings(rdpClient, terminal || null)
-			toast.success("Saved", "Host preferences updated.")
-		} catch (e) {
-			toast.error("Couldn't save", api.errString(e))
-		} finally {
-			setSaving(false)
-		}
+		const ok = await saveAction.run("Couldn't save", () => api.setSettings(rdpClient, terminal || null))
+		if (ok) toast.success("Saved", "Host preferences updated.")
 	}
 
 	const ts = active.tailscale
@@ -65,17 +60,15 @@ export function ConnectionPage({ active }: { active: ActiveInfo }) {
 
 	return (
 		<>
-			<header className="drag flex items-center justify-between border-b border-border px-7 py-5">
-				<div>
-					<h1 className="text-xl font-bold text-text">Connection</h1>
-					<p className="text-sm text-muted">
-						How agents reach “{active.name}”. Edit the type from the launch screen.
-					</p>
-				</div>
-				<Badge tone="primary">
-					<span className="capitalize">{kind.type}</span>
-				</Badge>
-			</header>
+			<PageHeader
+				actions={
+					<Badge tone="primary">
+						<span className="capitalize">{kind.type}</span>
+					</Badge>
+				}
+				subtitle={`How agents reach “${active.name}”. Edit the type from the launch screen.`}
+				title="Connection"
+			/>
 
 			<div className="min-h-0 flex-1 overflow-y-auto px-7 py-6">
 				<div className="mx-auto flex max-w-2xl flex-col gap-4">
@@ -181,7 +174,7 @@ export function ConnectionPage({ active }: { active: ActiveInfo }) {
 						<div className="flex justify-end">
 							<Button
 								icon={<Save className="h-4 w-4" />}
-								loading={saving}
+								loading={saveAction.busy}
 								onClick={savePrefs}
 								variant="primary"
 							>

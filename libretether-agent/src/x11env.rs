@@ -16,9 +16,23 @@
 #[cfg(target_os = "linux")]
 pub fn ensure() {
 	use std::path::Path;
+	use std::sync::Mutex;
+
+	// Serialize so two concurrent callers (e.g. a screenshot during a live session)
+	// never run `set_var` at the same time, and so we stop touching the process
+	// environment once it's been satisfied — `getenv`/`setenv` are not thread-safe,
+	// and the X11 backends read these vars on their own threads. `applied` flips to
+	// true only once the env is fully usable, so an early call before the graphical
+	// session exists still retries later.
+	static APPLIED: Mutex<bool> = Mutex::new(false);
+	let mut applied = APPLIED.lock().unwrap();
+	if *applied {
+		return;
+	}
 
 	let xauth_ok = std::env::var_os("XAUTHORITY").is_some_and(|p| Path::new(&p).exists());
 	if std::env::var_os("DISPLAY").is_some() && xauth_ok {
+		*applied = true;
 		return;
 	}
 
@@ -27,11 +41,13 @@ pub fn ensure() {
 		// (e.g. a hardcoded :0) so it can't disagree with the cookie.
 		std::env::set_var("DISPLAY", display);
 		std::env::set_var("XAUTHORITY", xauthority);
+		*applied = true;
 		return;
 	}
 
 	// No borrowable session env (e.g. a classic `startx` with ~/.Xauthority):
-	// at least point DISPLAY at a live X socket and let Xlib find the cookie.
+	// at least point DISPLAY at a live X socket and let Xlib find the cookie. Leave
+	// `applied` false so a later call can still upgrade to a borrowed pair.
 	if std::env::var_os("DISPLAY").is_none() {
 		if let Some(display) = display_from_socket() {
 			std::env::set_var("DISPLAY", display);

@@ -141,7 +141,9 @@ Every method rides Tailscale straight to the client's private IP — no extra tu
   that merely holds the relay's owner secret, can't impersonate the controller and drive an
   agent. After a successful handshake the agent issues a per-connection capability token
   that every control/screen/tunnel stream must carry, so unauthenticated streams (e.g.
-  injected through the relay) are rejected.
+  injected through the relay) are rejected. (Such a party still can't drive agents, but the
+  owner secret is a single controller-slot credential, so treat it as sensitive for
+  *availability* too — whoever holds it can claim the relay's controller slot.)
 - A **one-time enrollment token** (baked into the deploy script) binds the very first
   connection, then is burned.
 - Config files holding secrets (identity seeds, enrollment tokens, relay/owner secrets, the
@@ -165,10 +167,12 @@ This is an early build. What works today:
 
 Releases publish the `libretether-agent` and `libretether-relay` binaries for every platform
 (`-linux-x86_64`, `-linux-aarch64`, `-macos-universal`, `-windows-x86_64.exe`). The deploy
-script downloads the matching agent from the latest release automatically — override with
-`LIBRETETHER_AGENT_URL` (a specific asset) or `LIBRETETHER_AGENT_BIN` (a local build) when
-developing. Grab `libretether-relay-linux-x86_64` for your relay host; the relay is also
-published as a multi-arch container image at `ghcr.io/libretether/libretether-relay`
+script downloads the matching agent from the latest release and verifies it against the
+published `.sha256` sidecar. Override the binary source with `LIBRETETHER_AGENT_URL` (a
+specific asset) or `LIBRETETHER_AGENT_BIN` (a local build) when developing — a custom URL
+with no `.sha256` sidecar skips the integrity check (the installer warns), so only point it
+at a source you trust. Grab `libretether-relay-linux-x86_64` for your relay host; the relay
+is also published as a multi-arch container image at `ghcr.io/libretether/libretether-relay`
 (see [Run the relay with Docker](#run-the-relay-with-docker)).
 
 Rough edges & next up: frame streaming is JPEG-over-QUIC (no delta/codec yet), input

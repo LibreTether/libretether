@@ -1,9 +1,9 @@
 import { Camera, Play, RefreshCw } from "lucide-react"
 import { useCallback, useEffect, useState } from "react"
 import * as api from "../lib/api"
-import { formatUptime } from "../lib/format"
-import { useToast } from "../lib/toast"
+import { formatUptime, tokenizeCommand } from "../lib/format"
 import type { AgentStatus, ClientDto, ExecResult } from "../lib/types"
+import { useAsyncAction } from "../lib/useAsyncAction"
 import { Button, Field, Input, Modal } from "./ui"
 
 function StatusGrid({ status }: { status: AgentStatus }) {
@@ -39,44 +39,34 @@ export function ClientDetailModal({
 	onClose: () => void
 	client: ClientDto
 }) {
-	const toast = useToast()
 	const [status, setStatus] = useState<AgentStatus | null>(client.status)
-	const [busy, setBusy] = useState(false)
 	const [cmd, setCmd] = useState("")
 	const [exec, setExec] = useState<ExecResult | null>(null)
-	const [execBusy, setExecBusy] = useState(false)
 	const [shot, setShot] = useState<string | null>(null)
-	const [shotBusy, setShotBusy] = useState(false)
+	const statusAction = useAsyncAction()
+	const execAction = useAsyncAction()
+	const shotAction = useAsyncAction()
 
 	const refresh = useCallback(() => {
-		setBusy(true)
-		api.clientStatus(client.id)
-			.then(setStatus)
-			.catch((e) => toast.error("Status failed", api.errString(e)))
-			.finally(() => setBusy(false))
-	}, [client.id, toast])
+		statusAction.run("Status failed", async () => setStatus(await api.clientStatus(client.id)))
+	}, [client.id, statusAction])
 
 	useEffect(() => {
 		if (open && client.online) refresh()
 	}, [open, client.online, refresh])
 
 	const run = () => {
-		const parts = cmd.trim().split(/\s+/).filter(Boolean)
+		const parts = tokenizeCommand(cmd)
 		if (parts.length === 0) return
-		setExecBusy(true)
 		setExec(null)
-		api.clientExec(client.id, parts[0], parts.slice(1))
-			.then(setExec)
-			.catch((e) => toast.error("Command failed", api.errString(e)))
-			.finally(() => setExecBusy(false))
+		execAction.run("Command failed", async () => setExec(await api.clientExec(client.id, parts[0], parts.slice(1))))
 	}
 
 	const screenshot = () => {
-		setShotBusy(true)
-		api.clientScreenshot(client.id)
-			.then((s) => setShot(`data:image/png;base64,${s.png_base64}`))
-			.catch((e) => toast.error("Screenshot failed", api.errString(e)))
-			.finally(() => setShotBusy(false))
+		shotAction.run("Screenshot failed", async () => {
+			const s = await api.clientScreenshot(client.id)
+			setShot(`data:image/png;base64,${s.png_base64}`)
+		})
 	}
 
 	return (
@@ -92,7 +82,7 @@ export function ClientDetailModal({
 							<h3 className="text-sm font-semibold text-text">Status</h3>
 							<Button
 								icon={<RefreshCw className="h-3.5 w-3.5" />}
-								loading={busy}
+								loading={statusAction.busy}
 								onClick={refresh}
 								size="sm"
 								variant="ghost"
@@ -116,7 +106,7 @@ export function ClientDetailModal({
 							</Field>
 							<Button
 								icon={<Play className="h-4 w-4" />}
-								loading={execBusy}
+								loading={execAction.busy}
 								onClick={run}
 								variant="solid"
 							>
@@ -143,7 +133,7 @@ export function ClientDetailModal({
 							<h3 className="text-sm font-semibold text-text">Screenshot</h3>
 							<Button
 								icon={<Camera className="h-3.5 w-3.5" />}
-								loading={shotBusy}
+								loading={shotAction.busy}
 								onClick={screenshot}
 								size="sm"
 								variant="ghost"

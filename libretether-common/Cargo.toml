@@ -9,4 +9,7 @@ license = "AGPL-3.0-only"
 name = "libretether_common"
 
 [dependencies]
-tokio = { version = "1", features = ["signal", "process"] }
+tokio = { version = "1", features = ["signal", "process", "io-util", "macros"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "macros", "io-util"] }

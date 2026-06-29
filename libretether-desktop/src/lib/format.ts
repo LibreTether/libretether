@@ -22,6 +22,36 @@ export function relativeTime(unixSecs: number | null): string {
 	return `${Math.floor(diff / 86400)}d ago`
 }
 
+/** Split a command line into program + args, honoring single/double quotes so a
+ *  value with spaces (e.g. `echo "a b"`) stays one token. Args are passed to the
+ *  agent as an argv array (no shell), so this only needs to handle quoting/spaces. */
+export function tokenizeCommand(input: string): string[] {
+	const tokens: string[] = []
+	let cur = ""
+	let quote: '"' | "'" | null = null
+	let started = false
+	for (const ch of input) {
+		if (quote) {
+			if (ch === quote) quote = null
+			else cur += ch
+		} else if (ch === '"' || ch === "'") {
+			quote = ch
+			started = true
+		} else if (/\s/.test(ch)) {
+			if (started) {
+				tokens.push(cur)
+				cur = ""
+				started = false
+			}
+		} else {
+			cur += ch
+			started = true
+		}
+	}
+	if (started) tokens.push(cur)
+	return tokens
+}
+
 /** A filesystem-safe slug for a client name. */
 export function slug(name: string): string {
 	return (

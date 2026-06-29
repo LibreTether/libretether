@@ -8,17 +8,19 @@ import {
 	Terminal,
 	Trash2
 } from "lucide-react"
-import { useState } from "react"
+import { useEffect, useState } from "react"
 import { ClientDetailModal } from "../components/ClientDetailModal"
 import { Combobox } from "../components/Combobox"
 import { useConfirm } from "../components/confirm"
 import { DeployModal } from "../components/DeployModal"
 import { OsIcon, osLabel } from "../components/OsIcon"
+import { PageHeader } from "../components/PageHeader"
 import { Badge, Button, EmptyState, Field, Input, Modal } from "../components/ui"
 import * as api from "../lib/api"
 import { relativeTime } from "../lib/format"
 import { useToast } from "../lib/toast"
 import type { ClientDto, ClientOs } from "../lib/types"
+import { useAsyncAction } from "../lib/useAsyncAction"
 
 interface DeployState {
 	name: string
@@ -42,6 +44,13 @@ export function MachinesPage({
 	const [createOpen, setCreateOpen] = useState(false)
 	const [deploy, setDeploy] = useState<DeployState | null>(null)
 	const [detail, setDetail] = useState<ClientDto | null>(null)
+	// Re-render every 30s so relative "last seen" labels don't go stale between
+	// `clients:changed` events (e.g. for a machine that just went offline).
+	const [, tickTimes] = useState(0)
+	useEffect(() => {
+		const t = window.setInterval(() => tickTimes((n) => n + 1), 30_000)
+		return () => window.clearInterval(t)
+	}, [])
 
 	const openDeploy = async (client: ClientDto) => {
 		try {
@@ -102,15 +111,15 @@ export function MachinesPage({
 
 	return (
 		<>
-			<header className="drag flex items-center justify-between border-b border-border px-7 py-5">
-				<div>
-					<h1 className="text-xl font-bold text-text">Machines</h1>
-					<p className="text-sm text-muted">Enrol, monitor and take control of your remote machines.</p>
-				</div>
-				<Button icon={<Plus className="h-4 w-4" />} onClick={() => setCreateOpen(true)} variant="primary">
-					Add machine
-				</Button>
-			</header>
+			<PageHeader
+				actions={
+					<Button icon={<Plus className="h-4 w-4" />} onClick={() => setCreateOpen(true)} variant="primary">
+						Add machine
+					</Button>
+				}
+				subtitle="Enrol, monitor and take control of your remote machines."
+				title="Machines"
+			/>
 
 			<div className="min-h-0 flex-1 overflow-y-auto px-7 py-6">
 				{loading ? (
@@ -280,24 +289,18 @@ function CreateModal({
 	onClose: () => void
 	onCreated: (d: DeployState) => void
 }) {
-	const toast = useToast()
+	const createAction = useAsyncAction()
 	const [name, setName] = useState("")
 	const [os, setOs] = useState<ClientOs>("linux")
-	const [busy, setBusy] = useState(false)
 
 	const submit = async () => {
 		if (!name.trim()) return
-		setBusy(true)
-		try {
+		await createAction.run("Couldn't create machine", async () => {
 			const res = await api.createClient(name.trim(), os)
 			onCreated({ name: res.client.name, os: res.client.os, script: res.deploy_script })
 			setName("")
 			setOs("linux")
-		} catch (e) {
-			toast.error("Couldn't create machine", api.errString(e))
-		} finally {
-			setBusy(false)
-		}
+		})
 	}
 
 	return (
@@ -307,7 +310,12 @@ function CreateModal({
 					<Button onClick={onClose} variant="ghost">
 						Cancel
 					</Button>
-					<Button icon={<Rocket className="h-4 w-4" />} loading={busy} onClick={submit} variant="primary">
+					<Button
+						icon={<Rocket className="h-4 w-4" />}
+						loading={createAction.busy}
+						onClick={submit}
+						variant="primary"
+					>
 						Create & get script
 					</Button>
 				</>
@@ -328,8 +336,8 @@ function CreateModal({
 					/>
 				</Field>
 				<Field hint="Picks the right deploy script for the target." label="Operating system">
-					<Combobox
-						onChange={(v) => setOs(v as ClientOs)}
+					<Combobox<ClientOs>
+						onChange={setOs}
 						options={[
 							{ icon: <OsIcon className="h-4 w-4" os="linux" />, label: "Linux", value: "linux" },
 							{ icon: <OsIcon className="h-4 w-4" os="macos" />, label: "macOS", value: "macos" },

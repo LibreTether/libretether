@@ -1,4 +1,7 @@
-// These types mirror the structs serialised by the Rust backend.
+// These types mirror the structs serialised by the Rust backend. They are
+// hand-maintained, but guarded: a Rust-side test (`commands.rs` →
+// `*_match_types_ts`) pins the JSON field set and enum tags below, so renaming or
+// dropping a field there fails `cargo test` until this file is updated to match.
 
 export type ClientOs = "linux" | "macos" | "windows"
 

@@ -3,7 +3,7 @@
 
 use std::path::PathBuf;
 
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use libretether_protocol::crypto::Identity;
 use libretether_protocol::DEFAULT_PORT;
 use serde::{Deserialize, Serialize};
@@ -55,6 +55,19 @@ impl AgentConfig {
 		self.relay_addr.as_deref().filter(|s| !s.is_empty())
 	}
 
+	/// The pinned controller key, or a clear "re-enroll" error. There is no
+	/// trust-on-first-use: an agent whose config predates key pinning (or has it
+	/// blanked) must be re-enrolled rather than trusting whichever controller dials
+	/// it. Fails closed — see the project's no-backward-compatibility rule.
+	pub fn require_controller_key(&self) -> Result<String> {
+		self.controller_key
+			.clone()
+			.filter(|k| !k.trim().is_empty())
+			.ok_or_else(|| {
+				anyhow!("no controller key pinned in config — re-enroll with `--controller-key` (re-run the deploy command)")
+			})
+	}
+
 	pub fn load(path: &PathBuf) -> Result<Self> {
 		let raw =
 			std::fs::read_to_string(path).with_context(|| format!("reading agent config at {}", path.display()))?;
@@ -79,13 +92,10 @@ pub fn default_config_path() -> PathBuf {
 		.join("config.json")
 }
 
-/// Normalize a controller address, defaulting the port when omitted.
+/// Normalize a controller/relay address, defaulting the port when omitted
+/// (handles bare IPv6 literals correctly — see [`libretether_common::with_default_port`]).
 pub fn normalize_addr(addr: &str) -> String {
-	if addr.contains(':') {
-		addr.to_string()
-	} else {
-		format!("{addr}:{DEFAULT_PORT}")
-	}
+	libretether_common::with_default_port(addr, DEFAULT_PORT)
 }
 
 #[cfg(test)]
@@ -104,23 +114,59 @@ mod tests {
 		assert_eq!(normalize_addr("10.0.0.5:9000"), "10.0.0.5:9000");
 	}
 
-	#[test]
-	fn relay_mode_is_detected_from_a_non_empty_relay_addr() {
-		let mut cfg = AgentConfig {
-			controller_addr: String::new(),
-			relay_addr: Some("relay.example:47600".into()),
-			relay_secret: Some("s".into()),
+	/// A minimal config with a valid identity; tweak fields per test.
+	fn base_config() -> AgentConfig {
+		AgentConfig {
+			controller_addr: "ctl.example:47600".into(),
+			relay_addr: None,
+			relay_secret: None,
 			server_name: default_server_name(),
 			enrollment_token: None,
-			controller_key: Some("k".into()),
+			controller_key: Some("ckey".into()),
 			identity_seed: Identity::generate().seed_b64(),
 			client_id: None,
-		};
+		}
+	}
+
+	#[test]
+	fn relay_mode_is_detected_from_a_non_empty_relay_addr() {
+		let mut cfg = base_config();
+		cfg.controller_addr = String::new();
+		cfg.relay_addr = Some("relay.example:47600".into());
+		cfg.relay_secret = Some("s".into());
 		assert_eq!(cfg.relay(), Some("relay.example:47600"));
 		// An empty relay address falls back to direct mode.
 		cfg.relay_addr = Some(String::new());
 		assert_eq!(cfg.relay(), None);
 		cfg.relay_addr = None;
 		assert_eq!(cfg.relay(), None);
+	}
+
+	#[test]
+	fn require_controller_key_returns_the_pinned_key() {
+		assert_eq!(base_config().require_controller_key().unwrap(), "ckey");
+	}
+
+	#[test]
+	fn require_controller_key_fails_closed_when_absent_or_blank() {
+		// A missing or whitespace-only pinned key must error with a re-enroll hint
+		// rather than letting the agent trust any controller (no trust-on-first-use).
+		for blank in [None, Some(String::new()), Some("   ".into())] {
+			let mut cfg = base_config();
+			cfg.controller_key = blank;
+			let err = cfg.require_controller_key().unwrap_err().to_string();
+			assert!(err.contains("re-enroll"), "expected a re-enroll error, got: {err}");
+		}
+	}
+
+	#[test]
+	fn config_round_trips_through_json() {
+		// The on-disk shape must survive a save/load cycle (serde_json round-trip).
+		let cfg = base_config();
+		let raw = serde_json::to_string(&cfg).unwrap();
+		let back: AgentConfig = serde_json::from_str(&raw).unwrap();
+		assert_eq!(back.controller_addr, cfg.controller_addr);
+		assert_eq!(back.controller_key, cfg.controller_key);
+		assert_eq!(back.identity_seed, cfg.identity_seed);
 	}
 }

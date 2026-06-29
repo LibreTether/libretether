@@ -13,6 +13,11 @@
 /// specified". So we also look for the compositor's `wayland-N` socket in
 /// `XDG_RUNTIME_DIR`, which the service always has and which only exists when a
 /// Wayland compositor is running.
+///
+/// Intentionally not cached: the agent service starts at boot before any session
+/// exists, so an early call would cache "not Wayland" and never re-detect once the
+/// user logs in. The `read_dir` probe is cheap and only runs per screenshot/session
+/// start, not per frame.
 pub fn is_wayland() -> bool {
 	if std::env::var_os("WAYLAND_DISPLAY").is_some() {
 		return true;

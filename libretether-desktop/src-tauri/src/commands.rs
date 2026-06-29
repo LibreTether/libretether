@@ -17,6 +17,19 @@ use crate::state::{ActiveController, AppState, ControllerKind};
 use crate::tailscale::{self, TailscaleInfo};
 use crate::{deploy, session};
 
+/// Send a control request to the active agent and extract the expected response
+/// variant, mapping an agent-side `Error` to [`AppError::Agent`] and any other
+/// variant to a generic error. Expands to an `AppResult<T>`.
+macro_rules! expect_response {
+	($conn:expr, $req:expr, $variant:path) => {
+		match control_request($conn, $req).await? {
+			$variant(value) => Ok(value),
+			ControlResponse::Error { message } => Err(AppError::Agent(message)),
+			_ => Err(AppError::msg("unexpected response from agent")),
+		}
+	};
+}
+
 // ---------------------------------------------------------------- DTOs
 
 #[derive(Serialize)]
@@ -86,11 +99,7 @@ fn parse_id(id: &str) -> AppResult<Uuid> {
 }
 
 fn with_port(addr: &str, port: u16) -> String {
-	if addr.contains(':') {
-		addr.to_string()
-	} else {
-		format!("{addr}:{port}")
-	}
+	libretether_common::with_default_port(addr, port)
 }
 
 async fn tailscale_addr(port: u16) -> String {
@@ -434,16 +443,11 @@ pub async fn client_status(state: State<'_, AppState>, id: String) -> AppResult<
 	let ctrl = state.inner().require_active()?;
 	let id = parse_id(&id)?;
 	let conn = ctrl.connection(id).ok_or(AppError::Offline)?;
-	match control_request(&conn, &ControlRequest::Status).await? {
-		ControlResponse::Status(status) => {
-			if let Some(live) = ctrl.live.lock().unwrap().get_mut(&id) {
-				live.status = Some(status.clone());
-			}
-			Ok(status)
-		}
-		ControlResponse::Error { message } => Err(AppError::Agent(message)),
-		_ => Err(AppError::msg("unexpected response")),
+	let status = expect_response!(&conn, &ControlRequest::Status, ControlResponse::Status)?;
+	if let Some(live) = ctrl.live.lock().unwrap().get_mut(&id) {
+		live.status = Some(status.clone());
 	}
+	Ok(status)
 }
 
 #[tauri::command]
@@ -457,20 +461,15 @@ pub async fn client_exec(
 	let ctrl = state.inner().require_active()?;
 	let id = parse_id(&id)?;
 	let conn = ctrl.connection(id).ok_or(AppError::Offline)?;
-	match control_request(
+	expect_response!(
 		&conn,
 		&ControlRequest::Exec {
 			program,
 			args,
 			timeout_secs,
 		},
+		ControlResponse::Exec
 	)
-	.await?
-	{
-		ControlResponse::Exec(result) => Ok(result),
-		ControlResponse::Error { message } => Err(AppError::Agent(message)),
-		_ => Err(AppError::msg("unexpected response")),
-	}
 }
 
 #[tauri::command]
@@ -482,11 +481,11 @@ pub async fn client_screenshot(
 	let ctrl = state.inner().require_active()?;
 	let id = parse_id(&id)?;
 	let conn = ctrl.connection(id).ok_or(AppError::Offline)?;
-	match control_request(&conn, &ControlRequest::Screenshot { display }).await? {
-		ControlResponse::Screenshot(shot) => Ok(shot),
-		ControlResponse::Error { message } => Err(AppError::Agent(message)),
-		_ => Err(AppError::msg("unexpected response")),
-	}
+	expect_response!(
+		&conn,
+		&ControlRequest::Screenshot { display },
+		ControlResponse::Screenshot
+	)
 }
 
 // ---------------------------------------------------------------- session
@@ -552,11 +551,7 @@ pub async fn connect_rdp(state: State<'_, AppState>, id: String) -> AppResult<()
 	let ctrl = state.require_active()?;
 	let id = parse_id(&id)?;
 	let conn = ctrl.connection(id).ok_or(AppError::Offline)?;
-	let info = match control_request(&conn, &ControlRequest::EnableRdp).await? {
-		ControlResponse::Rdp(info) => info,
-		ControlResponse::Error { message } => return Err(AppError::Agent(message)),
-		_ => return Err(AppError::msg("unexpected response")),
-	};
+	let info = expect_response!(&conn, &ControlRequest::EnableRdp, ControlResponse::Rdp)?;
 	let (host, port) = client_endpoint(&ctrl, id, &conn, info.address.clone(), info.port).await?;
 	let host = safe_host(&host)?;
 	let username = safe_username(&info.username)?;
@@ -588,11 +583,7 @@ pub async fn connect_ssh(state: State<'_, AppState>, id: String) -> AppResult<()
 	let ctrl = state.require_active()?;
 	let id = parse_id(&id)?;
 	let conn = ctrl.connection(id).ok_or(AppError::Offline)?;
-	let status = match control_request(&conn, &ControlRequest::Status).await? {
-		ControlResponse::Status(s) => s,
-		ControlResponse::Error { message } => return Err(AppError::Agent(message)),
-		_ => return Err(AppError::msg("unexpected response")),
-	};
+	let status = expect_response!(&conn, &ControlRequest::Status, ControlResponse::Status)?;
 	let (host, port) = client_endpoint(&ctrl, id, &conn, status.tailscale_ip.clone(), 22).await?;
 	let host = safe_host(&host)?;
 	let username = safe_username(&status.host.username)?;
@@ -737,5 +728,332 @@ mod tests {
 		assert_eq!(with_port("1.2.3.4", 47600), "1.2.3.4:47600");
 		assert_eq!(with_port("host.example", 9000), "host.example:9000");
 		assert_eq!(with_port("host:22", 47600), "host:22");
+	}
+
+	/// A fresh active controller with the given kind (no live agents).
+	fn active_with(kind: ControllerKind) -> ActiveController {
+		use crate::registry::ClientStore;
+		use crate::state::ControllerProfile;
+		use std::collections::HashMap;
+		use std::sync::atomic::{AtomicU32, Ordering};
+		use std::sync::Mutex;
+		static N: AtomicU32 = AtomicU32::new(0);
+		let path = std::env::temp_dir().join(format!(
+			"lt-cmds-{}-{}.json",
+			std::process::id(),
+			N.fetch_add(1, Ordering::Relaxed)
+		));
+		ActiveController {
+			profile: ControllerProfile::new("test".into(), kind),
+			store: Mutex::new(ClientStore::load(path).unwrap()),
+			live: Mutex::new(HashMap::new()),
+			sessions: Mutex::new(HashMap::new()),
+			tunnels: Mutex::new(HashMap::new()),
+		}
+	}
+
+	#[tokio::test]
+	async fn deploy_target_for_relay_carries_the_agent_secret_and_controller_key() {
+		let ctrl = active_with(ControllerKind::Relay {
+			address: "relay.example".into(),
+			owner_secret: "owner".into(),
+			agent_secret: "agentsecret".into(),
+		});
+		match deploy_target(&ctrl).await {
+			deploy::DeployTarget::Relay {
+				address,
+				agent_secret,
+				controller_key,
+			} => {
+				assert_eq!(address, "relay.example:47600", "the default port is appended");
+				assert_eq!(agent_secret, "agentsecret");
+				// The pinned controller key is the profile's real public key (not blank).
+				assert_eq!(controller_key, ctrl.profile.public_key());
+				assert!(!controller_key.is_empty());
+			}
+			_ => panic!("relay controller must produce a Relay deploy target"),
+		}
+	}
+
+	#[tokio::test]
+	async fn deploy_target_for_direct_uses_the_advertise_addr_and_no_auth_key() {
+		let ctrl = active_with(ControllerKind::Direct {
+			advertise_addr: Some("10.0.0.5".into()),
+			listen_port: 47600,
+		});
+		match deploy_target(&ctrl).await {
+			deploy::DeployTarget::Controller {
+				address,
+				auth_key,
+				controller_key,
+			} => {
+				assert_eq!(address, "10.0.0.5:47600");
+				assert!(auth_key.is_none(), "direct mode carries no tailscale key");
+				assert_eq!(controller_key, ctrl.profile.public_key());
+			}
+			_ => panic!("direct controller must produce a Controller deploy target"),
+		}
+	}
+
+	// ------------------------------------------------ frontend wire contract
+	//
+	// `libretether-desktop/src/lib/types.ts` is hand-maintained to mirror these
+	// structs. There is no codegen, so these tests are the drift guard: they pin the
+	// exact JSON field set the frontend reads (and the enum tags it switches on). If
+	// you rename/add/remove a field here, this fails until `types.ts` is updated to
+	// match — turning a silent runtime `undefined` into a failed `cargo test`.
+
+	use libretether_protocol::{Frame, FrameEncoding, HostInfo, MouseButton};
+	use serde::Serialize;
+
+	/// Assert that `value` serializes to a JSON object with exactly `expected` keys.
+	fn assert_fields<T: Serialize>(value: T, expected: &[&str]) {
+		let v = serde_json::to_value(&value).unwrap();
+		let obj = v.as_object().expect("expected a JSON object");
+		let mut got: Vec<&str> = obj.keys().map(String::as_str).collect();
+		got.sort_unstable();
+		let mut want = expected.to_vec();
+		want.sort_unstable();
+		assert_eq!(got, want, "JSON field set drifted from src/lib/types.ts");
+	}
+
+	fn sample_host() -> HostInfo {
+		HostInfo {
+			hostname: "h".into(),
+			os: "linux".into(),
+			arch: "x86_64".into(),
+			username: "u".into(),
+		}
+	}
+
+	fn sample_status() -> AgentStatus {
+		AgentStatus {
+			host: sample_host(),
+			agent_version: "1".into(),
+			uptime_secs: 1,
+			started_at: 0,
+			boot_time_secs: None,
+			displays: 1,
+			tailscale_ip: None,
+		}
+	}
+
+	#[test]
+	fn protocol_dtos_match_types_ts() {
+		assert_fields(sample_host(), &["hostname", "os", "arch", "username"]);
+		assert_fields(
+			sample_status(),
+			&[
+				"host",
+				"agent_version",
+				"uptime_secs",
+				"started_at",
+				"boot_time_secs",
+				"displays",
+				"tailscale_ip",
+			],
+		);
+		assert_fields(
+			ExecResult {
+				code: Some(0),
+				stdout: String::new(),
+				stderr: String::new(),
+				duration_ms: 0,
+			},
+			&["code", "stdout", "stderr", "duration_ms"],
+		);
+		assert_fields(
+			ScreenshotResult {
+				display: 0,
+				width: 1,
+				height: 1,
+				png_base64: String::new(),
+			},
+			&["display", "width", "height", "png_base64"],
+		);
+		assert_fields(
+			Frame {
+				seq: 0,
+				width: 1,
+				height: 1,
+				encoding: FrameEncoding::Jpeg,
+				data_base64: String::new(),
+			},
+			&["seq", "width", "height", "encoding", "data_base64"],
+		);
+	}
+
+	#[test]
+	fn command_dtos_match_types_ts() {
+		let client = ClientDto {
+			id: "id".into(),
+			name: "n".into(),
+			os: "linux".into(),
+			created_at: 0,
+			enrolled: true,
+			online: false,
+			last_seen: None,
+			status: None,
+		};
+		assert_fields(
+			&client,
+			&[
+				"id",
+				"name",
+				"os",
+				"created_at",
+				"enrolled",
+				"online",
+				"last_seen",
+				"status",
+			],
+		);
+		assert_fields(
+			CreateClientResult {
+				client,
+				deploy_script: String::new(),
+			},
+			&["client", "deploy_script"],
+		);
+		let kind = ControllerKind::Direct {
+			advertise_addr: None,
+			listen_port: 47600,
+		};
+		assert_fields(
+			ControllerSummary {
+				id: "id".into(),
+				name: "n".into(),
+				kind: kind.clone(),
+				fingerprint: "fp".into(),
+				machine_count: 0,
+				active: false,
+			},
+			&["id", "name", "kind", "fingerprint", "machine_count", "active"],
+		);
+		assert_fields(
+			ActiveInfo {
+				id: "id".into(),
+				name: "n".into(),
+				kind,
+				fingerprint: "fp".into(),
+				reachable_at: None,
+				tailscale: None,
+			},
+			&["id", "name", "kind", "fingerprint", "reachable_at", "tailscale"],
+		);
+		assert_fields(
+			SettingsDto {
+				rdp_client: None,
+				terminal: None,
+			},
+			&["rdp_client", "terminal"],
+		);
+		assert_fields(
+			TailscaleInfo {
+				installed: false,
+				running: false,
+				address: None,
+				hostname: None,
+			},
+			&["installed", "running", "address", "hostname"],
+		);
+	}
+
+	#[test]
+	fn controller_kind_is_tagged_by_type_with_the_expected_fields() {
+		let direct = serde_json::to_value(ControllerKind::Direct {
+			advertise_addr: None,
+			listen_port: 47600,
+		})
+		.unwrap();
+		assert_eq!(direct["type"], "direct");
+		assert_fields(
+			ControllerKind::Direct {
+				advertise_addr: None,
+				listen_port: 47600,
+			},
+			&["type", "advertise_addr", "listen_port"],
+		);
+		assert_fields(
+			ControllerKind::Tailscale {
+				auth_key: None,
+				listen_port: 47600,
+			},
+			&["type", "auth_key", "listen_port"],
+		);
+		assert_fields(
+			ControllerKind::Relay {
+				address: "a".into(),
+				owner_secret: "o".into(),
+				agent_secret: "g".into(),
+			},
+			&["type", "address", "owner_secret", "agent_secret"],
+		);
+		assert_eq!(
+			serde_json::to_value(ControllerKind::Tailscale {
+				auth_key: None,
+				listen_port: 0
+			})
+			.unwrap()["type"],
+			"tailscale"
+		);
+		assert_eq!(
+			serde_json::to_value(ControllerKind::Relay {
+				address: "a".into(),
+				owner_secret: "o".into(),
+				agent_secret: "g".into()
+			})
+			.unwrap()["type"],
+			"relay"
+		);
+	}
+
+	#[test]
+	fn input_event_is_tagged_by_t_with_the_expected_variants() {
+		let cases = [
+			(
+				InputEvent::MouseMove { x: 0.0, y: 0.0 },
+				"mouse_move",
+				&["t", "x", "y"][..],
+			),
+			(
+				InputEvent::MouseButton {
+					button: MouseButton::Left,
+					pressed: true,
+				},
+				"mouse_button",
+				&["t", "button", "pressed"][..],
+			),
+			(
+				InputEvent::MouseScroll { dx: 0, dy: 0 },
+				"mouse_scroll",
+				&["t", "dx", "dy"][..],
+			),
+			(
+				InputEvent::Key {
+					code: "KeyA".into(),
+					pressed: true,
+				},
+				"key",
+				&["t", "code", "pressed"][..],
+			),
+			(InputEvent::Text { text: "x".into() }, "text", &["t", "text"][..]),
+		];
+		for (event, tag, fields) in cases {
+			assert_eq!(serde_json::to_value(&event).unwrap()["t"], tag);
+			assert_fields(event, fields);
+		}
+	}
+
+	#[test]
+	fn string_enums_serialize_to_the_literals_types_ts_expects() {
+		assert_eq!(serde_json::to_value(MouseButton::Left).unwrap(), "left");
+		assert_eq!(serde_json::to_value(MouseButton::Right).unwrap(), "right");
+		assert_eq!(serde_json::to_value(MouseButton::Middle).unwrap(), "middle");
+		assert_eq!(serde_json::to_value(FrameEncoding::Jpeg).unwrap(), "jpeg");
+		assert_eq!(serde_json::to_value(FrameEncoding::Png).unwrap(), "png");
+		assert_eq!(serde_json::to_value(ClientOs::Linux).unwrap(), "linux");
+		assert_eq!(serde_json::to_value(ClientOs::Macos).unwrap(), "macos");
+		assert_eq!(serde_json::to_value(ClientOs::Windows).unwrap(), "windows");
 	}
 }

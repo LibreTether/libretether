@@ -1,12 +1,5 @@
 import { Loader2, X } from "lucide-react"
-import {
-	type ButtonHTMLAttributes,
-	forwardRef,
-	type InputHTMLAttributes,
-	type ReactNode,
-	type SelectHTMLAttributes,
-	useEffect
-} from "react"
+import { type ButtonHTMLAttributes, forwardRef, type InputHTMLAttributes, type ReactNode, useEffect } from "react"
 import { cn } from "../lib/cn"
 
 // ----------------------------------------------------------------- Spinner
@@ -47,11 +40,14 @@ export const Button = forwardRef<HTMLButtonElement, ButtonProps>(function Button
 	{ variant = "soft", size = "md", loading, icon, className, children, disabled, ...rest },
 	ref
 ) {
+	// Default to a non-submit button (the app has no <form>s); a caller can still
+	// override `type` via `...rest`.
 	return (
 		<button
 			className={cn("btn no-drag", VARIANTS[variant], SIZES[size], className)}
 			disabled={disabled || loading}
 			ref={ref}
+			type="button"
 			{...rest}
 		>
 			{loading ? <Spinner /> : icon}
@@ -121,17 +117,6 @@ export const Input = forwardRef<HTMLInputElement, InputHTMLAttributes<HTMLInputE
 	return <input className={cn(inputBase, className)} ref={ref} {...rest} />
 })
 
-export const Select = forwardRef<HTMLSelectElement, SelectHTMLAttributes<HTMLSelectElement>>(function Select(
-	{ className, children, ...rest },
-	ref
-) {
-	return (
-		<select className={cn(inputBase, "pr-8", className)} ref={ref} {...rest}>
-			{children}
-		</select>
-	)
-})
-
 // ----------------------------------------------------------------- Modal
 export function Modal({
 	open,
@@ -186,8 +171,10 @@ export function Modal({
 					<div className="flex items-center justify-between border-b border-border px-5 py-3.5">
 						<h2 className="text-base font-semibold text-text">{title}</h2>
 						<button
+							aria-label="Close"
 							className="rounded-lg p-1.5 text-subtle transition hover:bg-surface-3 hover:text-text"
 							onClick={onClose}
+							type="button"
 						>
 							<X className="h-4.5 w-4.5" />
 						</button>
@@ -224,36 +211,6 @@ export function EmptyState({
 				{description && <p className="mx-auto mt-1 max-w-sm text-sm text-muted">{description}</p>}
 			</div>
 			{action}
-		</div>
-	)
-}
-
-// ----------------------------------------------------------------- Segmented
-export function Segmented<T extends string>({
-	value,
-	onChange,
-	options,
-	className
-}: {
-	value: T
-	onChange: (v: T) => void
-	options: { value: T; label: ReactNode }[]
-	className?: string
-}) {
-	return (
-		<div className={cn("inline-flex rounded-xl bg-surface-2 p-1", className)}>
-			{options.map((opt) => (
-				<button
-					className={cn(
-						"no-drag rounded-lg px-3 py-1.5 text-xs font-semibold transition",
-						value === opt.value ? "bg-surface text-text shadow-sm" : "text-muted hover:text-text"
-					)}
-					key={opt.value}
-					onClick={() => onChange(opt.value)}
-				>
-					{opt.label}
-				</button>
-			))}
 		</div>
 	)
 }

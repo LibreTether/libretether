@@ -10,11 +10,21 @@ export function ControlOverlay({ client, onClose }: { client: ClientDto; onClose
 	const surfaceRef = useRef<HTMLDivElement>(null)
 	const [meta, setMeta] = useState<SessionMeta | null>(null)
 	const [error, setError] = useState<string | null>(null)
-	const [frames, setFrames] = useState(0)
+	// Count frames in a ref and surface it ~1 Hz, so a 20 fps stream doesn't
+	// re-render the whole overlay on every frame (the <img> is updated imperatively).
+	const framesRef = useRef(0)
+	const [frameCount, setFrameCount] = useState(0)
 
 	// Coalesce pointer moves to one send per animation frame.
 	const pendingMove = useRef<{ x: number; y: number } | null>(null)
 	const rafScheduled = useRef(false)
+
+	// What the controller currently holds down. Tracked so we can release a key or
+	// mouse button that's still pressed when control ends (overlay close, the host
+	// window losing focus, a pointer-up that lands outside the image) — otherwise a
+	// held Ctrl/Shift or mouse button stays stuck *down* on the remote machine.
+	const pressedKeys = useRef<Set<string>>(new Set())
+	const pressedButtons = useRef<Set<MouseButton>>(new Set())
 
 	const send = useCallback(
 		(event: InputEvent) => {
@@ -25,6 +35,14 @@ export function ControlOverlay({ client, onClose }: { client: ClientDto; onClose
 		[client.id]
 	)
 
+	// Release everything currently held, then forget it. Safe to call repeatedly.
+	const releaseAll = useCallback(() => {
+		for (const code of pressedKeys.current) send({ code, pressed: false, t: "key" })
+		pressedKeys.current.clear()
+		for (const button of pressedButtons.current) send({ button, pressed: false, t: "mouse_button" })
+		pressedButtons.current.clear()
+	}, [send])
+
 	// Subscribe to session events, then start the session.
 	useEffect(() => {
 		let alive = true
@@ -32,8 +50,8 @@ export function ControlOverlay({ client, onClose }: { client: ClientDto; onClose
 			api.onSessionMeta(client.id, (m) => alive && setMeta(m)),
 			api.onSessionFrame(client.id, (f) => {
 				if (!alive || !imgRef.current) return
-				imgRef.current.src = `data:image/jpeg;base64,${f.data_base64}`
-				setFrames((n) => n + 1)
+				imgRef.current.src = `data:image/${f.encoding};base64,${f.data_base64}`
+				framesRef.current += 1
 			}),
 			api.onSessionError(client.id, (msg) => alive && setError(msg)),
 			api.onSessionClosed(client.id, () => alive && setError((prev) => prev ?? "The session ended."))
@@ -53,17 +71,77 @@ export function ControlOverlay({ client, onClose }: { client: ClientDto; onClose
 		return () => {
 			alive = false
 			clearTimeout(startTimer)
+			// Flush any held keys/buttons *before* tearing the session down so the
+			// releases still reach the agent (the agent also releases on stop as a
+			// backstop, but this covers both backends and is immediate).
+			releaseAll()
 			api.stopControl(client.id).catch(() => {})
 			for (const u of unlisteners) u.then((fn) => fn())
 		}
-	}, [client.id])
+	}, [client.id, releaseAll])
+
+	// Refresh the frame counter ~1 Hz from the ref (see above).
+	useEffect(() => {
+		const t = window.setInterval(() => setFrameCount(framesRef.current), 1000)
+		return () => window.clearInterval(t)
+	}, [])
+
+	// Keyboard is handled at the window level (not on the focused surface) so that
+	// control doesn't silently die the moment focus moves to the header, a button,
+	// or a toast. Escape closes the overlay; everything else is forwarded.
+	useEffect(() => {
+		const onKeyDown = (e: KeyboardEvent) => {
+			if (e.key === "Escape") {
+				onClose()
+				return
+			}
+			e.preventDefault()
+			pressedKeys.current.add(e.code)
+			send({ code: e.code, pressed: true, t: "key" })
+		}
+		const onKeyUp = (e: KeyboardEvent) => {
+			if (e.key === "Escape") return
+			e.preventDefault()
+			pressedKeys.current.delete(e.code)
+			send({ code: e.code, pressed: false, t: "key" })
+		}
+		// The host window losing focus (alt-tab) means we'll never see the keyup, so
+		// release now rather than strand a modifier on the remote.
+		const onBlur = () => releaseAll()
+		window.addEventListener("keydown", onKeyDown)
+		window.addEventListener("keyup", onKeyUp)
+		window.addEventListener("blur", onBlur)
+		return () => {
+			window.removeEventListener("keydown", onKeyDown)
+			window.removeEventListener("keyup", onKeyUp)
+			window.removeEventListener("blur", onBlur)
+		}
+	}, [send, releaseAll, onClose])
+
+	// Forward wheel scroll to the agent and stop it from scrolling/zooming the
+	// host webview. React's synthetic `onWheel` is passive (preventDefault is a
+	// no-op there), so attach a non-passive native listener.
+	useEffect(() => {
+		const el = surfaceRef.current
+		if (!el) return
+		const onWheelNative = (e: WheelEvent) => {
+			e.preventDefault()
+			const dy = Math.round(e.deltaY / 100) || Math.sign(e.deltaY)
+			const dx = Math.round(e.deltaX / 100) || Math.sign(e.deltaX)
+			if (dx || dy) send({ dx, dy, t: "mouse_scroll" })
+		}
+		el.addEventListener("wheel", onWheelNative, { passive: false })
+		return () => el.removeEventListener("wheel", onWheelNative)
+	}, [send])
 
 	const norm = (e: React.PointerEvent | React.MouseEvent): { x: number; y: number } | null => {
 		const el = imgRef.current
 		if (!el) return null
 		const r = el.getBoundingClientRect()
 		if (r.width === 0 || r.height === 0) return null
-		return { x: (e.clientX - r.left) / r.width, y: (e.clientY - r.top) / r.height }
+		// Clamp to [0,1]: a fast drag at the edge can land a pixel outside the image.
+		const clamp = (v: number) => Math.min(1, Math.max(0, v))
+		return { x: clamp((e.clientX - r.left) / r.width), y: clamp((e.clientY - r.top) / r.height) }
 	}
 
 	const onMove = (e: React.PointerEvent) => {
@@ -79,28 +157,41 @@ export function ControlOverlay({ client, onClose }: { client: ClientDto; onClose
 		}
 	}
 
-	const onButton = (e: React.PointerEvent, pressed: boolean) => {
+	const onPointerDown = (e: React.PointerEvent) => {
+		const button = BUTTONS[e.button]
+		if (!button) return
+		// Capture the pointer so the matching pointerup still fires even if the user
+		// drags off the image before releasing — otherwise the remote button sticks.
+		e.currentTarget.setPointerCapture(e.pointerId)
+		const p = norm(e)
+		if (p) send({ t: "mouse_move", x: p.x, y: p.y })
+		pressedButtons.current.add(button)
+		send({ button, pressed: true, t: "mouse_button" })
+	}
+
+	const onPointerUp = (e: React.PointerEvent) => {
 		const button = BUTTONS[e.button]
 		if (!button) return
 		const p = norm(e)
 		if (p) send({ t: "mouse_move", x: p.x, y: p.y })
-		send({ button, pressed, t: "mouse_button" })
+		pressedButtons.current.delete(button)
+		send({ button, pressed: false, t: "mouse_button" })
 	}
 
-	const onWheel = (e: React.WheelEvent) => {
-		const dy = Math.round(e.deltaY / 100) || Math.sign(e.deltaY)
-		const dx = Math.round(e.deltaX / 100) || Math.sign(e.deltaX)
-		if (dx || dy) send({ dx, dy, t: "mouse_scroll" })
+	// The gesture was cancelled (e.g. the OS took over) — release whatever's down.
+	const onPointerCancel = () => {
+		for (const button of pressedButtons.current) send({ button, pressed: false, t: "mouse_button" })
+		pressedButtons.current.clear()
 	}
 
-	const onKey = (e: React.KeyboardEvent, pressed: boolean) => {
-		// Let the overlay's own Escape-to-close work without forwarding it.
-		if (e.key === "Escape") {
-			if (pressed) onClose()
-			return
+	// Paste / IME-committed text: physical `code` events can't represent these, so
+	// forward the committed string through the protocol's text channel.
+	const onPaste = (e: React.ClipboardEvent) => {
+		const text = e.clipboardData.getData("text")
+		if (text) {
+			e.preventDefault()
+			send({ t: "text", text })
 		}
-		e.preventDefault()
-		send({ code: e.code, pressed, t: "key" })
 	}
 
 	return (
@@ -110,14 +201,15 @@ export function ControlOverlay({ client, onClose }: { client: ClientDto; onClose
 				<span className="font-semibold">{client.name}</span>
 				<span className="text-xs text-white/50">
 					{meta ? `${meta.width}×${meta.height}` : "connecting…"}
-					{frames > 0 && ` · ${frames} frames`}
+					{frameCount > 0 && ` · ${frameCount} frames`}
 				</span>
 				<span className="ml-auto flex items-center gap-1.5 text-xs text-white/50">
-					<Keyboard className="h-3.5 w-3.5" /> click the screen, then type to control
+					<Keyboard className="h-3.5 w-3.5" /> type to control · Esc to exit
 				</span>
 				<button
 					className="ml-2 flex items-center gap-1.5 rounded-lg bg-danger/90 px-3 py-1.5 text-xs font-semibold text-white transition hover:bg-danger"
 					onClick={onClose}
+					type="button"
 				>
 					<Power className="h-3.5 w-3.5" /> Disconnect
 				</button>
@@ -135,6 +227,7 @@ export function ControlOverlay({ client, onClose }: { client: ClientDto; onClose
 						<button
 							className="rounded-lg bg-primary px-4 py-2 text-sm font-semibold text-white"
 							onClick={onClose}
+							type="button"
 						>
 							Close
 						</button>
@@ -142,8 +235,7 @@ export function ControlOverlay({ client, onClose }: { client: ClientDto; onClose
 				)}
 				<div
 					className="flex h-full w-full items-center justify-center outline-none"
-					onKeyDown={(e) => onKey(e, true)}
-					onKeyUp={(e) => onKey(e, false)}
+					onPaste={onPaste}
 					ref={surfaceRef}
 					tabIndex={0}
 				>
@@ -152,13 +244,13 @@ export function ControlOverlay({ client, onClose }: { client: ClientDto; onClose
 						className="max-h-full max-w-full select-none"
 						draggable={false}
 						onContextMenu={(e) => e.preventDefault()}
+						onPointerCancel={onPointerCancel}
 						onPointerDown={(e) => {
 							surfaceRef.current?.focus()
-							onButton(e, true)
+							onPointerDown(e)
 						}}
 						onPointerMove={onMove}
-						onPointerUp={(e) => onButton(e, false)}
-						onWheel={onWheel}
+						onPointerUp={onPointerUp}
 						ref={imgRef}
 						style={{ imageRendering: "auto" }}
 					/>

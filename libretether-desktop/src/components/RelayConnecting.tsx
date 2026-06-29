@@ -18,15 +18,22 @@ export function RelayConnecting({
 }) {
 	const [logs, setLogs] = useState<string[]>([])
 	const logRef = useRef<HTMLDivElement>(null)
+	// Set synchronously by Cancel, before its async teardown unmounts us, so the
+	// `connected` handler below can't navigate into a controller we just tore down.
+	const cancelled = useRef(false)
 
 	useEffect(() => {
 		let alive = true
 		const unlisteners = [
 			api.onControllerLog((line) => alive && setLogs((prev) => [...prev, line])),
 			api.onControllerConnected(async () => {
-				if (!alive) return
-				const info = await api.activeController()
-				if (alive && info) onConnected(info)
+				if (!alive || cancelled.current) return
+				try {
+					const info = await api.activeController()
+					if (alive && !cancelled.current && info) onConnected(info)
+				} catch (e) {
+					if (alive) setLogs((prev) => [...prev, `error: ${api.errString(e)}`])
+				}
 			})
 		]
 		// Start serving — this kicks off the relay dial; progress arrives as events.
@@ -44,6 +51,7 @@ export function RelayConnecting({
 	}, [logs])
 
 	const cancel = async () => {
+		cancelled.current = true
 		try {
 			await api.exitController()
 		} catch {
