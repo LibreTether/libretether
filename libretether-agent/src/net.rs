@@ -6,10 +6,11 @@ use std::fs::OpenOptions;
 use std::io::Write;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
+use libretether_protocol::crypto::Identity;
 use libretether_protocol::frame::{read_frame, write_frame};
 use libretether_protocol::relay::{RelayAck, RelayHello, RelayRole};
 use libretether_protocol::{tls, Challenge, ControlRequest, Hello, HelloAck, StreamOpen, PROTOCOL_VERSION};
@@ -213,14 +214,18 @@ async fn serve(conn: quinn::Connection, cfg: &mut AgentConfig, cfg_path: &PathBu
 	}
 	let _ = send.finish();
 
-	// Serve control + session streams until the connection ends.
+	// Serve control + session streams until the connection ends. In relay mode
+	// this connection is to the relay and outlives any single controller, so a
+	// reconnecting controller opens a fresh handshake stream here — hand the
+	// identity to each stream so it can re-authenticate (see `reauth`).
+	let identity = Arc::new(identity);
 	loop {
 		let (send, recv) = conn.accept_bi().await.map_err(|e| anyhow!("connection ended: {e}"))?;
-		tokio::spawn(handle_stream(send, recv));
+		tokio::spawn(handle_stream(send, recv, identity.clone()));
 	}
 }
 
-async fn handle_stream(mut send: SendStream, mut recv: RecvStream) {
+async fn handle_stream(mut send: SendStream, mut recv: RecvStream, identity: Arc<Identity>) {
 	let open = match read_frame::<_, StreamOpen>(&mut recv).await {
 		Ok(o) => o,
 		Err(_) => return,
@@ -241,8 +246,43 @@ async fn handle_stream(mut send: SendStream, mut recv: RecvStream) {
 			}
 		}
 		StreamOpen::Tunnel { port } => tunnel(port, send, recv).await,
-		StreamOpen::Handshake => log("unexpected handshake stream after auth"),
+		StreamOpen::Handshake => reauth(send, recv, &identity).await,
 	}
+}
+
+/// Answer a fresh handshake on an already-serving connection. The relay keeps the
+/// agent connected across controller restarts/reconnects, so a returning
+/// controller re-enrolls by opening a new handshake stream; the one-time token is
+/// long spent, so we identify purely by key. Without this the agent would reject
+/// the stream and stay unreachable until its own process restarted.
+async fn reauth(mut send: SendStream, mut recv: RecvStream, identity: &Identity) {
+	let challenge: Challenge = match read_frame(&mut recv).await {
+		Ok(c) => c,
+		Err(_) => return,
+	};
+	let hello = Hello {
+		protocol: PROTOCOL_VERSION,
+		enrollment_token: None,
+		public_key: identity.public_b64(),
+		signature: identity.sign_b64(challenge.nonce.as_bytes()),
+		host: host::host_info(),
+		agent_version: AGENT_VERSION.to_string(),
+	};
+	if write_frame(&mut send, &hello).await.is_err() {
+		return;
+	}
+	match read_frame::<_, HelloAck>(&mut recv).await {
+		Ok(ack) if ack.accepted => log(&format!(
+			"re-authenticated as client {}",
+			ack.client_id.unwrap_or_default()
+		)),
+		Ok(ack) => log(&format!(
+			"controller rejected re-auth: {}",
+			ack.reason.unwrap_or_default()
+		)),
+		Err(_) => {}
+	}
+	let _ = send.finish();
 }
 
 /// Pipe a QUIC stream to a local TCP port (the client's RDP/SSH server) — used

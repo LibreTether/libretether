@@ -64,6 +64,7 @@ export function Combobox({
 	searchPlaceholder = "Search…",
 	emptyText = "No options",
 	noMatchText = "No matches",
+	loadingText = "Loading…",
 	disabled,
 	loading,
 	className
@@ -75,6 +76,7 @@ export function Combobox({
 	searchPlaceholder?: string
 	emptyText?: string
 	noMatchText?: string
+	loadingText?: string
 	disabled?: boolean
 	loading?: boolean
 	className?: string
@@ -161,7 +163,7 @@ export function Combobox({
 					<span className="flex shrink-0 items-center">{selected.icon}</span>
 				)}
 				<span className="min-w-0 flex-1 truncate text-left">
-					{loading ? "Applying…" : empty ? emptyText : (selectedLabel ?? placeholder)}
+					{loading ? loadingText : empty ? emptyText : (selectedLabel ?? placeholder)}
 				</span>
 				<ChevronsUpDown className="h-4 w-4 shrink-0 text-subtle" />
 			</button>

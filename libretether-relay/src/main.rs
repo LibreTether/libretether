@@ -9,6 +9,7 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
@@ -75,10 +76,17 @@ fn load_or_create(path: &PathBuf) -> Result<ServerConfig> {
 
 // ---------------------------------------------------------------- relay state
 
+/// Hands out a unique generation to each controller session so a stale session's
+/// teardown can't clear a newer session's event sender (see `serve_controller`).
+static CONTROLLER_GEN: AtomicU64 = AtomicU64::new(0);
+
+/// The single connected controller's event sender, tagged with its generation.
+type ControllerSlot = Arc<Mutex<Option<(u64, UnboundedSender<RelayEvent>)>>>;
+
 #[derive(Clone, Default)]
 struct Relay {
 	agents: Arc<Mutex<HashMap<String, quinn::Connection>>>,
-	controller: Arc<Mutex<Option<UnboundedSender<RelayEvent>>>>,
+	controller: ControllerSlot,
 }
 
 impl Relay {
@@ -87,7 +95,7 @@ impl Relay {
 	}
 
 	fn notify(&self, event: RelayEvent) {
-		if let Some(tx) = self.controller.lock().unwrap().as_ref() {
+		if let Some((_, tx)) = self.controller.lock().unwrap().as_ref() {
 			let _ = tx.send(event);
 		}
 	}
@@ -240,6 +248,7 @@ async fn handle(relay: Relay, incoming: quinn::Incoming, secrets: &(String, Stri
 /// The controller pushes presence events out on `events`, and opens one routed
 /// bi stream per request which we pipe to the addressed agent.
 async fn serve_controller(relay: Relay, conn: quinn::Connection, mut events: SendStream) -> Result<()> {
+	let generation = CONTROLLER_GEN.fetch_add(1, Ordering::Relaxed);
 	let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<RelayEvent>();
 
 	// Announce agents that are already connected, then install the sender.
@@ -251,7 +260,7 @@ async fn serve_controller(relay: Relay, conn: quinn::Connection, mut events: Sen
 			});
 		}
 	}
-	*relay.controller.lock().unwrap() = Some(tx);
+	*relay.controller.lock().unwrap() = Some((generation, tx));
 
 	// Forward presence events to the controller.
 	let events_task = tokio::spawn(async move {
@@ -282,7 +291,15 @@ async fn serve_controller(relay: Relay, conn: quinn::Connection, mut events: Sen
 		});
 	}
 
-	relay.controller.lock().unwrap().take();
+	// Only relinquish the slot if it's still ours: a reconnecting controller may
+	// have already installed a newer sender, and clearing that would kill its
+	// event stream and bounce it into an endless reconnect loop.
+	{
+		let mut slot = relay.controller.lock().unwrap();
+		if slot.as_ref().map(|(g, _)| *g) == Some(generation) {
+			slot.take();
+		}
+	}
 	events_task.abort();
 	Ok(())
 }
