@@ -185,16 +185,11 @@ run agent:build     # -> target/release/libretether-agent
 ### Enrolling a machine
 
 1. In the controller, open **Machines → Add machine**, name it and pick its OS.
-2. Copy or save the generated deploy script and run it on the target machine:
-
-   ```bash
-   # On the client machine:
-   bash libretether-deploy-<name>.sh
-   ```
-
-   It downloads the matching agent for that machine's OS/arch from the latest release. To
-   use a local build or a specific asset instead, set `LIBRETETHER_AGENT_BIN=/path/to/binary`
-   or `LIBRETETHER_AGENT_URL=https://...` before running it.
+2. Copy the generated command and run it on the target machine. It's a one-liner that runs
+   the published installer (below) with this machine's token and address already filled in —
+   the controller just supplies the arguments; the install logic lives only in the release
+   installer. To use a local build or a specific asset, prefix it with
+   `LIBRETETHER_AGENT_BIN=/path/to/binary` or `LIBRETETHER_AGENT_URL=https://...`.
 
 3. The script joins the machine to Tailscale, installs the agent, enrols it, and starts
    the background service. It shows up as **online** in the controller within seconds.
