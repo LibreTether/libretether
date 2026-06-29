@@ -5,10 +5,12 @@
 
 use std::process::Command;
 
-use crate::error::{AppError, AppResult};
+use crate::error::AppResult;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use crate::launch::percent_encode;
-use crate::launch::{spawn, split_template};
+use crate::launch::spawn;
+#[cfg(target_os = "linux")]
+use crate::{error::AppError, launch::split_template};
 
 /// Launch an RDP viewer connecting to `host:port`. `pref` is the controller's
 /// preferred client ("auto"/"freerdp"/"remmina"/"gnome-connections" or a custom

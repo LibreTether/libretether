@@ -10,6 +10,10 @@ use crate::error::{AppError, AppResult};
 /// Split an operator-entered launcher template into `(program, remaining args)`.
 /// The program is the first whitespace-delimited token; the rest are arguments.
 /// Errors if the template is blank.
+///
+/// Linux-only: only the Linux launchers accept a custom command template (macOS
+/// and Windows use fixed system clients).
+#[cfg(target_os = "linux")]
 pub fn split_template(template: &str) -> AppResult<(&str, std::str::SplitWhitespace<'_>)> {
 	let mut tokens = template.split_whitespace();
 	let bin = tokens.next().ok_or_else(|| AppError::msg("empty launcher command"))?;
@@ -28,6 +32,10 @@ pub fn spawn(mut cmd: Command, label: &str) -> AppResult<()> {
 /// or password embedded in an `rdp://` URL can't alter the URL's structure (a `@`,
 /// `:`, `/`, `?`, `#`, `\` or space would otherwise be parsed as a delimiter), no
 /// longer relying on the upstream char allowlist alone to keep the URL well-formed.
+///
+/// Linux/macOS-only: those platforms launch RDP via an `rdp://` URL; Windows uses
+/// `mstsc`/`cmdkey` arguments instead, so no URL encoding is needed there.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub fn percent_encode(s: &str) -> String {
 	let mut out = String::with_capacity(s.len());
 	for &b in s.as_bytes() {
@@ -43,6 +51,7 @@ pub fn percent_encode(s: &str) -> String {
 mod tests {
 	use super::*;
 
+	#[cfg(any(target_os = "linux", target_os = "macos"))]
 	#[test]
 	fn percent_encode_passes_unreserved_and_escapes_the_rest() {
 		assert_eq!(percent_encode("Abc-123_.~"), "Abc-123_.~");
@@ -53,6 +62,7 @@ mod tests {
 		assert_eq!(percent_encode("a&b?c#d"), "a%26b%3Fc%23d");
 	}
 
+	#[cfg(target_os = "linux")]
 	#[test]
 	fn split_template_separates_program_from_args() {
 		let (bin, rest) = split_template("gnome-terminal -- --x").unwrap();
