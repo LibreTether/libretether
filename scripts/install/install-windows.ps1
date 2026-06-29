@@ -23,6 +23,24 @@ $ErrorActionPreference = "Stop"
 # The release workflow rewrites this to the exact repo + tag it publishes from.
 $ReleaseBase = "https://github.com/LibreTether/libretether/releases/latest/download"
 
+# Verify a downloaded file against its published <url>.sha256 sidecar. A custom
+# -AgentUrl may have no sidecar; in that case we warn and continue.
+function Test-Checksum {
+	param([string]$Url, [string]$File)
+	try {
+		$expected = ((Invoke-WebRequest -Uri "$Url.sha256" -UseBasicParsing).Content).Trim()
+	} catch {
+		Write-Host "==> No published checksum for $Url — skipping integrity check."
+		return
+	}
+	$actual = (Get-FileHash -Algorithm SHA256 -Path $File).Hash
+	if ($expected.ToLower() -ne $actual.ToLower()) {
+		Remove-Item $File -ErrorAction SilentlyContinue
+		throw "Checksum mismatch for the downloaded agent (expected $expected, got $actual)."
+	}
+	Write-Host "==> Verified agent checksum."
+}
+
 if ($Relay -and $Controller) { throw "Use -Relay or -Controller, not both." }
 if ($Relay) {
 	if (-not $RelaySecret) { throw "-Relay requires -RelaySecret." }
@@ -51,6 +69,7 @@ if ($env:LIBRETETHER_AGENT_BIN) {
 	$Url = if ($AgentUrl) { $AgentUrl } elseif ($env:LIBRETETHER_AGENT_URL) { $env:LIBRETETHER_AGENT_URL } else { "$ReleaseBase/libretether-agent-windows-x86_64.exe" }
 	Write-Host "==> Downloading agent from $Url"
 	Invoke-WebRequest -Uri $Url -OutFile $Bin
+	Test-Checksum -Url $Url -File $Bin
 }
 
 # Run an agent subcommand and fail loudly. The agent is a GUI-subsystem binary

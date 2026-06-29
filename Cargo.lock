@@ -2361,6 +2361,7 @@ dependencies = [
  "base64 0.22.1",
  "dirs",
  "gtk",
+ "libretether-common",
  "libretether-protocol",
  "quinn",
  "serde",
@@ -2388,6 +2389,7 @@ dependencies = [
  "dirs",
  "enigo",
  "image",
+ "libretether-common",
  "libretether-protocol",
  "libspa",
  "pipewire",
@@ -2397,6 +2399,13 @@ dependencies = [
  "tokio",
  "whoami",
  "xcap",
+]
+
+[[package]]
+name = "libretether-common"
+version = "0.1.0"
+dependencies = [
+ "tokio",
 ]
 
 [[package]]
@@ -2424,6 +2433,7 @@ dependencies = [
  "base64 0.22.1",
  "clap",
  "dirs",
+ "libretether-common",
  "libretether-protocol",
  "quinn",
  "serde",

@@ -164,6 +164,9 @@ pub struct Settings {
 pub struct LiveConn {
 	pub link: AgentLink,
 	pub status: Option<AgentStatus>,
+	/// Per-registration generation, so a stale connection's teardown can't evict
+	/// a newer one that reconnected under the same client id (see `server::cleanup`).
+	pub generation: u64,
 }
 
 /// A running screen-control session.
@@ -173,12 +176,22 @@ pub struct SessionHandle {
 	pub token: u64,
 }
 
+/// A loopback tunnel forwarding to a client's RDP/SSH port through the relay.
+/// Kept so it can be reused (instead of leaking a new listener per connect) and
+/// torn down when the client is removed or the controller exits.
+pub struct TunnelHandle {
+	pub local_port: u16,
+	pub task: tauri::async_runtime::JoinHandle<()>,
+}
+
 /// The single controller that is currently running.
 pub struct ActiveController {
 	pub profile: ControllerProfile,
 	pub store: Mutex<ClientStore>,
 	pub live: Mutex<HashMap<Uuid, LiveConn>>,
 	pub sessions: Mutex<HashMap<Uuid, SessionHandle>>,
+	/// Active loopback tunnels keyed by `(client, remote_port)`.
+	pub tunnels: Mutex<HashMap<(Uuid, u16), TunnelHandle>>,
 }
 
 impl ActiveController {
@@ -338,6 +351,7 @@ impl AppState {
 			store: Mutex::new(store),
 			live: Mutex::new(HashMap::new()),
 			sessions: Mutex::new(HashMap::new()),
+			tunnels: Mutex::new(HashMap::new()),
 		});
 
 		let state = self.clone();
@@ -371,6 +385,9 @@ impl AppState {
 			handle.serve_task.abort();
 			for (_, session) in handle.controller.sessions.lock().unwrap().drain() {
 				session.task.abort();
+			}
+			for (_, tunnel) in handle.controller.tunnels.lock().unwrap().drain() {
+				tunnel.task.abort();
 			}
 			handle.controller.live.lock().unwrap().clear();
 		}

@@ -79,7 +79,10 @@ fn inject(enigo: &mut Enigo, ev: InputEvent, w: u32, h: u32) -> Result<(), enigo
 		}
 		InputEvent::Key { code, pressed } => {
 			let dir = if pressed { Direction::Press } else { Direction::Release };
-			enigo.key(map_key(&code), dir)
+			match map_key(&code) {
+				Some(key) => enigo.key(key, dir),
+				None => Ok(()),
+			}
 		}
 		InputEvent::Text { text } => enigo.text(&text),
 	}
@@ -93,30 +96,32 @@ fn map_button(b: MouseButton) -> Button {
 	}
 }
 
-/// Map a W3C `KeyboardEvent.code` to an `enigo::Key`.
-fn map_key(code: &str) -> Key {
+/// Map a W3C `KeyboardEvent.code` to an `enigo::Key`. Returns `None` for codes we
+/// don't recognise so the caller skips them — injecting a fallback character
+/// (previously a space) for any unmapped key was worse than doing nothing.
+fn map_key(code: &str) -> Option<Key> {
 	// Letters: "KeyA".."KeyZ".
 	if let Some(letter) = code.strip_prefix("Key") {
 		if letter.len() == 1 {
 			if let Some(c) = letter.chars().next() {
-				return Key::Unicode(c.to_ascii_lowercase());
+				return Some(Key::Unicode(c.to_ascii_lowercase()));
 			}
 		}
 	}
 	// Digits: "Digit0".."Digit9".
 	if let Some(d) = code.strip_prefix("Digit") {
 		if let Some(c) = d.chars().next() {
-			return Key::Unicode(c);
+			return Some(Key::Unicode(c));
 		}
 	}
 	// Function keys: "F1".."F12".
 	if let Some(n) = code.strip_prefix('F') {
 		if let Ok(num) = n.parse::<u8>() {
-			return func_key(num);
+			return Some(func_key(num));
 		}
 	}
 
-	match code {
+	let key = match code {
 		"Enter" | "NumpadEnter" => Key::Return,
 		"Tab" => Key::Tab,
 		"Space" => Key::Space,
@@ -147,8 +152,9 @@ fn map_key(code: &str) -> Key {
 		"Period" => Key::Unicode('.'),
 		"Slash" => Key::Unicode('/'),
 		"Backquote" => Key::Unicode('`'),
-		_ => Key::Unicode(' '),
-	}
+		_ => return None,
+	};
+	Some(key)
 }
 
 fn func_key(n: u8) -> Key {

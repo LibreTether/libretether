@@ -8,7 +8,7 @@ use std::io::Write;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
 use libretether_protocol::crypto::{self, Identity};
@@ -33,6 +33,9 @@ const AGENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 const RECONNECT_MAX_SECS: u64 = 5;
 /// How long a single dial attempt may hang before we give up and retry.
 const CONNECT_TIMEOUT_SECS: u64 = 8;
+/// A connection that stayed up at least this long counts as a healthy session,
+/// so the next drop retries promptly rather than inheriting a grown backoff.
+const RECONNECT_STABLE_SECS: u64 = 30;
 
 static LOG_FILE: OnceLock<Mutex<std::fs::File>> = OnceLock::new();
 
@@ -75,7 +78,7 @@ pub async fn run(cfg_path: PathBuf) -> Result<()> {
 
 	tokio::select! {
 		_ = connect_loop(&mut cfg, &cfg_path) => {}
-		_ = shutdown_signal() => log("shutdown signal received; exiting"),
+		_ = libretether_common::shutdown_signal() => log("shutdown signal received; exiting"),
 	}
 	Ok(())
 }
@@ -84,12 +87,15 @@ pub async fn run(cfg_path: PathBuf) -> Result<()> {
 async fn connect_loop(cfg: &mut AgentConfig, cfg_path: &PathBuf) {
 	let mut backoff = 1u64;
 	loop {
-		match connect_once(cfg, cfg_path).await {
-			Ok(()) => {
-				log("controller connection closed");
-				backoff = 1;
-			}
-			Err(e) => log(&format!("connection error: {e:#}")),
+		// `connect_once` only returns once the link is gone (serve loops until the
+		// connection ends), so time how long it lasted: a long, healthy session
+		// resets the backoff; a fast failure keeps growing it.
+		let started = Instant::now();
+		if let Err(e) = connect_once(cfg, cfg_path).await {
+			log(&format!("connection error: {e:#}"));
+		}
+		if started.elapsed() >= Duration::from_secs(RECONNECT_STABLE_SECS) {
+			backoff = 1;
 		}
 		let wait = backoff.min(RECONNECT_MAX_SECS);
 		log(&format!("reconnecting in {wait}s"));
@@ -98,46 +104,13 @@ async fn connect_loop(cfg: &mut AgentConfig, cfg_path: &PathBuf) {
 	}
 }
 
-/// Resolve on the first SIGINT/SIGTERM (Ctrl+C on Windows) so the agent shuts
-/// down cleanly instead of being force-killed.
-async fn shutdown_signal() {
-	#[cfg(unix)]
-	{
-		use tokio::signal::unix::{signal, SignalKind};
-		let mut term = signal(SignalKind::terminate()).expect("install SIGTERM handler");
-		let mut int = signal(SignalKind::interrupt()).expect("install SIGINT handler");
-		tokio::select! {
-			_ = term.recv() => {}
-			_ = int.recv() => {}
-		}
-	}
-	#[cfg(not(unix))]
-	{
-		let _ = tokio::signal::ctrl_c().await;
-	}
-}
-
-fn make_endpoint(target: SocketAddr) -> Result<Endpoint> {
-	// Bind the client socket to the target's address family: quinn rejects dialing
-	// an IPv6 peer from an IPv4 socket (and vice versa) with "invalid remote
-	// address", so an IPv6 relay/controller needs a [::] client, an IPv4 one 0.0.0.0.
-	let bind: SocketAddr = if target.is_ipv6() {
-		(std::net::Ipv6Addr::UNSPECIFIED, 0).into()
-	} else {
-		(std::net::Ipv4Addr::UNSPECIFIED, 0).into()
-	};
-	let mut endpoint = Endpoint::client(bind).context("binding client socket")?;
-	endpoint.set_default_client_config(tls::client_config());
-	Ok(endpoint)
-}
-
 async fn connect_once(cfg: &mut AgentConfig, cfg_path: &PathBuf) -> Result<()> {
 	// Resolve the peer first so the client endpoint can match its address family.
 	let (addr, is_relay) = match cfg.relay() {
-		Some(relay) => (resolve(relay).await?, true),
-		None => (resolve(&cfg.controller_addr).await?, false),
+		Some(relay) => (tls::resolve(relay).await?, true),
+		None => (tls::resolve(&cfg.controller_addr).await?, false),
 	};
-	let endpoint = make_endpoint(addr)?;
+	let endpoint = tls::client_endpoint(addr).context("binding client socket")?;
 	let conn = if is_relay {
 		log(&format!("dialing relay at {addr}"));
 		connect_relay(&endpoint, addr, cfg).await?
@@ -411,15 +384,4 @@ async fn tunnel(port: u16, mut q_send: SendStream, mut q_recv: RecvStream) {
 			let _ = q_send.finish();
 		}
 	}
-}
-
-async fn resolve(addr: &str) -> Result<SocketAddr> {
-	if let Ok(sa) = addr.parse::<SocketAddr>() {
-		return Ok(sa);
-	}
-	tokio::net::lookup_host(addr)
-		.await
-		.with_context(|| format!("resolving {addr}"))?
-		.next()
-		.ok_or_else(|| anyhow!("no address resolved for {addr}"))
 }

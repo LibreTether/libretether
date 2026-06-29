@@ -1,7 +1,6 @@
 //! Host facts the controller likes to show: identity, uptime, boot time.
 
-use std::time::{SystemTime, UNIX_EPOCH};
-
+pub use libretether_common::now_secs;
 use libretether_protocol::HostInfo;
 
 pub fn host_info() -> HostInfo {
@@ -40,14 +39,6 @@ pub fn tailscale_ip() -> Option<String> {
 		.next()
 		.map(|s| s.trim().to_string())
 		.filter(|s| !s.is_empty())
-}
-
-/// Current unix time in seconds.
-pub fn now_secs() -> u64 {
-	SystemTime::now()
-		.duration_since(UNIX_EPOCH)
-		.map(|d| d.as_secs())
-		.unwrap_or(0)
 }
 
 /// Best-effort machine boot time (unix seconds). Linux-only for now.

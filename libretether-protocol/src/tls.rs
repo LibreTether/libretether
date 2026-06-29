@@ -14,6 +14,7 @@
 //! relay) an attacker that cannot present the expected certificate-independent
 //! Ed25519 signatures is rejected. See `Challenge`/`Hello`/`HelloAck`.
 
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -74,6 +75,35 @@ pub fn client_config() -> quinn::ClientConfig {
 	let mut cfg = quinn::ClientConfig::new(Arc::new(qcc));
 	cfg.transport_config(Arc::new(transport()));
 	cfg
+}
+
+/// Build a QUIC client [`Endpoint`](quinn::Endpoint) for dialing `target`, bound
+/// to the target's address family.
+///
+/// quinn rejects dialing an IPv6 peer from an IPv4 socket (and vice versa) with
+/// "invalid remote address", so an IPv6 peer needs a `[::]` client and an IPv4
+/// peer a `0.0.0.0` one. Shared by the agent and the controller.
+pub fn client_endpoint(target: SocketAddr) -> std::io::Result<quinn::Endpoint> {
+	let bind: SocketAddr = if target.is_ipv6() {
+		(std::net::Ipv6Addr::UNSPECIFIED, 0).into()
+	} else {
+		(std::net::Ipv4Addr::UNSPECIFIED, 0).into()
+	};
+	let mut endpoint = quinn::Endpoint::client(bind)?;
+	endpoint.set_default_client_config(client_config());
+	Ok(endpoint)
+}
+
+/// Resolve `addr` (an `ip:port` literal or a `host:port` name) to a single socket
+/// address, preferring the literal parse and falling back to DNS.
+pub async fn resolve(addr: &str) -> std::io::Result<SocketAddr> {
+	if let Ok(sa) = addr.parse::<SocketAddr>() {
+		return Ok(sa);
+	}
+	tokio::net::lookup_host(addr)
+		.await?
+		.next()
+		.ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, format!("no address resolved for {addr}")))
 }
 
 mod danger {

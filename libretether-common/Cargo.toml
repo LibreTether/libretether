@@ -1,0 +1,12 @@
+[package]
+name = "libretether-common"
+version = "0.1.0"
+description = "Shared host-side utilities for LibreTether (time, shutdown signal, process helpers)"
+edition = "2021"
+license = "AGPL-3.0-only"
+
+[lib]
+name = "libretether_common"
+
+[dependencies]
+tokio = { version = "1", features = ["signal", "process"] }

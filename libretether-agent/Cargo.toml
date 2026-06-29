@@ -11,6 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 libretether-protocol = { path = "../libretether-protocol" }
+libretether-common = { path = "../libretether-common" }
 
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "time", "io-util", "net", "sync", "signal"] }
 quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring", "log"] }

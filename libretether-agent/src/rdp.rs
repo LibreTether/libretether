@@ -31,15 +31,10 @@ pub fn enable() -> Result<RdpInfo, String> {
 }
 
 #[cfg(target_os = "linux")]
-fn has(bin: &str) -> bool {
-	Command::new(bin).arg("--help").output().is_ok()
-}
-
-#[cfg(target_os = "linux")]
 fn enable_linux() -> Result<RdpInfo, String> {
 	use libretether_protocol::crypto::random_alnum;
 
-	if !has("grdctl") {
+	if !libretether_common::which("grdctl") {
 		return Err(
 			"gnome-remote-desktop (grdctl) not found — install it on the client, e.g. `apt install gnome-remote-desktop`."
 				.to_string(),

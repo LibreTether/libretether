@@ -7,15 +7,17 @@
 //! control RPCs, live session and TCP tunnels are all end-to-end.
 
 use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
 use clap::{Parser, Subcommand};
+use libretether_common::shutdown_signal;
 use libretether_protocol::crypto::{self, random_alnum};
 use libretether_protocol::frame::{read_frame_capped, write_frame, MAX_CONTROL_FRAME};
 use libretether_protocol::relay::{RelayAck, RelayChallenge, RelayEvent, RelayHello, RelayProof, RelayRole, RouteTo};
@@ -23,6 +25,17 @@ use libretether_protocol::{secret, tls, DEFAULT_PORT};
 use quinn::{Endpoint, RecvStream, SendStream};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::Semaphore;
+
+/// Hard ceiling on concurrent connections we'll service at once — beyond this we
+/// shed load rather than spawn unbounded tasks for a UDP-reachable public port.
+const MAX_CONNECTIONS: usize = 1024;
+/// How long a peer has to complete the auth handshake before we drop it, so a
+/// peer that connects and then stalls can't tie up a connection slot.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Per-source rate limit: at most this many new connections per IP per window.
+const RATE_LIMIT_PER_WINDOW: u32 = 60;
+const RATE_WINDOW: Duration = Duration::from_secs(10);
 
 #[derive(Serialize, Deserialize)]
 struct ServerConfig {
@@ -79,13 +92,22 @@ fn load_or_create(path: &PathBuf) -> Result<ServerConfig> {
 /// teardown can't clear a newer session's event sender (see `serve_controller`).
 static CONTROLLER_GEN: AtomicU64 = AtomicU64::new(0);
 
-/// The single connected controller's event sender, tagged with its generation.
-type ControllerSlot = Arc<Mutex<Option<(u64, UnboundedSender<RelayEvent>)>>>;
+/// The single connected controller's session, tagged with its generation. We
+/// keep its connection so a newer controller can tear the old one down.
+struct ControllerSession {
+	generation: u64,
+	events: UnboundedSender<RelayEvent>,
+	conn: quinn::Connection,
+}
+
+type ControllerSlot = Arc<Mutex<Option<ControllerSession>>>;
 
 #[derive(Clone, Default)]
 struct Relay {
 	agents: Arc<Mutex<HashMap<String, quinn::Connection>>>,
 	controller: ControllerSlot,
+	/// Per-source-IP fixed-window connection counters for rate limiting.
+	limiter: Arc<Mutex<HashMap<IpAddr, (u32, Instant)>>>,
 }
 
 impl Relay {
@@ -94,9 +116,26 @@ impl Relay {
 	}
 
 	fn notify(&self, event: RelayEvent) {
-		if let Some((_, tx)) = self.controller.lock().unwrap().as_ref() {
-			let _ = tx.send(event);
+		if let Some(session) = self.controller.lock().unwrap().as_ref() {
+			let _ = session.events.send(event);
 		}
+	}
+
+	/// Fixed-window per-IP rate check: returns false once a source exceeds
+	/// [`RATE_LIMIT_PER_WINDOW`] new connections within [`RATE_WINDOW`].
+	fn allow(&self, ip: IpAddr) -> bool {
+		let now = Instant::now();
+		let mut map = self.limiter.lock().unwrap();
+		// Opportunistically drop stale entries so the map can't grow unbounded.
+		if map.len() > 10_000 {
+			map.retain(|_, (_, t)| now.duration_since(*t) < RATE_WINDOW);
+		}
+		let entry = map.entry(ip).or_insert((0, now));
+		if now.duration_since(entry.1) >= RATE_WINDOW {
+			*entry = (0, now);
+		}
+		entry.0 += 1;
+		entry.0 <= RATE_LIMIT_PER_WINDOW
 	}
 }
 
@@ -161,14 +200,26 @@ async fn run(cfg: ServerConfig) -> Result<()> {
 
 	let relay = Relay::default();
 	let secrets = Arc::new((cfg.owner_secret, cfg.agent_secret));
+	let conn_limit = Arc::new(Semaphore::new(MAX_CONNECTIONS));
 
 	loop {
 		tokio::select! {
 			incoming = endpoint.accept() => {
 				let Some(incoming) = incoming else { break };
+				// Shed obvious abuse before doing any handshake work: rate-limit per
+				// source IP, then cap total concurrent connections.
+				if !relay.allow(incoming.remote_address().ip()) {
+					incoming.refuse();
+					continue;
+				}
+				let Ok(permit) = conn_limit.clone().try_acquire_owned() else {
+					incoming.refuse();
+					continue;
+				};
 				let relay = relay.clone();
 				let secrets = secrets.clone();
 				tokio::spawn(async move {
+					let _permit = permit; // released when the connection task ends
 					if let Err(e) = handle(relay, incoming, &secrets).await {
 						eprintln!("[libretether-relay] connection error: {e}");
 					}
@@ -186,31 +237,38 @@ async fn run(cfg: ServerConfig) -> Result<()> {
 	Ok(())
 }
 
-/// Resolve on the first SIGINT/SIGTERM (Ctrl+C on Windows) so `docker stop`
-/// ends the relay gracefully instead of timing out into a SIGKILL.
-async fn shutdown_signal() {
-	#[cfg(unix)]
-	{
-		use tokio::signal::unix::{signal, SignalKind};
-		let mut term = signal(SignalKind::terminate()).expect("install SIGTERM handler");
-		let mut int = signal(SignalKind::interrupt()).expect("install SIGINT handler");
-		tokio::select! {
-			_ = term.recv() => {}
-			_ = int.recv() => {}
-		}
-	}
-	#[cfg(not(unix))]
-	{
-		let _ = tokio::signal::ctrl_c().await;
+async fn handle(relay: Relay, incoming: quinn::Incoming, secrets: &(String, String)) -> Result<()> {
+	let conn = incoming.accept()?.await?;
+	// Bound the auth handshake so a peer that connects and stalls can't hold a
+	// connection slot indefinitely.
+	let authed = match tokio::time::timeout(HANDSHAKE_TIMEOUT, authenticate(&conn, secrets)).await {
+		Ok(Ok(Some(v))) => v,
+		Ok(Ok(None)) => return Ok(()), // cleanly rejected (bad secret / proof)
+		Ok(Err(e)) => return Err(e),   // I/O error during handshake
+		Err(_) => return Ok(()),       // handshake timed out
+	};
+
+	match authed.role {
+		RelayRole::Controller => serve_controller(relay, conn, authed.send).await,
+		RelayRole::Agent => serve_agent(relay, conn, authed.public_key).await,
 	}
 }
 
-async fn handle(relay: Relay, incoming: quinn::Incoming, secrets: &(String, String)) -> Result<()> {
-	let conn = incoming.accept()?.await?;
+/// A successfully-authenticated relay peer.
+struct Authed {
+	role: RelayRole,
+	/// The hello stream's send half — the controller keeps writing presence events on it.
+	send: SendStream,
+	public_key: String,
+}
+
+/// Validate a peer's secret and prove it holds the private key for the public key
+/// it presented. Returns `Some` on success, `None` if cleanly rejected.
+async fn authenticate(conn: &quinn::Connection, secrets: &(String, String)) -> Result<Option<Authed>> {
 	let (mut send, mut recv) = conn.accept_bi().await.context("accept hello stream")?;
 	let hello: RelayHello = read_frame_capped(&mut recv, MAX_CONTROL_FRAME).await?;
 
-	let (expected, role_ok) = match hello.role {
+	let (expected, role_label) = match hello.role {
 		RelayRole::Controller => (&secrets.0, "controller"),
 		RelayRole::Agent => (&secrets.1, "agent"),
 	};
@@ -225,7 +283,7 @@ async fn handle(relay: Relay, incoming: quinn::Incoming, secrets: &(String, Stri
 			},
 		)
 		.await;
-		return Ok(());
+		return Ok(None);
 	}
 
 	// Prove possession of the presented Ed25519 key before trusting it — in
@@ -243,7 +301,7 @@ async fn handle(relay: Relay, incoming: quinn::Incoming, secrets: &(String, Stri
 			},
 		)
 		.await;
-		return Ok(());
+		return Ok(None);
 	}
 
 	write_frame(
@@ -255,14 +313,15 @@ async fn handle(relay: Relay, incoming: quinn::Incoming, secrets: &(String, Stri
 	)
 	.await?;
 	eprintln!(
-		"[libretether-relay] {role_ok} connected ({}…)",
+		"[libretether-relay] {role_label} connected ({}…)",
 		&hello.public_key.chars().take(8).collect::<String>()
 	);
 
-	match hello.role {
-		RelayRole::Controller => serve_controller(relay, conn, send).await,
-		RelayRole::Agent => serve_agent(relay, conn, hello.public_key).await,
-	}
+	Ok(Some(Authed {
+		role: hello.role,
+		send,
+		public_key: hello.public_key,
+	}))
 }
 
 /// The controller pushes presence events out on `events`, and opens one routed
@@ -271,16 +330,29 @@ async fn serve_controller(relay: Relay, conn: quinn::Connection, mut events: Sen
 	let generation = CONTROLLER_GEN.fetch_add(1, Ordering::Relaxed);
 	let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<RelayEvent>();
 
-	// Announce agents that are already connected, then install the sender.
-	{
+	// Install our sender (and connection) and snapshot existing agents under one
+	// lock hold: doing it atomically means an agent that connects mid-attach is
+	// delivered via the sender rather than missed (presence race). Any previous
+	// controller is displaced and its connection closed, so a second owner can't
+	// leave a zombie routing loop running.
+	let previous = {
 		let agents = relay.agents.lock().unwrap();
+		let mut slot = relay.controller.lock().unwrap();
+		let previous = slot.replace(ControllerSession {
+			generation,
+			events: tx.clone(),
+			conn: conn.clone(),
+		});
 		for key in agents.keys() {
 			let _ = tx.send(RelayEvent::AgentOnline {
 				public_key: key.clone(),
 			});
 		}
+		previous
+	};
+	if let Some(prev) = previous {
+		prev.conn.close(0u32.into(), b"replaced by a newer controller");
 	}
-	*relay.controller.lock().unwrap() = Some((generation, tx));
 
 	// Forward presence events to the controller.
 	let events_task = tokio::spawn(async move {
@@ -316,7 +388,7 @@ async fn serve_controller(relay: Relay, conn: quinn::Connection, mut events: Sen
 	// event stream and bounce it into an endless reconnect loop.
 	{
 		let mut slot = relay.controller.lock().unwrap();
-		if slot.as_ref().map(|(g, _)| *g) == Some(generation) {
+		if slot.as_ref().map(|s| s.generation) == Some(generation) {
 			slot.take();
 		}
 	}
@@ -325,6 +397,7 @@ async fn serve_controller(relay: Relay, conn: quinn::Connection, mut events: Sen
 }
 
 async fn serve_agent(relay: Relay, conn: quinn::Connection, public_key: String) -> Result<()> {
+	let conn_id = conn.stable_id();
 	relay.agents.lock().unwrap().insert(public_key.clone(), conn.clone());
 	relay.notify(RelayEvent::AgentOnline {
 		public_key: public_key.clone(),
@@ -332,8 +405,16 @@ async fn serve_agent(relay: Relay, conn: quinn::Connection, public_key: String) 
 
 	conn.closed().await;
 
-	relay.agents.lock().unwrap().remove(&public_key);
-	relay.notify(RelayEvent::AgentOffline { public_key });
+	// Only deregister if we're still the registered connection for this key. A
+	// reconnect can replace us with a fresh connection before our `closed()`
+	// fires; removing then would wrongly mark a live agent offline (stale-cleanup
+	// race), and the agent would stay unreachable until its new connection drops.
+	let mut agents = relay.agents.lock().unwrap();
+	if agents.get(&public_key).map(|c| c.stable_id()) == Some(conn_id) {
+		agents.remove(&public_key);
+		drop(agents);
+		relay.notify(RelayEvent::AgentOffline { public_key });
+	}
 	Ok(())
 }
 

@@ -18,6 +18,24 @@ set -eu
 # so a versioned script always pulls the matching agent build.
 RELEASE_BASE="https://github.com/LibreTether/libretether/releases/latest/download"
 
+# Verify a downloaded file against its published <url>.sha256 sidecar. A custom
+# LIBRETETHER_AGENT_URL may have no sidecar; in that case we warn and continue.
+verify_checksum() {
+	url="$1"; file="$2"
+	expected="$(curl -fsSL "$url.sha256" 2>/dev/null | tr -d '[:space:]')" || true
+	if [ -z "$expected" ]; then
+		echo "==> No published checksum for $url — skipping integrity check." >&2
+		return 0
+	fi
+	actual="$(sha256sum "$file" | awk '{print $1}')"
+	if [ "$expected" != "$actual" ]; then
+		echo "!! Checksum mismatch for the downloaded agent (expected $expected, got $actual). Aborting." >&2
+		rm -f "$file"
+		exit 1
+	fi
+	echo "==> Verified agent checksum."
+}
+
 TOKEN=""
 CONTROLLER=""
 RELAY=""
@@ -99,6 +117,7 @@ else
 	fi
 	echo "==> Downloading agent from $URL"
 	curl -fsSL "$URL" -o "$BIN"
+	verify_checksum "$URL" "$BIN"
 	chmod +x "$BIN"
 fi
 

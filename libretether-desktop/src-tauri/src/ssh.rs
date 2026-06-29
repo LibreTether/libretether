@@ -59,7 +59,7 @@ fn launch_linux(pref: Option<&str>, ssh: &[String]) -> AppResult<()> {
 		("xterm", &["-e"]),
 	];
 	for (bin, prefix) in TERMINALS {
-		if which(bin) {
+		if libretether_common::which(bin) {
 			let mut cmd = Command::new(bin);
 			cmd.args(*prefix).args(ssh);
 			return cmd
@@ -71,15 +71,6 @@ fn launch_linux(pref: Option<&str>, ssh: &[String]) -> AppResult<()> {
 	Err(AppError::msg(
 		"No terminal emulator found — set a terminal command in Controller settings.",
 	))
-}
-
-#[cfg(target_os = "linux")]
-fn which(bin: &str) -> bool {
-	Command::new("which")
-		.arg(bin)
-		.output()
-		.map(|o| o.status.success())
-		.unwrap_or(false)
 }
 
 #[cfg(target_os = "macos")]

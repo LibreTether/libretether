@@ -5,6 +5,7 @@
 //! [`ActiveController`] passed in, so each controller is fully isolated.
 
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -29,6 +30,10 @@ pub const EVENT_RELAY_CONNECTED: &str = "controller:connected";
 /// How long the handshake may take before we drop a connecting peer, so one that
 /// connects and then stalls can't tie up a task indefinitely.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Per-registration generation source, so a stale connection's teardown only
+/// evicts its own live entry and not a newer reconnection's (see `cleanup`).
+static LIVE_GEN: AtomicU64 = AtomicU64::new(1);
 
 fn log(msg: &str) {
 	eprintln!("[libretether] {msg}");
@@ -83,9 +88,9 @@ async fn handle_direct(state: AppState, ctrl: Arc<ActiveController>, incoming: q
 		.map_err(|e| AppError::msg(format!("handshake: {e}")))?;
 
 	let link = AgentLink::direct(conn.clone());
-	if let Some(id) = enroll_and_register(&state, &ctrl, link).await? {
+	if let Some((id, generation)) = enroll_and_register(&state, &ctrl, link).await? {
 		conn.closed().await;
-		cleanup(&state, &ctrl, id);
+		cleanup(&state, &ctrl, id, Some(generation));
 		log(&format!("agent {id} disconnected"));
 	}
 	Ok(())
@@ -129,9 +134,11 @@ async fn relay_session(
 	owner_secret: &str,
 	pubkey: &str,
 ) -> AppResult<()> {
-	let addr = resolve(relay_addr).await?;
+	let addr = tls::resolve(relay_addr)
+		.await
+		.map_err(|e| AppError::msg(format!("resolving {relay_addr}: {e}")))?;
 	relay_log(state, &format!("dialing relay at {addr}"));
-	let endpoint = make_client_endpoint(addr)?;
+	let endpoint = tls::client_endpoint(addr).map_err(|e| AppError::msg(format!("bind client: {e}")))?;
 	let conn = endpoint
 		.connect(addr, "libretether.local")
 		.map_err(|e| AppError::msg(e.to_string()))?
@@ -185,43 +192,26 @@ async fn relay_session(
 			RelayEvent::AgentOffline { public_key } => {
 				let id = ctrl.store.lock().unwrap().id_for_pubkey(&public_key);
 				if let Some(id) = id {
-					cleanup(state, ctrl, id);
+					// The relay is authoritative for relay-mode presence, so remove
+					// unconditionally (the relay only reports offline once the agent's
+					// current connection has actually dropped).
+					cleanup(state, ctrl, id, None);
 				}
 			}
 		}
 	}
 }
 
-fn make_client_endpoint(target: SocketAddr) -> AppResult<Endpoint> {
-	// Bind the client socket to the relay's address family: quinn rejects dialing
-	// an IPv6 peer from an IPv4 socket (and vice versa) with "invalid remote
-	// address", so an IPv6 relay needs a [::] client and an IPv4 relay a 0.0.0.0 one.
-	let bind: SocketAddr = if target.is_ipv6() {
-		(std::net::Ipv6Addr::UNSPECIFIED, 0).into()
-	} else {
-		(std::net::Ipv4Addr::UNSPECIFIED, 0).into()
-	};
-	let mut endpoint = Endpoint::client(bind).map_err(|e| AppError::msg(format!("bind client: {e}")))?;
-	endpoint.set_default_client_config(tls::client_config());
-	Ok(endpoint)
-}
-
-async fn resolve(addr: &str) -> AppResult<SocketAddr> {
-	if let Ok(sa) = addr.parse::<SocketAddr>() {
-		return Ok(sa);
-	}
-	tokio::net::lookup_host(addr)
-		.await
-		.map_err(|e| AppError::msg(format!("resolving {addr}: {e}")))?
-		.next()
-		.ok_or_else(|| AppError::msg(format!("no address resolved for {addr}")))
-}
-
 // ---------------------------------------------------------------- shared
 
 /// Run the Ed25519 handshake over `link`, enroll/identify the agent, register it
-/// in the live map and pull an initial status. Returns the client id on success.
-async fn enroll_and_register(state: &AppState, ctrl: &ActiveController, link: AgentLink) -> AppResult<Option<Uuid>> {
+/// in the live map and pull an initial status. Returns the client id and its
+/// registration generation on success.
+async fn enroll_and_register(
+	state: &AppState,
+	ctrl: &ActiveController,
+	link: AgentLink,
+) -> AppResult<Option<(Uuid, u64)>> {
 	let (mut send, mut recv) = link.open_bi().await?;
 	write_frame(&mut send, &StreamOpen::Handshake).await?;
 	let nonce = crypto::random_nonce_b64();
@@ -289,11 +279,13 @@ async fn enroll_and_register(state: &AppState, ctrl: &ActiveController, link: Ag
 		hello.host.hostname, hello.host.os
 	));
 
+	let generation = LIVE_GEN.fetch_add(1, Ordering::Relaxed);
 	ctrl.live.lock().unwrap().insert(
 		client_id,
 		LiveConn {
 			link: link.clone(),
 			status: None,
+			generation,
 		},
 	);
 	state.notify_changed();
@@ -304,11 +296,30 @@ async fn enroll_and_register(state: &AppState, ctrl: &ActiveController, link: Ag
 		}
 		state.notify_changed();
 	}
-	Ok(Some(client_id))
+	Ok(Some((client_id, generation)))
 }
 
-fn cleanup(state: &AppState, ctrl: &ActiveController, id: Uuid) {
-	ctrl.live.lock().unwrap().remove(&id);
+/// Drop a client's live entry and mark it last-seen. `generation` guards the
+/// direct-mode teardown: a stale connection only evicts the entry it registered,
+/// never a newer reconnection's. Relay mode passes `None` (the relay is
+/// authoritative there).
+fn cleanup(state: &AppState, ctrl: &ActiveController, id: Uuid, generation: Option<u64>) {
+	{
+		let mut live = ctrl.live.lock().unwrap();
+		let is_current = match generation {
+			Some(g) => live.get(&id).map(|c| c.generation) == Some(g),
+			None => true,
+		};
+		if is_current {
+			live.remove(&id);
+		} else {
+			// A newer connection replaced us — leave it in place.
+			return;
+		}
+	}
+	// Drop any relay tunnels for this client: they hold the now-defunct
+	// connection's capability token, so a reconnect must rebuild them afresh.
+	crate::tunnel::close_for(ctrl, id);
 	ctrl.store.lock().unwrap().touch_seen(id);
 	state.notify_changed();
 }

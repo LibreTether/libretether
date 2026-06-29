@@ -1,8 +1,8 @@
 //! Persisted record of the machines (clients) this controller manages.
 
 use std::path::PathBuf;
-use std::time::{SystemTime, UNIX_EPOCH};
 
+pub use libretether_common::now_secs;
 use libretether_protocol::crypto;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -169,14 +169,66 @@ impl ClientStore {
 	}
 }
 
-pub fn now_secs() -> u64 {
-	SystemTime::now()
-		.duration_since(UNIX_EPOCH)
-		.map(|d| d.as_secs())
-		.unwrap_or(0)
-}
-
 /// A reasonably long, URL-safe one-time token.
 fn new_token() -> String {
 	format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple())
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	/// A unique temp path so parallel tests don't clobber each other's store file.
+	fn temp_store() -> ClientStore {
+		use std::sync::atomic::{AtomicU32, Ordering};
+		static N: AtomicU32 = AtomicU32::new(0);
+		let path = std::env::temp_dir().join(format!(
+			"lt-store-{}-{}.json",
+			std::process::id(),
+			N.fetch_add(1, Ordering::Relaxed)
+		));
+		let _ = std::fs::remove_file(&path);
+		ClientStore::load(path).unwrap()
+	}
+
+	#[test]
+	fn enroll_binds_key_burns_token_then_reconnects_by_key() {
+		let mut store = temp_store();
+		let client = store.create("box".into(), ClientOs::Linux).unwrap();
+		let token = client.enrollment_token.clone().unwrap();
+		assert!(!client.enrolled && client.public_key.is_none());
+
+		// First connect with the one-time token binds the key and burns the token.
+		let id = store.authenticate(Some(&token), "PUBKEY").expect("token enrolls");
+		assert_eq!(id, client.id);
+		let bound = store.get(id).unwrap();
+		assert!(bound.enrolled);
+		assert_eq!(bound.public_key.as_deref(), Some("PUBKEY"));
+		assert!(bound.enrollment_token.is_none());
+
+		// The token is single-use: presenting it again is rejected.
+		assert!(store.authenticate(Some(&token), "OTHERKEY").is_none());
+		// Reconnect is by bound key.
+		assert_eq!(store.authenticate(None, "PUBKEY"), Some(id));
+		// An unknown key is rejected.
+		assert!(store.authenticate(None, "UNKNOWN").is_none());
+
+		let _ = std::fs::remove_file(&store.path);
+	}
+
+	#[test]
+	fn reset_token_revokes_the_old_key_and_issues_a_new_token() {
+		let mut store = temp_store();
+		let client = store.create("box".into(), ClientOs::Linux).unwrap();
+		let first = client.enrollment_token.clone().unwrap();
+		store.authenticate(Some(&first), "PUBKEY").unwrap();
+
+		let new = store.reset_token(client.id).unwrap();
+		assert_ne!(new, first);
+		// Old key no longer authenticates; the new token does and can rebind.
+		assert!(store.authenticate(None, "PUBKEY").is_none());
+		assert_eq!(store.authenticate(Some(&new), "NEWKEY"), Some(client.id));
+
+		let _ = std::fs::remove_file(&store.path);
+	}
 }

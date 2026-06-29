@@ -48,7 +48,7 @@ fn launch_linux(pref: &str, host: &str, port: u16, username: &str, password: Opt
 fn freerdp(host: &str, port: u16, username: &str, password: Option<&str>) -> AppResult<()> {
 	let bin = ["xfreerdp3", "xfreerdp", "wlfreerdp"]
 		.into_iter()
-		.find(|b| which(b))
+		.find(|b| libretether_common::which(b))
 		.ok_or_else(|| AppError::msg("FreeRDP not found (install `freerdp3-x11`)."))?;
 	let mut cmd = Command::new(bin);
 	cmd.arg(format!("/v:{host}:{port}")).arg(format!("/u:{username}"));
@@ -61,7 +61,7 @@ fn freerdp(host: &str, port: u16, username: &str, password: Option<&str>) -> App
 
 #[cfg(target_os = "linux")]
 fn remmina(host: &str, port: u16, username: &str, password: Option<&str>) -> AppResult<()> {
-	if !which("remmina") {
+	if !libretether_common::which("remmina") {
 		return Err(AppError::msg("Remmina not found (install `remmina`)."));
 	}
 	let url = match password {
@@ -75,7 +75,7 @@ fn remmina(host: &str, port: u16, username: &str, password: Option<&str>) -> App
 
 #[cfg(target_os = "linux")]
 fn gnome_connections(host: &str, port: u16) -> AppResult<()> {
-	if !which("gnome-connections") {
+	if !libretether_common::which("gnome-connections") {
 		return Err(AppError::msg(
 			"GNOME Connections not found (install `gnome-connections`).",
 		));
@@ -99,15 +99,6 @@ fn custom(template: &str, host: &str, port: u16, username: &str, password: Optio
 	let mut cmd = Command::new(&bin);
 	cmd.args(tokens);
 	spawn(cmd, &bin)
-}
-
-#[cfg(target_os = "linux")]
-fn which(bin: &str) -> bool {
-	Command::new("which")
-		.arg(bin)
-		.output()
-		.map(|o| o.status.success())
-		.unwrap_or(false)
 }
 
 #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]

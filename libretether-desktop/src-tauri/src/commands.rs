@@ -367,6 +367,7 @@ pub async fn remove_client(state: State<'_, AppState>, id: String) -> AppResult<
 	let ctrl = state.require_active()?;
 	let id = parse_id(&id)?;
 	session::stop(&ctrl, id);
+	crate::tunnel::close_for(&ctrl, id);
 	if let Some(link) = ctrl.connection(id) {
 		link.close();
 	}
@@ -526,9 +527,15 @@ pub async fn stop_control(state: State<'_, AppState>, id: String) -> AppResult<(
 
 /// Resolve `(host, port)` to point a client at — tunneling through the relay
 /// when the agent isn't directly reachable.
-async fn client_endpoint(conn: &AgentLink, reported: Option<String>, remote_port: u16) -> AppResult<(String, u16)> {
+async fn client_endpoint(
+	ctrl: &ActiveController,
+	id: Uuid,
+	conn: &AgentLink,
+	reported: Option<String>,
+	remote_port: u16,
+) -> AppResult<(String, u16)> {
 	if conn.is_relay() {
-		let local = crate::tunnel::open(conn.clone(), remote_port).await?;
+		let local = crate::tunnel::open(ctrl, id, conn.clone(), remote_port).await?;
 		return Ok(("127.0.0.1".to_string(), local));
 	}
 	let host = reported
@@ -550,7 +557,7 @@ pub async fn connect_rdp(state: State<'_, AppState>, id: String) -> AppResult<()
 		ControlResponse::Error { message } => return Err(AppError::Agent(message)),
 		_ => return Err(AppError::msg("unexpected response")),
 	};
-	let (host, port) = client_endpoint(&conn, info.address.clone(), info.port).await?;
+	let (host, port) = client_endpoint(&ctrl, id, &conn, info.address.clone(), info.port).await?;
 	let host = safe_host(&host)?;
 	let username = safe_username(&info.username)?;
 	let password = info.password.as_deref().map(safe_password).transpose()?;
@@ -586,7 +593,7 @@ pub async fn connect_ssh(state: State<'_, AppState>, id: String) -> AppResult<()
 		ControlResponse::Error { message } => return Err(AppError::Agent(message)),
 		_ => return Err(AppError::msg("unexpected response")),
 	};
-	let (host, port) = client_endpoint(&conn, status.tailscale_ip.clone(), 22).await?;
+	let (host, port) = client_endpoint(&ctrl, id, &conn, status.tailscale_ip.clone(), 22).await?;
 	let host = safe_host(&host)?;
 	let username = safe_username(&status.host.username)?;
 	if !ssh_reachable(&host, port).await {

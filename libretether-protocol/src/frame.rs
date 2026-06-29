@@ -63,3 +63,38 @@ where
 	r.read_exact(&mut buf).await?;
 	serde_json::from_slice(&buf).map_err(|e| invalid(e.to_string()))
 }
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[tokio::test]
+	async fn round_trips_a_value() {
+		let (mut a, mut b) = tokio::io::duplex(4096);
+		let msg = vec!["one".to_string(), "two".to_string()];
+		write_frame(&mut a, &msg).await.unwrap();
+		let got: Vec<String> = read_frame(&mut b).await.unwrap();
+		assert_eq!(got, msg);
+	}
+
+	#[tokio::test]
+	async fn write_rejects_oversize_frames() {
+		// An absurd payload over the global cap is refused on write.
+		let huge = "y".repeat(MAX_FRAME as usize + 1);
+		assert!(write_frame(&mut Vec::new(), &huge).await.is_err());
+		// A control-sized payload still writes fine under the global cap.
+		let ok = "x".repeat(MAX_CONTROL_FRAME as usize + 1);
+		assert!(write_frame(&mut Vec::new(), &ok).await.is_ok());
+	}
+
+	#[tokio::test]
+	async fn read_capped_rejects_a_frame_over_the_cap() {
+		// Write a frame larger than MAX_CONTROL_FRAME, then read it under the tight
+		// cap — the reader must reject it on the length prefix alone.
+		let (mut a, mut b) = tokio::io::duplex(1024 * 1024 * 2);
+		let payload = "z".repeat(MAX_CONTROL_FRAME as usize + 10);
+		write_frame(&mut a, &payload).await.unwrap();
+		let res: std::io::Result<String> = read_frame_capped(&mut b, MAX_CONTROL_FRAME).await;
+		assert!(res.is_err());
+	}
+}

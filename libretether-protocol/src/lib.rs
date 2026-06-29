@@ -321,3 +321,31 @@ pub enum InputEvent {
 		text: String,
 	},
 }
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	// `SessionClient` is tagged with `kind` and the wrapped `InputEvent` with `t`.
+	// If they shared a tag key the map would carry two of it and deserialization
+	// would fail with "duplicate field". This locks the distinct tags in.
+	#[test]
+	fn session_client_input_uses_distinct_tags_and_round_trips() {
+		let ev = SessionClient::Input(InputEvent::MouseMove { x: 0.5, y: 0.25 });
+		let json = serde_json::to_value(&ev).unwrap();
+		assert_eq!(json["kind"], "input");
+		assert_eq!(json["t"], "mouse_move");
+
+		let back: SessionClient = serde_json::from_value(json).unwrap();
+		assert!(matches!(back, SessionClient::Input(InputEvent::MouseMove { .. })));
+	}
+
+	#[test]
+	fn challenge_and_hello_tolerate_missing_optional_fields() {
+		// v2 fields carry `#[serde(default)]` so a frame without them still parses.
+		let challenge: Challenge = serde_json::from_str(r#"{"nonce":"n"}"#).unwrap();
+		assert!(challenge.controller_key.is_empty());
+		let ack: HelloAck = serde_json::from_str(r#"{"accepted":true}"#).unwrap();
+		assert!(ack.controller_sig.is_empty());
+	}
+}

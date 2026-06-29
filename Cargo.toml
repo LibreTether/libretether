@@ -3,6 +3,7 @@ resolver = "2"
 members = [
 	"libretether-desktop/src-tauri",
 	"libretether-agent",
+	"libretether-common",
 	"libretether-protocol",
 	"libretether-relay",
 ]

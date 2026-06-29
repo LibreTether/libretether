@@ -49,3 +49,6 @@ jobs:
 
       - name: Check (format, lint, type-check)
         run: run check
+
+      - name: Test (Rust workspace)
+        run: run test
