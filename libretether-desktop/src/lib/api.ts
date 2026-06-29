@@ -63,6 +63,9 @@ export const saveTextFile = (path: string, contents: string) => invoke<void>("sa
 
 // ---------------------------------------------------------------- events
 export const onClientsChanged = (cb: () => void): Promise<UnlistenFn> => listen("clients:changed", () => cb())
+export const onControllerLog = (cb: (line: string) => void): Promise<UnlistenFn> =>
+	listen<string>("controller:log", (e) => cb(e.payload))
+export const onControllerConnected = (cb: () => void): Promise<UnlistenFn> => listen("controller:connected", () => cb())
 export const onSessionFrame = (id: string, cb: (f: Frame) => void): Promise<UnlistenFn> =>
 	listen<Frame>(`session:frame:${id}`, (e) => cb(e.payload))
 export const onSessionMeta = (id: string, cb: (m: SessionMeta) => void): Promise<UnlistenFn> =>

@@ -10,10 +10,11 @@ import {
 } from "lucide-react"
 import { useState } from "react"
 import { ClientDetailModal } from "../components/ClientDetailModal"
+import { Combobox } from "../components/Combobox"
 import { useConfirm } from "../components/confirm"
 import { DeployModal } from "../components/DeployModal"
 import { OsIcon, osLabel } from "../components/OsIcon"
-import { Badge, Button, EmptyState, Field, Input, Modal, Select } from "../components/ui"
+import { Badge, Button, EmptyState, Field, Input, Modal } from "../components/ui"
 import * as api from "../lib/api"
 import { relativeTime } from "../lib/format"
 import { useToast } from "../lib/toast"
@@ -327,11 +328,15 @@ function CreateModal({
 					/>
 				</Field>
 				<Field hint="Picks the right deploy script for the target." label="Operating system">
-					<Select onChange={(e) => setOs(e.target.value as ClientOs)} value={os}>
-						<option value="linux">Linux</option>
-						<option value="macos">macOS</option>
-						<option value="windows">Windows</option>
-					</Select>
+					<Combobox
+						onChange={(v) => setOs(v as ClientOs)}
+						options={[
+							{ icon: <OsIcon className="h-4 w-4" os="linux" />, label: "Linux", value: "linux" },
+							{ icon: <OsIcon className="h-4 w-4" os="macos" />, label: "macOS", value: "macos" },
+							{ icon: <OsIcon className="h-4 w-4" os="windows" />, label: "Windows", value: "windows" }
+						]}
+						value={os}
+					/>
 				</Field>
 			</div>
 		</Modal>

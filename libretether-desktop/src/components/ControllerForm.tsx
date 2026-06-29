@@ -3,7 +3,8 @@ import { useState } from "react"
 import * as api from "../lib/api"
 import { useToast } from "../lib/toast"
 import type { ControllerKind, ControllerSummary, ControllerType } from "../lib/types"
-import { Button, Field, Input, Modal, Segmented } from "./ui"
+import { Combobox } from "./Combobox"
+import { Button, Field, Input, Modal } from "./ui"
 
 const DEFAULT_PORT = 47600
 
@@ -40,7 +41,7 @@ export function ControllerForm({
 	const buildKind = (): ControllerKind => {
 		const listen_port = Number.parseInt(port, 10) || DEFAULT_PORT
 		if (type === "direct") return { advertise_addr: advertise.trim() || null, listen_port, type }
-		if (type === "tailscale") return { auth_key: authKey.trim() || null, listen_port, type }
+		if (type === "tailscale") return { auth_key: authKey.trim(), listen_port, type }
 		return {
 			address: relayAddr.trim(),
 			agent_secret: relayAgent.trim(),
@@ -52,6 +53,10 @@ export function ControllerForm({
 	const save = async () => {
 		if (!name.trim()) {
 			toast.error("Name your controller")
+			return
+		}
+		if (type === "tailscale" && !authKey.trim()) {
+			toast.error("Tailscale controllers require an auth key")
 			return
 		}
 		if (type === "relay" && (!relayAddr.trim() || !relayOwner.trim() || !relayAgent.trim())) {
@@ -98,33 +103,12 @@ export function ControllerForm({
 				</Field>
 
 				<Field hint={TYPE_HELP[type]} label="Type">
-					<Segmented
-						onChange={setType}
+					<Combobox
+						onChange={(v) => setType(v as ControllerType)}
 						options={[
-							{
-								label: (
-									<span className="flex items-center gap-1.5">
-										<Wifi className="h-3.5 w-3.5" /> Tailscale
-									</span>
-								),
-								value: "tailscale"
-							},
-							{
-								label: (
-									<span className="flex items-center gap-1.5">
-										<Network className="h-3.5 w-3.5" /> Direct
-									</span>
-								),
-								value: "direct"
-							},
-							{
-								label: (
-									<span className="flex items-center gap-1.5">
-										<Server className="h-3.5 w-3.5" /> Relay
-									</span>
-								),
-								value: "relay"
-							}
+							{ icon: <Wifi className="h-4 w-4" />, label: "Tailscale", value: "tailscale" },
+							{ icon: <Network className="h-4 w-4" />, label: "Direct", value: "direct" },
+							{ icon: <Server className="h-4 w-4" />, label: "Relay", value: "relay" }
 						]}
 						value={type}
 					/>
@@ -133,7 +117,7 @@ export function ControllerForm({
 				{type === "tailscale" && (
 					<>
 						<Field
-							hint="A Tailscale pre-auth key from your admin console, so agents join the tailnet without an interactive login."
+							hint="Required. A Tailscale pre-auth key from your admin console, so agents join the tailnet without an interactive login."
 							label="Auth key"
 						>
 							<Input

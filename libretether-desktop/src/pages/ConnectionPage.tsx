@@ -1,7 +1,8 @@
 import { writeText } from "@tauri-apps/plugin-clipboard-manager"
 import { Copy, Fingerprint, Network, Save, ScreenShare, Server, Wifi, WifiOff } from "lucide-react"
 import { useEffect, useState } from "react"
-import { Badge, Button, Field, Input, Select } from "../components/ui"
+import { Combobox } from "../components/Combobox"
+import { Badge, Button, Field, Input } from "../components/ui"
 import * as api from "../lib/api"
 import { useToast } from "../lib/toast"
 import type { ActiveInfo } from "../lib/types"
@@ -143,13 +144,17 @@ export function ConnectionPage({ active }: { active: ActiveInfo }) {
 						</div>
 
 						<Field hint="Which client the “Connect via RDP” button launches." label="RDP client">
-							<Select onChange={(e) => setRdpMode(e.target.value)} value={rdpMode}>
-								<option value="auto">Auto-detect</option>
-								<option value="freerdp">FreeRDP</option>
-								<option value="remmina">Remmina</option>
-								<option value="gnome-connections">GNOME Connections</option>
-								<option value="custom">Custom command…</option>
-							</Select>
+							<Combobox
+								onChange={setRdpMode}
+								options={[
+									{ label: "Auto-detect", value: "auto" },
+									{ label: "FreeRDP", value: "freerdp" },
+									{ label: "Remmina", value: "remmina" },
+									{ label: "GNOME Connections", value: "gnome-connections" },
+									{ label: "Custom command…", value: "custom" }
+								]}
+								value={rdpMode}
+							/>
 						</Field>
 
 						{rdpMode === "custom" && (

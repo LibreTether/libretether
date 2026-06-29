@@ -45,6 +45,10 @@
 			"commands": "tauri icon public/libretether.png",
 			"description": "Regenerate app icons from public/libretether.png"
 		},
+		"install": {
+			"commands": ["@build", "bash ../scripts/install-package.sh"],
+			"description": "Build the desktop bundle, then install the matching .deb (apt) / .rpm (dnf/yum) / .app (macOS) on this host"
+		},
 		"typecheck": {
 			"commands": "tsc --noEmit",
 			"description": "Type-check the frontend (tsc --noEmit)"

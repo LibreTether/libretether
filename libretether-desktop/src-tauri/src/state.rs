@@ -64,6 +64,25 @@ impl ControllerKind {
 			_ => None,
 		}
 	}
+
+	/// Reject incomplete settings (Tailscale needs an auth key; Relay needs an
+	/// address + both secrets).
+	pub fn validate(&self) -> AppResult<()> {
+		let blank = |s: &Option<String>| s.as_deref().unwrap_or("").trim().is_empty();
+		match self {
+			ControllerKind::Tailscale { auth_key, .. } if blank(auth_key) => {
+				Err(AppError::msg("Tailscale controllers require an auth key"))
+			}
+			ControllerKind::Relay {
+				address,
+				owner_secret,
+				agent_secret,
+			} if address.trim().is_empty() || owner_secret.trim().is_empty() || agent_secret.trim().is_empty() => Err(
+				AppError::msg("Relay controllers require an address, owner secret and agent secret"),
+			),
+			_ => Ok(()),
+		}
+	}
 }
 
 /// A saved controller: its identity, QUIC certificate and connection settings.
@@ -246,6 +265,7 @@ impl AppState {
 	}
 
 	pub fn create_profile(&self, name: String, kind: ControllerKind) -> AppResult<ControllerProfile> {
+		kind.validate()?;
 		let profile = ControllerProfile::new(name, kind);
 		self.save_profile(&profile)?;
 		Ok(profile)
@@ -256,6 +276,7 @@ impl AppState {
 		if self.active().is_some_and(|c| c.profile.id == id) {
 			return Err(AppError::msg("exit this controller before editing it"));
 		}
+		kind.validate()?;
 		let mut profile = self.load_profile(id)?;
 		profile.name = name;
 		profile.kind = kind;

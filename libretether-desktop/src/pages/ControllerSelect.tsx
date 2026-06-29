@@ -2,6 +2,7 @@ import { Network, Pencil, Plus, Server, Trash2, Wifi } from "lucide-react"
 import { type ComponentType, useCallback, useEffect, useState } from "react"
 import { ControllerForm } from "../components/ControllerForm"
 import { useConfirm } from "../components/confirm"
+import { RelayConnecting } from "../components/RelayConnecting"
 import { Badge, Button, Spinner } from "../components/ui"
 import * as api from "../lib/api"
 import { useToast } from "../lib/toast"
@@ -20,6 +21,7 @@ export function ControllerSelect({ onConnected }: { onConnected: (a: ActiveInfo)
 	const [loading, setLoading] = useState(true)
 	const [form, setForm] = useState<{ existing: ControllerSummary | null } | null>(null)
 	const [connecting, setConnecting] = useState<string | null>(null)
+	const [connectingRelay, setConnectingRelay] = useState<ControllerSummary | null>(null)
 
 	const reload = useCallback(() => {
 		setLoading(true)
@@ -32,6 +34,12 @@ export function ControllerSelect({ onConnected }: { onConnected: (a: ActiveInfo)
 	useEffect(() => reload(), [reload])
 
 	const connect = async (c: ControllerSummary) => {
+		// Relay controllers dial out — show the connecting screen and only enter
+		// once the relay accepts. Direct/Tailscale just bind a listener locally.
+		if (c.kind.type === "relay") {
+			setConnectingRelay(c)
+			return
+		}
 		setConnecting(c.id)
 		try {
 			onConnected(await api.selectController(c.id))
@@ -55,6 +63,16 @@ export function ControllerSelect({ onConnected }: { onConnected: (a: ActiveInfo)
 		} catch (e) {
 			toast.error("Couldn't delete", api.errString(e))
 		}
+	}
+
+	if (connectingRelay) {
+		return (
+			<RelayConnecting
+				controller={connectingRelay}
+				onCancel={() => setConnectingRelay(null)}
+				onConnected={onConnected}
+			/>
+		)
 	}
 
 	return (

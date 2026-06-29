@@ -15,14 +15,27 @@ use libretether_protocol::{
 	tls, Challenge, ControlRequest, ControlResponse, Hello, HelloAck, StreamOpen, PROTOCOL_VERSION,
 };
 use quinn::Endpoint;
+use tauri::Emitter;
 use uuid::Uuid;
 
 use crate::error::{AppError, AppResult};
 use crate::link::AgentLink;
 use crate::state::{ActiveController, AppState, ControllerKind, LiveConn};
 
+/// Relay-connection progress, surfaced to the connecting screen.
+pub const EVENT_RELAY_LOG: &str = "controller:log";
+pub const EVENT_RELAY_CONNECTED: &str = "controller:connected";
+
 fn log(msg: &str) {
 	eprintln!("[libretether] {msg}");
+}
+
+/// Log a relay-connection line and mirror it to the UI's connecting screen.
+fn relay_log(state: &AppState, line: &str) {
+	log(line);
+	if let Some(app) = state.0.app.get() {
+		let _ = app.emit(EVENT_RELAY_LOG, line.to_string());
+	}
 }
 
 // ---------------------------------------------------------------- direct mode
@@ -93,13 +106,13 @@ pub async fn serve_relay(state: AppState, ctrl: Arc<ActiveController>) {
 	loop {
 		match relay_session(&state, &ctrl, &relay_addr, &owner_secret, &pubkey).await {
 			Ok(()) => backoff = 1,
-			Err(e) => log(&format!("relay error: {e:#}")),
+			Err(e) => relay_log(&state, &format!("relay error: {e:#}")),
 		}
 		// The relay is gone, so every agent is unreachable.
 		ctrl.live.lock().unwrap().clear();
 		state.notify_changed();
 		let wait = backoff.min(5);
-		log(&format!("reconnecting to relay in {wait}s"));
+		relay_log(&state, &format!("reconnecting to relay in {wait}s"));
 		tokio::time::sleep(Duration::from_secs(wait)).await;
 		backoff = (backoff * 2).min(5);
 	}
@@ -113,7 +126,7 @@ async fn relay_session(
 	pubkey: &str,
 ) -> AppResult<()> {
 	let addr = resolve(relay_addr).await?;
-	log(&format!("dialing relay at {addr}"));
+	relay_log(state, &format!("dialing relay at {addr}"));
 	let endpoint = make_client_endpoint(addr)?;
 	let conn = endpoint
 		.connect(addr, "libretether.local")
@@ -141,7 +154,10 @@ async fn relay_session(
 			ack.reason.unwrap_or_default()
 		)));
 	}
-	log("connected to relay; awaiting agents");
+	relay_log(state, "connected to relay; awaiting agents");
+	if let Some(app) = state.0.app.get() {
+		let _ = app.emit(EVENT_RELAY_CONNECTED, ());
+	}
 
 	loop {
 		let event: RelayEvent = read_frame(&mut recv).await?;
