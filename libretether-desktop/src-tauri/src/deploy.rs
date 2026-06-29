@@ -24,17 +24,14 @@ pub enum DeployTarget {
 }
 
 /// Render the deploy command for a client: a one-liner that runs the published
-/// installer for `os` with this client's enrollment arguments.
-pub fn script(name: &str, os: ClientOs, token: &str, target: &DeployTarget) -> String {
+/// installer for `os` with this client's enrollment arguments. The result is
+/// bare (no shebang or comments) so it can be pasted straight into a shell; the
+/// UI adds a shebang only when saving it to a file.
+pub fn script(os: ClientOs, token: &str, target: &DeployTarget) -> String {
 	match os {
 		ClientOs::Windows => {
 			let url = format!("{RELEASE_BASE}/install-windows.ps1");
-			let args = win_args(token, target);
-			format!(
-				"# LibreTether agent deployment — {name} (windows)\n\
-				 # Paste into a PowerShell prompt on the client machine.\n\
-				 & ([scriptblock]::Create((irm {url}))) {args}\n"
-			)
+			format!("& ([scriptblock]::Create((irm {url}))) {}", win_args(token, target))
 		}
 		ClientOs::Linux | ClientOs::Macos => {
 			let installer = match os {
@@ -42,13 +39,7 @@ pub fn script(name: &str, os: ClientOs, token: &str, target: &DeployTarget) -> S
 				_ => "install-linux.sh",
 			};
 			let url = format!("{RELEASE_BASE}/{installer}");
-			let args = sh_args(token, target);
-			format!(
-				"#!/usr/bin/env sh\n\
-				 # LibreTether agent deployment — {name}\n\
-				 # Run this on the client machine you want to control.\n\
-				 curl -fsSL {url} | sh -s -- {args}\n"
-			)
+			format!("curl -fsSL {url} | sh -s -- {}", sh_args(token, target))
 		}
 	}
 }
@@ -110,21 +101,23 @@ mod tests {
 			address: "relay.example:47600".into(),
 			agent_secret: "sekret".into(),
 		};
-		let linux = script("box", ClientOs::Linux, "tok", &relay);
+		let linux = script(ClientOs::Linux, "tok", &relay);
 		assert!(linux.contains("releases/latest/download/install-linux.sh"), "{linux}");
 		assert!(
 			linux.contains("| sh -s -- --token 'tok' --relay 'relay.example:47600' --relay-secret 'sekret'"),
 			"{linux}"
 		);
+		// Bare command — no shebang or comment lines.
+		assert!(!linux.contains('#'), "{linux}");
 
-		let macos = script("box", ClientOs::Macos, "tok", &relay);
+		let macos = script(ClientOs::Macos, "tok", &relay);
 		assert!(macos.contains("releases/latest/download/install-macos.sh"), "{macos}");
 
 		let direct = DeployTarget::Controller {
 			address: "ctl:47600".into(),
 			auth_key: Some("tskey-abc".into()),
 		};
-		let win = script("box", ClientOs::Windows, "tok", &direct);
+		let win = script(ClientOs::Windows, "tok", &direct);
 		assert!(win.contains("releases/latest/download/install-windows.ps1"), "{win}");
 		assert!(
 			win.contains("-Token 'tok' -Controller 'ctl:47600' -TailscaleKey 'tskey-abc'"),

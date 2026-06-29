@@ -9,10 +9,9 @@ import type { ClientOs } from "../lib/types"
 import { Button, Modal } from "./ui"
 
 const RUN_HINT: Record<ClientOs, string> = {
-	linux: "On the client machine, save this script and run:  bash libretether-deploy.sh",
-	macos: "On the client Mac, save this script and run:  bash libretether-deploy.sh",
-	windows:
-		"On the client PC, save this script, then in an Administrator PowerShell run:  powershell -ExecutionPolicy Bypass -File .\\libretether-deploy.ps1"
+	linux: "Run this on the client machine you want to control:",
+	macos: "Run this on the client Mac you want to control:",
+	windows: "Run this in PowerShell on the client PC you want to control:"
 }
 
 export function DeployModal({
@@ -43,10 +42,12 @@ export function DeployModal({
 
 	const download = async () => {
 		const ext = os === "windows" ? "ps1" : "sh"
+		// The shebang is only needed in the saved file; the textbox/clipboard keep the bare command.
+		const contents = os === "windows" ? `${script}\n` : `#!/usr/bin/env sh\n${script}\n`
 		try {
 			const path = await save({ defaultPath: `libretether-deploy-${slug(name)}.${ext}` })
 			if (!path) return
-			await api.saveTextFile(path, script)
+			await api.saveTextFile(path, contents)
 			toast.success("Script saved", path)
 		} catch (e) {
 			toast.error("Save failed", api.errString(e))
@@ -83,24 +84,15 @@ export function DeployModal({
 					<div>
 						<p className="font-medium text-text">{RUN_HINT[os]}</p>
 						<p className="mt-1 text-xs">
-							The script connects the machine to your controller (via Tailscale if you set an auth key on
-							the Controller page, otherwise directly), installs the background agent, and enrols it. It
-							runs once and keeps the agent running on every boot.
+							It installs the LibreTether agent, enrols it with your controller, and keeps it running on
+							every boot. Runs once — no need to save it first.
 						</p>
 					</div>
 				</div>
 
-				<pre className="max-h-[44vh] overflow-auto rounded-xl border border-border bg-surface-2 p-3.5 text-[0.78rem] leading-relaxed text-text">
+				<pre className="max-h-[44vh] overflow-y-auto whitespace-pre-wrap break-all rounded-xl border border-border bg-surface-2 p-3.5 text-[0.78rem] leading-relaxed text-text">
 					<code>{script}</code>
 				</pre>
-
-				<p className="text-xs text-subtle">
-					Before running, point the script at the agent binary on the client: set
-					<code className="mx-1 rounded bg-surface-3 px-1 py-0.5">LIBRETETHER_AGENT_BIN</code>
-					to a local path or
-					<code className="mx-1 rounded bg-surface-3 px-1 py-0.5">LIBRETETHER_AGENT_URL</code>
-					to a download URL.
-				</p>
 			</div>
 		</Modal>
 	)

@@ -152,7 +152,7 @@ pub async fn create_client(state: State<'_, AppState>, name: String, os: ClientO
 	let client = state.0.store.lock().unwrap().create(name, os)?;
 	let token = client.enrollment_token.clone().unwrap_or_default();
 	let target = deploy_target(&state).await;
-	let deploy_script = deploy::script(&client.name, client.os, &token, &target);
+	let deploy_script = deploy::script(client.os, &token, &target);
 	state.notify_changed();
 	Ok(CreateClientResult {
 		client: to_dto(&client, false, None),
@@ -191,14 +191,14 @@ pub async fn rename_client(state: State<'_, AppState>, id: String, name: String)
 pub async fn get_deploy_script(state: State<'_, AppState>, id: String, os: Option<ClientOs>) -> AppResult<String> {
 	let state = state.inner().clone();
 	let id = parse_id(&id)?;
-	let (name, client_os, token) = {
+	let (client_os, token) = {
 		let store = state.0.store.lock().unwrap();
 		let c = store.get(id).ok_or(AppError::NotFound)?;
-		(c.name.clone(), c.os, c.enrollment_token.clone())
+		(c.os, c.enrollment_token.clone())
 	};
 	let token = token.ok_or_else(|| AppError::msg("client already enrolled — reset its token to re-deploy"))?;
 	let target = deploy_target(&state).await;
-	Ok(deploy::script(&name, os.unwrap_or(client_os), &token, &target))
+	Ok(deploy::script(os.unwrap_or(client_os), &token, &target))
 }
 
 #[tauri::command]
@@ -212,7 +212,7 @@ pub async fn reset_token(state: State<'_, AppState>, id: String) -> AppResult<Cr
 		let store = state.0.store.lock().unwrap();
 		store.get(id).ok_or(AppError::NotFound)?.clone()
 	};
-	let deploy_script = deploy::script(&client.name, client.os, &token, &target);
+	let deploy_script = deploy::script(client.os, &token, &target);
 	state.notify_changed();
 	Ok(CreateClientResult {
 		client: to_dto(&client, state.is_online(id), None),

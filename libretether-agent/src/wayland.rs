@@ -71,8 +71,12 @@ async fn serve(cfg: SessionConfig, mut send: SendStream, recv: RecvStream) -> Re
 	let (frame_tx, mut frame_rx) = tokio::sync::mpsc::channel::<crate::session::Encoded>(4);
 	crate::pwstream::spawn(fd, portal.node_id, cfg.quality, cfg.max_fps, stop.clone(), frame_tx);
 
-	// Read input on a dedicated task so the framed read is never cancelled
-	// mid-message by the writer's select! loop.
+	// Read input on its own task (so a framed read is never cancelled mid-message)
+	// and inject on another. Injection must NOT share the frame-writing loop: a
+	// portal call can be slow or block (e.g. a burst of pointer motion, each a
+	// D-Bus round-trip), and coupling the two would stall frame delivery and tear
+	// the session down. The frame loop below owns the session's lifetime; input
+	// failures only stop input, never the video.
 	let (input_tx, mut input_rx) = tokio::sync::mpsc::unbounded_channel::<InputEvent>();
 	let reader = tokio::spawn(async move {
 		let mut recv = recv;
@@ -89,25 +93,27 @@ async fn serve(cfg: SessionConfig, mut send: SendStream, recv: RecvStream) -> Re
 		}
 	});
 
-	loop {
-		tokio::select! {
-			ev = input_rx.recv() => match ev {
-				Some(ev) => inject(&portal, ev).await,
-				None => break,
-			},
-			frame = frame_rx.recv() => match frame {
-				Some(enc) => {
-					if write_frame(&mut send, &crate::session::to_frame(&enc)).await.is_err() {
-						break;
-					}
-				}
-				None => break,
-			},
+	let portal = std::sync::Arc::new(portal);
+	let injector = {
+		let portal = portal.clone();
+		tokio::spawn(async move {
+			while let Some(ev) = input_rx.recv().await {
+				inject(&portal, ev).await;
+			}
+		})
+	};
+
+	// Frame loop: forward captured frames until capture ends or the controller
+	// disconnects. Input is handled independently above.
+	while let Some(enc) = frame_rx.recv().await {
+		if write_frame(&mut send, &crate::session::to_frame(&enc)).await.is_err() {
+			break;
 		}
 	}
 
 	stop.store(true, std::sync::atomic::Ordering::Relaxed);
 	reader.abort();
+	injector.abort();
 	let _ = portal.session.close().await;
 	let _ = send.finish();
 	Ok(())
