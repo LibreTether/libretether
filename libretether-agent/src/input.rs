@@ -222,6 +222,10 @@ pub(crate) fn map_key(code: &str) -> Option<Key> {
 		"Space" => Key::Space,
 		"Backspace" => Key::Backspace,
 		"Delete" => Key::Delete,
+		// enigo has no `Key::Insert` on macOS (Apple keyboards lack the key); fall
+		// through to `None` there. The X11/Wayland parity test is Linux-only, so it
+		// still enforces this arm on the platforms that have the variant.
+		#[cfg(not(target_os = "macos"))]
 		"Insert" => Key::Insert,
 		"Escape" => Key::Escape,
 		"ArrowUp" => Key::UpArrow,
