@@ -18,6 +18,7 @@ mod service;
 mod session;
 #[cfg(target_os = "linux")]
 mod wayland;
+mod x11env;
 
 use std::path::PathBuf;
 

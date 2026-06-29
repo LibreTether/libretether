@@ -19,6 +19,13 @@ pub struct Capture {
 
 /// Number of monitors currently attached, or 0 if enumeration fails.
 pub fn display_count() -> u32 {
+	// On Wayland `xcap` enumerates over X11, which fails noisily ("Authorization
+	// required…") without an X session. We capture a single portal stream there,
+	// so report one display and skip the X11 probe entirely.
+	#[cfg(target_os = "linux")]
+	if crate::platform::is_wayland() {
+		return 1;
+	}
 	Monitor::all().map(|m| m.len() as u32).unwrap_or(0)
 }
 

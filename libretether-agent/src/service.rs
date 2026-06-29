@@ -54,8 +54,8 @@ mod platform {
 			 ExecStart={exe} run --config {config}\n\
 			 Restart=always\n\
 			 RestartSec=3\n\
-			 # Best-effort X11 session hint; adjust for your display/Wayland.\n\
-			 Environment=DISPLAY=:0\n\n\
+			 # The session is discovered at runtime: DISPLAY/XAUTHORITY for X11 (from\n\
+			 # the live session) and the wayland-N socket in XDG_RUNTIME_DIR for Wayland.\n\n\
 			 [Install]\n\
 			 WantedBy=default.target\n",
 			exe = exe.display(),

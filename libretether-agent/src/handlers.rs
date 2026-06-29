@@ -101,6 +101,7 @@ async fn screenshot(display: u32) -> Result<ScreenshotResult, String> {
 		});
 	}
 
+	crate::x11env::ensure();
 	tokio::task::spawn_blocking(move || {
 		let cap = capture::capture(display).map_err(|e| e.to_string())?;
 		let png = capture::encode_png(&cap.image).map_err(|e| e.to_string())?;

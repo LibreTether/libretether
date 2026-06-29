@@ -53,6 +53,10 @@ pub async fn run(mut send: SendStream, mut recv: RecvStream) -> std::io::Result<
 
 /// X11 backend: stateless per-frame `xcap` capture + `enigo` input injection.
 async fn x11_session(cfg: SessionConfig, mut send: SendStream, mut recv: RecvStream) -> std::io::Result<()> {
+	// Recover DISPLAY/XAUTHORITY from the live session before the capture and
+	// injector threads start, so both can authenticate to the X server.
+	crate::x11env::ensure();
+
 	let stop = Arc::new(AtomicBool::new(false));
 	let injector = input::spawn();
 
