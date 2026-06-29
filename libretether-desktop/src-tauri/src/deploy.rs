@@ -8,10 +8,15 @@
 //! - **Relay** — the agent dials out to a `libretether-relay` relay; nothing on the
 //!   client (or controller) needs to be exposed.
 //!
-//! We do not host the agent binary, so the script takes it from
-//! `LIBRETETHER_AGENT_BIN` (a local path) or `LIBRETETHER_AGENT_URL` (a release asset).
+//! By default the script downloads the agent for the client's OS/arch from the
+//! project's latest GitHub release; `LIBRETETHER_AGENT_BIN` (a local path) or
+//! `LIBRETETHER_AGENT_URL` (an explicit URL) override that for development.
 
 use crate::registry::ClientOs;
+
+/// Base URL for the published agent binaries — GitHub serves the newest release's
+/// assets under `releases/latest/download/<asset>`. Change this in a fork.
+const AGENT_RELEASE_BASE: &str = "https://github.com/LibreTether/libretether/releases/latest/download";
 
 /// Where the client should connect, and how it enrols.
 pub enum DeployTarget {
@@ -39,6 +44,7 @@ pub fn script(name: &str, os: ClientOs, token: &str, target: &DeployTarget) -> S
 	template
 		.replace("__CONNECT_BLOCK__", &connect_block(os, target))
 		.replace("__ENROLL__", &enroll_cmd(os, target))
+		.replace("__AGENT_BASE__", AGENT_RELEASE_BASE)
 		.replace("__NAME__", name)
 		.replace("__CONTROLLER__", target.address())
 		.replace("__TOKEN__", token)
@@ -120,17 +126,26 @@ else
   echo "!! Couldn't auto-install runtime libs — ensure libxdo (libxdo.so.3) and libxcb are present." >&2
 fi
 
-# 3. Install the agent binary.
-#    Provide it via LIBRETETHER_AGENT_BIN=/path/to/libretether-agent or LIBRETETHER_AGENT_URL=https://...
+# 3. Install the agent binary. By default it is downloaded from the latest
+#    LibreTether release for this machine's architecture; override with
+#    LIBRETETHER_AGENT_BIN=/path/to/binary or LIBRETETHER_AGENT_URL=https://...
 mkdir -p "$BIN_DIR"
 if [ -n "${LIBRETETHER_AGENT_BIN:-}" ]; then
   install -m 0755 "$LIBRETETHER_AGENT_BIN" "$BIN"
-elif [ -n "${LIBRETETHER_AGENT_URL:-}" ]; then
-  echo "==> Downloading agent from $LIBRETETHER_AGENT_URL"
-  curl -fsSL "$LIBRETETHER_AGENT_URL" -o "$BIN" && chmod +x "$BIN"
 else
-  echo "!! No agent binary source. Set LIBRETETHER_AGENT_BIN or LIBRETETHER_AGENT_URL and re-run." >&2
-  exit 1
+  if [ -n "${LIBRETETHER_AGENT_URL:-}" ]; then
+    URL="$LIBRETETHER_AGENT_URL"
+  else
+    case "$(uname -m)" in
+      x86_64|amd64) ARCH=x86_64 ;;
+      aarch64|arm64) ARCH=aarch64 ;;
+      *) echo "!! Unsupported architecture $(uname -m). Set LIBRETETHER_AGENT_BIN or LIBRETETHER_AGENT_URL." >&2; exit 1 ;;
+    esac
+    URL="__AGENT_BASE__/libretether-agent-linux-$ARCH"
+  fi
+  echo "==> Downloading agent from $URL"
+  curl -fsSL "$URL" -o "$BIN"
+  chmod +x "$BIN"
 fi
 
 # 4. Enroll and install the always-on service.
@@ -154,16 +169,17 @@ echo "==> LibreTether setup for __NAME__"
 
 __CONNECT_BLOCK__
 
-# 2. Install the agent binary (set LIBRETETHER_AGENT_BIN or LIBRETETHER_AGENT_URL).
+# 2. Install the agent binary (universal). By default it is downloaded from the
+#    latest LibreTether release; override with LIBRETETHER_AGENT_BIN=/path or
+#    LIBRETETHER_AGENT_URL=https://...
 mkdir -p "$BIN_DIR"
 if [ -n "${LIBRETETHER_AGENT_BIN:-}" ]; then
   install -m 0755 "$LIBRETETHER_AGENT_BIN" "$BIN"
-elif [ -n "${LIBRETETHER_AGENT_URL:-}" ]; then
-  echo "==> Downloading agent from $LIBRETETHER_AGENT_URL"
-  curl -fsSL "$LIBRETETHER_AGENT_URL" -o "$BIN" && chmod +x "$BIN"
 else
-  echo "!! No agent binary source. Set LIBRETETHER_AGENT_BIN or LIBRETETHER_AGENT_URL and re-run." >&2
-  exit 1
+  URL="${LIBRETETHER_AGENT_URL:-__AGENT_BASE__/libretether-agent-macos-universal}"
+  echo "==> Downloading agent from $URL"
+  curl -fsSL "$URL" -o "$BIN"
+  chmod +x "$BIN"
 fi
 
 # 3. Enroll and install the LaunchAgent.
@@ -188,16 +204,15 @@ Write-Host "==> LibreTether setup for __NAME__"
 
 __CONNECT_BLOCK__
 
-# 2. Install the agent binary (set LIBRETETHER_AGENT_BIN or LIBRETETHER_AGENT_URL).
+# 2. Install the agent binary. By default it is downloaded from the latest
+#    LibreTether release; override with $env:LIBRETETHER_AGENT_BIN or $env:LIBRETETHER_AGENT_URL.
 New-Item -ItemType Directory -Force -Path $BinDir | Out-Null
 if ($env:LIBRETETHER_AGENT_BIN) {
   Copy-Item $env:LIBRETETHER_AGENT_BIN $Bin -Force
-} elseif ($env:LIBRETETHER_AGENT_URL) {
-  Write-Host "==> Downloading agent from $env:LIBRETETHER_AGENT_URL"
-  Invoke-WebRequest -Uri $env:LIBRETETHER_AGENT_URL -OutFile $Bin
 } else {
-  Write-Error "Set LIBRETETHER_AGENT_BIN or LIBRETETHER_AGENT_URL to the agent binary and re-run."
-  exit 1
+  $Url = if ($env:LIBRETETHER_AGENT_URL) { $env:LIBRETETHER_AGENT_URL } else { "__AGENT_BASE__/libretether-agent-windows-x86_64.exe" }
+  Write-Host "==> Downloading agent from $Url"
+  Invoke-WebRequest -Uri $Url -OutFile $Bin
 }
 
 # 3. Enroll and register the logon task.
@@ -206,3 +221,42 @@ __ENROLL__
 
 Write-Host "==> Done. __NAME__ is now reachable from your LibreTether controller."
 "#;
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	// The agent asset names must stay in lockstep with the release workflow
+	// (`.github/workflows/release.yml` -> `libretether-agent-<key>[.exe]`).
+	#[test]
+	fn agent_is_fetched_from_the_latest_release() {
+		let target = DeployTarget::Relay {
+			address: "relay.example:47600".into(),
+			agent_secret: "secret".into(),
+		};
+		let base = "releases/latest/download";
+
+		let linux = script("box", ClientOs::Linux, "tok", &target);
+		assert!(
+			linux.contains(&format!("{base}/libretether-agent-linux-$ARCH")),
+			"{linux}"
+		);
+
+		let macos = script("box", ClientOs::Macos, "tok", &target);
+		assert!(
+			macos.contains(&format!("{base}/libretether-agent-macos-universal")),
+			"{macos}"
+		);
+
+		let windows = script("box", ClientOs::Windows, "tok", &target);
+		assert!(
+			windows.contains(&format!("{base}/libretether-agent-windows-x86_64.exe")),
+			"{windows}"
+		);
+
+		// No template placeholder should survive rendering.
+		for s in [&linux, &macos, &windows] {
+			assert!(!s.contains("__"), "unsubstituted placeholder in:\n{s}");
+		}
+	}
+}

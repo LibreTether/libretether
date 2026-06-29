@@ -88,6 +88,32 @@ jobs:
             "libretether-agent-${{ matrix.key }}${{ matrix.ext }}" \
             "libretether-relay-${{ matrix.key }}${{ matrix.ext }}" --clobber
 
+  # Publish the one-line agent installers. They're pinned to this exact release
+  # (and repo, so forks stay self-contained) so a downloaded script always pulls
+  # the matching agent build. Runs after `binaries` so the agent assets exist.
+  install-scripts:
+    name: Install scripts
+    needs: [release, binaries]
+    permissions:
+      contents: write
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6.0.2
+
+      - name: Pin and upload installers
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          src="https://github.com/LibreTether/libretether/releases/latest/download"
+          dst="https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}"
+          mkdir -p dist-scripts
+          for f in scripts/install/install-linux.sh scripts/install/install-macos.sh scripts/install/install-windows.ps1; do
+            sed "s#${src}#${dst}#g" "$f" > "dist-scripts/$(basename "$f")"
+          done
+          gh release upload "$TAG" dist-scripts/* --clobber
+
   # Build the libretether-relay relay container per-arch on a NATIVE runner (no QEMU
   # emulation — the arm64 leg uses an ARM runner, like the binaries job), push
   # each by digest, then `docker-merge` stitches them into one multi-arch image

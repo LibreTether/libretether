@@ -149,11 +149,12 @@ This is an early build. What works today:
 - ✅ **Relay mode** — `libretether-relay` on a cloud host routes between controller and clients (control plane + RDP/SSH tunneled), so neither end is exposed
 
 Releases publish the `libretether-agent` and `libretether-relay` binaries for every platform
-(`-linux-x86_64`, `-linux-aarch64`, `-macos-universal`, `-windows-x86_64.exe`) — point the
-deploy script's `LIBRETETHER_AGENT_URL` at the agent asset (or use a local build via
-`LIBRETETHER_AGENT_BIN`), and grab `libretether-relay-linux-x86_64` for your relay host. The relay is
-also published as a multi-arch container image at
-`ghcr.io/libretether/libretether-relay` (see [Run the relay with Docker](#run-the-relay-with-docker)).
+(`-linux-x86_64`, `-linux-aarch64`, `-macos-universal`, `-windows-x86_64.exe`). The deploy
+script downloads the matching agent from the latest release automatically — override with
+`LIBRETETHER_AGENT_URL` (a specific asset) or `LIBRETETHER_AGENT_BIN` (a local build) when
+developing. Grab `libretether-relay-linux-x86_64` for your relay host; the relay is also
+published as a multi-arch container image at `ghcr.io/libretether/libretether-relay`
+(see [Run the relay with Docker](#run-the-relay-with-docker)).
 
 Rough edges & next up: frame streaming is JPEG-over-QUIC (no delta/codec yet), input
 mapping is tuned for the primary display, and the Wayland PipeWire capture
@@ -184,18 +185,46 @@ run agent:build     # -> target/release/libretether-agent
 ### Enrolling a machine
 
 1. In the controller, open **Machines → Add machine**, name it and pick its OS.
-2. Copy or save the generated deploy script and run it on the target machine. Point it at
-   the agent binary first:
+2. Copy or save the generated deploy script and run it on the target machine:
 
    ```bash
-   # On the client machine, with the built agent next to you:
-   LIBRETETHER_AGENT_BIN=/path/to/libretether-agent bash libretether-deploy-<name>.sh
+   # On the client machine:
+   bash libretether-deploy-<name>.sh
    ```
+
+   It downloads the matching agent for that machine's OS/arch from the latest release. To
+   use a local build or a specific asset instead, set `LIBRETETHER_AGENT_BIN=/path/to/binary`
+   or `LIBRETETHER_AGENT_URL=https://...` before running it.
 
 3. The script joins the machine to Tailscale, installs the agent, enrols it, and starts
    the background service. It shows up as **online** in the controller within seconds.
 
-> Trying it on one machine? You can skip the script: run
+#### One-line install (without copying a script)
+
+Every release also ships generic, argument-driven installers, so you can enrol a machine
+straight from the release with the **token** (and a relay/controller address) the controller
+shows you when you add it:
+
+```bash
+# Linux / macOS — relay mode
+curl -fsSL https://github.com/LibreTether/libretether/releases/latest/download/install-linux.sh \
+  | sh -s -- --token <TOKEN> --relay <RELAY_HOST:PORT> --relay-secret <AGENT_SECRET>
+
+# Linux / macOS — direct / Tailscale mode
+curl -fsSL .../install-linux.sh | sh -s -- --token <TOKEN> --controller <HOST:PORT> [--tailscale-key <KEY>]
+```
+
+```powershell
+# Windows (PowerShell)
+& ([scriptblock]::Create((irm https://github.com/LibreTether/libretether/releases/latest/download/install-windows.ps1))) `
+  -Token <TOKEN> -Relay <RELAY_HOST:PORT> -RelaySecret <AGENT_SECRET>
+```
+
+Use `install-macos.sh` on macOS. Each installer is pinned to the release it ships with, so it
+always pulls the matching agent build; `LIBRETETHER_AGENT_BIN` / `LIBRETETHER_AGENT_URL` still
+override the binary source.
+
+> Trying it on one machine? You can skip the scripts entirely: run
 > `libretether-agent enroll --controller <addr> --token <token>` then `libretether-agent run`
 > (or `libretether-agent install`) by hand.
 
