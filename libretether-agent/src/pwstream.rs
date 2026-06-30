@@ -106,6 +106,7 @@ fn run(
 			}
 			let format = user_data.format.format();
 			let Some(bytes) = data.data() else { return };
+			let convert_started = Instant::now();
 			if let Some(rgba) = to_rgba(bytes, stride, w, h, format) {
 				let raw = RawFrame {
 					width: w,
@@ -116,6 +117,9 @@ fn run(
 					origin_x: 0,
 					origin_y: 0,
 					rgba,
+					// On Wayland the compositor pushes frames, so "capture" cost here is
+					// the packed-buffer→RGBA conversion (the PipeWire wait isn't ours).
+					capture_us: convert_started.elapsed().as_micros() as u64,
 				};
 				match user_data.tx.try_send(raw) {
 					Ok(()) => user_data.last_emit = Some(Instant::now()),

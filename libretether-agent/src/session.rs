@@ -165,6 +165,7 @@ fn spawn_capture(
 						origin_x: cap.origin_x,
 						origin_y: cap.origin_y,
 						rgba: cap.image,
+						capture_us: started.elapsed().as_micros() as u64,
 					};
 					match tx.try_send(raw) {
 						// Encoder busy — drop this frame, the next capture is fresher.

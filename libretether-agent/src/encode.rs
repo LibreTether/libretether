@@ -17,7 +17,7 @@
 use std::borrow::Cow;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use image::imageops::{self, FilterType};
 use image::RgbaImage;
@@ -106,6 +106,20 @@ pub struct RawFrame {
 	pub origin_x: i32,
 	pub origin_y: i32,
 	pub rgba: RgbaImage,
+	/// Microseconds the producing thread spent obtaining this frame (the xcap grab
+	/// on X11/Windows/macOS, or the PipeWire→RGBA conversion on Wayland) — fed into
+	/// the per-stage stats so the capture cost is visible alongside encode/network.
+	pub capture_us: u64,
+}
+
+/// Per-stage timing + tile counts for one frame, returned by [`Tiler::encode`].
+pub struct EncodeOutcome {
+	/// The frame body, or `None` if nothing changed (the hash still ran).
+	pub body: Option<Vec<u8>>,
+	pub hash_us: u64,
+	pub encode_us: u64,
+	pub total_tiles: u32,
+	pub changed_tiles: u32,
 }
 
 /// An encoded frame ready to write to the session stream.
@@ -132,6 +146,7 @@ pub fn run(
 	// auto is off.
 	let mut eff_scale = shared.scale();
 	let mut good_streak = 0u32;
+	let mut stats = Stats::new();
 
 	while let Ok(raw) = rx.recv() {
 		let quality = shared.quality();
@@ -147,35 +162,43 @@ pub fn run(
 			tiler.reset();
 		}
 
-		let started = Instant::now();
+		let down_started = Instant::now();
 		let scaled = downscale(&raw.rgba, eff_scale);
-		let body = match tiler.encode(&scaled, quality, &mut seq) {
-			// Nothing changed since the last frame — send nothing, save the bandwidth.
-			None => continue,
-			Some(body) => body,
-		};
-		let encode_ms = started.elapsed().as_millis() as u64;
+		let downscale_us = down_started.elapsed().as_micros() as u64;
 
-		let out = OutFrame {
-			source_width: raw.width,
-			source_height: raw.height,
-			origin_x: raw.origin_x,
-			origin_y: raw.origin_y,
-			body,
-		};
+		let mut outcome = tiler.encode(&scaled, quality, &mut seq);
 
-		// Backpressure (not frame-dropping): a delta frame must reach the controller
-		// or its canvas goes stale, so block here. How long we block measures how far
-		// behind the link is.
-		let send_started = Instant::now();
-		if tx.blocking_send(out).is_err() {
-			break;
+		// Send only when something changed (a static frame produces no body). Take the
+		// body out so the rest of `outcome` (its timings/counts) stays borrowable for
+		// the stats below.
+		let body = outcome.body.take();
+		let bytes = body.as_ref().map_or(0, |b| b.len() as u64);
+		let sent = body.is_some();
+		let mut send_us = 0u64;
+		if let Some(body) = body {
+			let out = OutFrame {
+				source_width: raw.width,
+				source_height: raw.height,
+				origin_x: raw.origin_x,
+				origin_y: raw.origin_y,
+				body,
+			};
+			// Backpressure (not frame-dropping): a delta frame must reach the
+			// controller or its canvas goes stale, so block here. How long we block
+			// measures how far behind the link is.
+			let send_started = Instant::now();
+			if tx.blocking_send(out).is_err() {
+				break;
+			}
+			send_us = send_started.elapsed().as_micros() as u64;
 		}
-		let send_ms = send_started.elapsed().as_millis() as u64;
 
+		// Adaptive scale reacts to encode/network only — capture and downscale don't
+		// shrink with scale (downscale runs *after* capture), so lowering scale can't
+		// fix a capture-bound stream.
 		if auto {
-			let interval_ms = 1000 / shared.max_fps();
-			let behind = encode_ms > interval_ms || send_ms > interval_ms;
+			let interval_us = 1_000_000 / shared.max_fps();
+			let behind = outcome.encode_us > interval_us || send_us > interval_us;
 			if behind && eff_scale > AUTO_MIN_SCALE {
 				eff_scale = eff_scale.saturating_sub(AUTO_STEP).max(AUTO_MIN_SCALE);
 				good_streak = 0;
@@ -187,6 +210,91 @@ pub fn run(
 				}
 			}
 		}
+
+		stats.record(&raw, downscale_us, &outcome, send_us, bytes, sent);
+		stats.maybe_log(eff_scale, quality);
+	}
+}
+
+/// Rolling per-stage timing, logged ~once a second while a session runs so the
+/// operator can see exactly where the frame budget goes (capture vs hash vs encode
+/// vs network) on each guest — the basis for deciding what to optimize next.
+struct Stats {
+	window_start: Instant,
+	frames: u32,
+	sent: u32,
+	capture_us: u64,
+	downscale_us: u64,
+	hash_us: u64,
+	encode_us: u64,
+	send_us: u64,
+	changed_tiles: u64,
+	total_tiles: u64,
+	bytes: u64,
+}
+
+impl Stats {
+	fn new() -> Self {
+		Self {
+			window_start: Instant::now(),
+			frames: 0,
+			sent: 0,
+			capture_us: 0,
+			downscale_us: 0,
+			hash_us: 0,
+			encode_us: 0,
+			send_us: 0,
+			changed_tiles: 0,
+			total_tiles: 0,
+			bytes: 0,
+		}
+	}
+
+	fn record(
+		&mut self,
+		raw: &RawFrame,
+		downscale_us: u64,
+		outcome: &EncodeOutcome,
+		send_us: u64,
+		bytes: u64,
+		sent: bool,
+	) {
+		self.frames += 1;
+		if sent {
+			self.sent += 1;
+		}
+		self.capture_us += raw.capture_us;
+		self.downscale_us += downscale_us;
+		self.hash_us += outcome.hash_us;
+		self.encode_us += outcome.encode_us;
+		self.send_us += send_us;
+		self.changed_tiles += outcome.changed_tiles as u64;
+		self.total_tiles += outcome.total_tiles as u64;
+		self.bytes += bytes;
+	}
+
+	fn maybe_log(&mut self, scale: u8, quality: u8) {
+		let elapsed = self.window_start.elapsed();
+		if elapsed < Duration::from_secs(1) || self.frames == 0 {
+			return;
+		}
+		let n = self.frames as f64;
+		// Mean milliseconds per processed frame for each stage.
+		let ms = |total: u64| (total as f64 / n) / 1000.0;
+		let fps = n / elapsed.as_secs_f64();
+		let kib_per_sent = (self.bytes as f64 / self.sent.max(1) as f64) / 1024.0;
+		crate::net::log(&format!(
+			"stream {fps:.0} fps ({} sent/s) | cap {:.1} down {:.1} hash {:.1} enc {:.1} net {:.1} ms/f | {:.0}/{:.0} tiles {kib_per_sent:.0} KiB/f | scale {scale}% q{quality}",
+			self.sent,
+			ms(self.capture_us),
+			ms(self.downscale_us),
+			ms(self.hash_us),
+			ms(self.encode_us),
+			ms(self.send_us),
+			self.changed_tiles as f64 / n,
+			self.total_tiles as f64 / n,
+		));
+		*self = Stats::new();
 	}
 }
 
@@ -231,9 +339,10 @@ impl Tiler {
 		self.height = 0;
 	}
 
-	/// Encode `img` into a binary frame body, or `None` if nothing changed since the
-	/// previous frame. Bumps `seq` only when a frame is actually produced.
-	pub fn encode(&mut self, img: &RgbaImage, quality: u8, seq: &mut u64) -> Option<Vec<u8>> {
+	/// Encode `img` into a binary frame body (with per-stage timings), or a body of
+	/// `None` if nothing changed since the previous frame. Bumps `seq` only when a
+	/// frame is actually produced.
+	pub fn encode(&mut self, img: &RgbaImage, quality: u8, seq: &mut u64) -> EncodeOutcome {
 		let (w, h) = (img.width(), img.height());
 		let tile = self.tile as u32;
 		let key = w != self.width || h != self.height || self.hashes.is_empty();
@@ -248,6 +357,7 @@ impl Tiler {
 		let count = (cols * rows) as usize;
 
 		// Hash every tile (parallel, read-only over the frame).
+		let hash_started = Instant::now();
 		let current: Vec<u64> = (0..count)
 			.into_par_iter()
 			.map(|idx| {
@@ -255,6 +365,7 @@ impl Tiler {
 				hash_tile(img, rect)
 			})
 			.collect();
+		let hash_us = hash_started.elapsed().as_micros() as u64;
 
 		// On a keyframe every tile is sent; otherwise only those whose hash moved.
 		let changed: Vec<usize> = if key {
@@ -263,10 +374,17 @@ impl Tiler {
 			(0..count).filter(|&i| current[i] != self.hashes[i]).collect()
 		};
 		if changed.is_empty() {
-			return None;
+			return EncodeOutcome {
+				body: None,
+				hash_us,
+				encode_us: 0,
+				total_tiles: count as u32,
+				changed_tiles: 0,
+			};
 		}
 
 		// Encode the selected tiles in parallel.
+		let encode_started = Instant::now();
 		let tiles: Vec<Tile> = changed
 			.par_iter()
 			.map(|&i| {
@@ -278,10 +396,17 @@ impl Tiler {
 				}
 			})
 			.collect();
+		let encode_us = encode_started.elapsed().as_micros() as u64;
 
 		self.hashes = current;
 		*seq += 1;
-		Some(video::frame_message(key, *seq, w, h, self.tile, &tiles))
+		EncodeOutcome {
+			body: Some(video::frame_message(key, *seq, w, h, self.tile, &tiles)),
+			hash_us,
+			encode_us,
+			total_tiles: count as u32,
+			changed_tiles: changed.len() as u32,
+		}
 	}
 }
 
@@ -369,7 +494,10 @@ mod tests {
 		let mut tiler = Tiler::new(256);
 		let mut seq = 0;
 		// 300×300 with tile 256 → a 2×2 grid (4 tiles).
-		let body = tiler.encode(&solid(300, 300, [10, 20, 30, 255]), 70, &mut seq).unwrap();
+		let body = tiler
+			.encode(&solid(300, 300, [10, 20, 30, 255]), 70, &mut seq)
+			.body
+			.unwrap();
 		let payload = read_back(&body).await;
 		assert_eq!(payload[0], KIND_KEY);
 		assert_eq!(seq, 1);
@@ -382,9 +510,9 @@ mod tests {
 		let mut tiler = Tiler::new(256);
 		let mut seq = 0;
 		let img = solid(300, 300, [1, 2, 3, 255]);
-		tiler.encode(&img, 70, &mut seq).unwrap();
+		tiler.encode(&img, 70, &mut seq).body.unwrap();
 		assert!(
-			tiler.encode(&img, 70, &mut seq).is_none(),
+			tiler.encode(&img, 70, &mut seq).body.is_none(),
 			"a static frame sends nothing"
 		);
 		assert_eq!(seq, 1);
@@ -395,11 +523,11 @@ mod tests {
 		let mut tiler = Tiler::new(256);
 		let mut seq = 0;
 		let mut img = solid(300, 300, [0, 0, 0, 255]);
-		tiler.encode(&img, 70, &mut seq).unwrap(); // keyframe
+		tiler.encode(&img, 70, &mut seq).body.unwrap(); // keyframe
 
 		// Touch one pixel in the top-left tile only.
 		img.put_pixel(5, 5, image::Rgba([255, 255, 255, 255]));
-		let body = tiler.encode(&img, 70, &mut seq).unwrap();
+		let body = tiler.encode(&img, 70, &mut seq).body.unwrap();
 		let payload = read_back(&body).await;
 		assert_eq!(payload[0], KIND_DELTA);
 		let count = u32::from_be_bytes(payload[19..23].try_into().unwrap());
@@ -414,9 +542,9 @@ mod tests {
 		let mut tiler = Tiler::new(256);
 		let mut seq = 0;
 		let img = solid(300, 300, [9, 9, 9, 255]);
-		tiler.encode(&img, 70, &mut seq).unwrap();
+		tiler.encode(&img, 70, &mut seq).body.unwrap();
 		tiler.reset();
-		let body = tiler.encode(&img, 70, &mut seq).unwrap();
+		let body = tiler.encode(&img, 70, &mut seq).body.unwrap();
 		let payload = read_back(&body).await;
 		assert_eq!(payload[0], KIND_KEY, "after reset the next frame is a keyframe");
 	}
