@@ -80,6 +80,14 @@ The named volume (`/data`) keeps the generated config — the owner/agent secret
 TLS cert — stable across restarts. QUIC is UDP, hence `-p 47600:47600/udp`. Build it
 yourself with `run relay:docker:build` (or `docker build -t libretether-relay .`).
 
+To reprint the secrets from an **already-running** container, pass `--config` explicitly —
+`docker exec` bypasses the image entrypoint (which supplies it), so the bare
+`… info` would look at the wrong path:
+
+```bash
+docker exec libretether-relay libretether-relay --config /data/config.json info
+```
+
 Authentication is layered: the secrets gate access to the relay, and the agent still proves
 its identity to the controller end-to-end with Ed25519 — the relay only forwards bytes.
 

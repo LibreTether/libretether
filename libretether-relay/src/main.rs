@@ -8,7 +8,7 @@
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -100,14 +100,36 @@ fn config_path(arg: Option<PathBuf>) -> PathBuf {
 	})
 }
 
+/// Parse and validate a config from its on-disk text.
+fn parse_config(raw: &str, path: &Path) -> Result<ServerConfig> {
+	let cfg: ServerConfig = serde_json::from_str(raw).context("parsing server config")?;
+	cfg.validate()
+		.with_context(|| format!("config at {}", path.display()))?;
+	Ok(cfg)
+}
+
+/// Read an existing config, never creating one. `info` uses this: generating a
+/// fresh config here would print freshly-minted secrets that don't match the
+/// running relay — e.g. when `--config` is omitted and a default path the relay
+/// never used is consulted — which is more dangerous than a clean failure. Fail
+/// closed with an actionable error instead.
+fn load(path: &PathBuf) -> Result<ServerConfig> {
+	match std::fs::read_to_string(path) {
+		Ok(raw) => parse_config(&raw, path),
+		Err(e) if e.kind() == std::io::ErrorKind::NotFound => anyhow::bail!(
+			"no relay config at {} — run the relay (`libretether-relay run`) first to \
+			 generate one, or pass --config <path> to point at an existing config",
+			path.display()
+		),
+		Err(e) => Err(anyhow::Error::new(e).context(format!("reading relay config at {}", path.display()))),
+	}
+}
+
+/// Read the config, generating and persisting a fresh one on first run. `run`
+/// uses this; `info` must not (see [`load`]).
 fn load_or_create(path: &PathBuf) -> Result<ServerConfig> {
 	match std::fs::read_to_string(path) {
-		Ok(raw) => {
-			let cfg: ServerConfig = serde_json::from_str(&raw).context("parsing server config")?;
-			cfg.validate()
-				.with_context(|| format!("config at {}", path.display()))?;
-			Ok(cfg)
-		}
+		Ok(raw) => parse_config(&raw, path),
 		Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
 			let cfg = ServerConfig::generate();
 			// The config holds the owner/agent secrets and TLS key — write it
@@ -204,14 +226,16 @@ enum Command {
 async fn main() -> Result<()> {
 	let cli = Cli::parse();
 	let path = config_path(cli.config.clone());
-	let mut cfg = load_or_create(&path)?;
 
 	match cli.command {
 		Command::Info => {
-			print_credentials(&cfg);
+			// Read-only: never generate a config, so we can't print secrets that
+			// wouldn't match the running relay — see `load`.
+			print_credentials(&load(&path)?);
 			Ok(())
 		}
 		Command::Run { listen } => {
+			let mut cfg = load_or_create(&path)?;
 			if let Some(listen) = listen {
 				cfg.listen_addr = listen;
 			}
@@ -871,6 +895,29 @@ mod tests {
 			}
 			other => panic!("expected a stream reset for an unknown agent, got {other:?}"),
 		}
+	}
+
+	#[test]
+	fn info_load_refuses_to_create_a_missing_config() {
+		// `info` reads through `load`, which must fail with an actionable error
+		// (rather than silently minting secrets) when no config exists, and must
+		// leave no file behind — printing secrets the running relay never used
+		// would be a footgun.
+		let path = std::env::temp_dir()
+			.join(format!("libretether-relay-load-test-{}", std::process::id()))
+			.join("config.json");
+		let _ = std::fs::remove_dir_all(path.parent().unwrap());
+		// Not `unwrap_err`: `ServerConfig` deliberately isn't `Debug` (it holds the
+		// secrets), so match rather than require a `Debug` bound on the Ok type.
+		let err = match load(&path) {
+			Ok(_) => panic!("load must fail when no config exists"),
+			Err(e) => e.to_string(),
+		};
+		assert!(
+			err.contains("no relay config"),
+			"expected an actionable error, got: {err}"
+		);
+		assert!(!path.exists(), "load must not create a config file");
 	}
 
 	#[test]
