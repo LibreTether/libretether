@@ -13,7 +13,7 @@ members = [
 # lockstep with the desktop package.json / tauri.conf.json, so the agent (which
 # reports `CARGO_PKG_VERSION`) stops reporting a stale, hand-set 0.1.0.
 [workspace.package]
-version = "0.23.0"
+version = "0.24.0"
 
 # Applied workspace-wide (the relay/agent binaries and the desktop bundle all
 # ship from `--release`). Tuned for *release build time*, not binary size: the
