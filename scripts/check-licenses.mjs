@@ -47,7 +47,9 @@ const ALLOW = new Set([
 	"AGPL-3.0-or-later",
 	// SIL Open Font License — the bundled @fontsource webfonts (Geist, Geist Mono,
 	// Space Grotesk). Compatible by aggregation; see the note above.
-	"OFL-1.1"
+	"OFL-1.1",
+	"(MIT OR Apache-2.0)",
+	"IJG"
 ])
 
 // Escape hatch for individual deps verified by hand. Use "name" or "name@version".
