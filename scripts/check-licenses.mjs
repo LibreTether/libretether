@@ -14,8 +14,12 @@
 import { execSync } from "node:child_process"
 
 // SPDX ids accepted as compatible with an AGPL-3.0 outbound license:
-//   - permissive (MIT/BSD/ISC/Zlib/Apache-2.0/Boost/Unicode/public-domain), and
-//   - copyleft that is one-way compatible *into* (A)GPLv3 (MPL-2.0, LGPL, GPLv3).
+//   - permissive (MIT/BSD/ISC/Zlib/Apache-2.0/Boost/Unicode/public-domain),
+//   - copyleft that is one-way compatible *into* (A)GPLv3 (MPL-2.0, LGPL, GPLv3), and
+//   - font licenses compatible by aggregation (OFL-1.1): the bundled @fontsource
+//     webfonts ship as separate woff2 assets (referenced from CSS), not merged into
+//     the code, so the OFL coexists with our AGPL output. Verified via the SIL OFL
+//     FAQ §1.2/1.3 and the FSF, which lists OFL-1.1 as a free, GPL-compatible license.
 const ALLOW = new Set([
 	"MIT",
 	"MIT-0",
@@ -40,7 +44,10 @@ const ALLOW = new Set([
 	"GPL-3.0-only",
 	"GPL-3.0-or-later",
 	"AGPL-3.0-only",
-	"AGPL-3.0-or-later"
+	"AGPL-3.0-or-later",
+	// SIL Open Font License — the bundled @fontsource webfonts (Geist, Geist Mono,
+	// Space Grotesk). Compatible by aggregation; see the note above.
+	"OFL-1.1"
 ])
 
 // Escape hatch for individual deps verified by hand. Use "name" or "name@version".
