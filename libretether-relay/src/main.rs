@@ -20,12 +20,16 @@ use clap::{Parser, Subcommand};
 use libretether_common::{pipe_bidirectional, shutdown_signal};
 use libretether_protocol::crypto::{self, random_alnum};
 use libretether_protocol::frame::{read_frame_capped, write_frame, MAX_CONTROL_FRAME};
-use libretether_protocol::relay::{RelayAck, RelayChallenge, RelayEvent, RelayHello, RelayProof, RelayRole, RouteTo};
+use libretether_protocol::relay::{
+	RelayAck, RelayChallenge, RelayEvent, RelayHello, RelayProof, RelayRequest, RelayRole,
+};
 use libretether_protocol::{secret, tls, DEFAULT_PORT};
 use quinn::{Endpoint, RecvStream, SendStream};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+
+mod logbook;
 
 /// Hard ceiling on concurrent connections we'll service at once — beyond this we
 /// shed load rather than spawn unbounded tasks for a UDP-reachable public port.
@@ -257,11 +261,11 @@ async fn run(cfg: ServerConfig) -> Result<()> {
 	let (cert, key) = cfg.cert_key()?;
 	let addr: SocketAddr = cfg.listen_addr.parse().context("invalid listen address")?;
 	let endpoint = Endpoint::server(tls::server_config(cert, key), addr)?;
-	eprintln!("[libretether-relay] relay listening on udp/{addr}");
+	logbook::info(&format!("relay listening on udp/{addr}"));
 	// Don't echo the secrets on every `run` — they'd persist in the journal /
 	// `docker logs` for the life of the deployment. `libretether-relay info` prints
 	// them on demand.
-	eprintln!("[libretether-relay] run `libretether-relay info` to print the owner/agent secrets");
+	logbook::info("run `libretether-relay info` to print the owner/agent secrets");
 
 	let relay = Relay::default();
 	let secrets = Arc::new((cfg.owner_secret, cfg.agent_secret));
@@ -291,12 +295,12 @@ async fn run(cfg: ServerConfig) -> Result<()> {
 				tokio::spawn(async move {
 					let _permit = permit; // released when the connection task ends
 					if let Err(e) = handle(relay, incoming, &secrets, &agent_limit).await {
-						eprintln!("[libretether-relay] connection error: {e}");
+						logbook::warn(&format!("connection error: {e}"));
 					}
 				});
 			}
 			_ = shutdown_signal() => {
-				eprintln!("[libretether-relay] shutting down");
+				logbook::info("shutting down");
 				break;
 			}
 		}
@@ -338,7 +342,7 @@ async fn handle(
 			// minted keys, which the key-ownership proof can't prevent) can't drain the
 			// global pool and lock the controller out. Held for the connection's life.
 			let Ok(permit) = agent_limit.clone().try_acquire_owned() else {
-				eprintln!("[libretether-relay] agent connection refused: at agent capacity");
+				logbook::warn("agent connection refused: at agent capacity");
 				return Ok(());
 			};
 			serve_agent(relay, conn, authed.public_key, permit).await
@@ -404,10 +408,10 @@ async fn authenticate(conn: &quinn::Connection, secrets: &(String, String)) -> R
 		},
 	)
 	.await?;
-	eprintln!(
-		"[libretether-relay] {role_label} connected ({}…)",
+	logbook::info(&format!(
+		"{role_label} connected ({}…)",
 		&hello.public_key.chars().take(8).collect::<String>()
-	);
+	));
 
 	// Route on the canonical key bytes, not the raw wire string: two base64
 	// encodings of the same key must resolve to one routing entry. `verify_b64`
@@ -477,7 +481,9 @@ async fn serve_controller(relay: Relay, conn: quinn::Connection, mut events: Sen
 		})
 	};
 
-	// Route each stream the controller opens to the named agent.
+	// Each stream the controller opens leads with a RelayRequest header: either route
+	// it to the named agent (the common case) or serve it ourselves (the relay's own
+	// logs).
 	loop {
 		let (mut c_send, mut c_recv) = match conn.accept_bi().await {
 			Ok(pair) => pair,
@@ -485,22 +491,34 @@ async fn serve_controller(relay: Relay, conn: quinn::Connection, mut events: Sen
 		};
 		let relay = relay.clone();
 		tokio::spawn(async move {
-			let Ok(route) = read_frame_capped::<_, RouteTo>(&mut c_recv, MAX_CONTROL_FRAME).await else {
+			let Ok(req) = read_frame_capped::<_, RelayRequest>(&mut c_recv, MAX_CONTROL_FRAME).await else {
 				return;
 			};
-			// Reset the stream with a distinct code (rather than silently dropping it)
-			// when the addressed agent is gone or its connection is dying, so the
-			// controller gets a prompt, attributable failure instead of an opaque
-			// close it might mistake for a transient relay hiccup.
-			let agent_key = crypto::canonical_pubkey(&route.agent).unwrap_or(route.agent);
-			let Some(agent) = relay.agent(&agent_key) else {
-				let _ = c_send.reset(AGENT_UNAVAILABLE.into());
-				return;
-			};
-			match agent.open_bi().await {
-				Ok((a_send, a_recv)) => pipe(c_recv, a_send, a_recv, c_send).await,
-				Err(_) => {
-					let _ = c_send.reset(AGENT_UNAVAILABLE.into());
+			match req {
+				// Served by the relay itself: hand back a snapshot of its own log ring
+				// so an operator can read the relay's activity from the controller.
+				RelayRequest::FetchLogs { max_lines } => {
+					let snapshot = logbook::snapshot(max_lines.map(|m| m as usize));
+					let _ = write_frame(&mut c_send, &snapshot).await;
+					let _ = c_send.finish();
+				}
+				// Pipe to the addressed agent. Reset the stream with a distinct code
+				// (rather than silently dropping it) when the agent is gone or its
+				// connection is dying, so the controller gets a prompt, attributable
+				// failure instead of an opaque close it might mistake for a transient
+				// relay hiccup.
+				RelayRequest::Route { agent } => {
+					let agent_key = crypto::canonical_pubkey(&agent).unwrap_or(agent);
+					let Some(agent) = relay.agent(&agent_key) else {
+						let _ = c_send.reset(AGENT_UNAVAILABLE.into());
+						return;
+					};
+					match agent.open_bi().await {
+						Ok((a_send, a_recv)) => pipe(c_recv, a_send, a_recv, c_send).await,
+						Err(_) => {
+							let _ = c_send.reset(AGENT_UNAVAILABLE.into());
+						}
+					}
 				}
 			}
 		});
@@ -839,7 +857,7 @@ mod tests {
 		let (mut rsend, mut rrecv) = ctrl_conn.open_bi().await.unwrap();
 		write_frame(
 			&mut rsend,
-			&RouteTo {
+			&RelayRequest::Route {
 				agent: agent_key.clone(),
 			},
 		)
@@ -848,13 +866,13 @@ mod tests {
 		rsend.write_all(b"PING").await.unwrap();
 		let _ = rsend.finish();
 
-		// The agent receives the payload *without* the RouteTo header (the relay
+		// The agent receives the payload *without* the RelayRequest header (the relay
 		// consumed it), then echoes back through the relay to the controller.
 		let (mut asend, mut arecv) = with_timeout("agent accept", agent_conn.accept_bi()).await.unwrap();
 		let got = with_timeout("agent read", arecv.read_to_end(64)).await.unwrap();
 		assert_eq!(
 			got, b"PING",
-			"RouteTo header must be stripped; agent sees only the payload"
+			"the RelayRequest header must be stripped; agent sees only the payload"
 		);
 		asend.write_all(b"PONG").await.unwrap();
 		let _ = asend.finish();
@@ -879,7 +897,7 @@ mod tests {
 		// with AGENT_UNAVAILABLE, so the controller gets an attributable failure
 		// rather than an ambiguous clean close.
 		let (mut rsend, mut rrecv) = ctrl_conn.open_bi().await.unwrap();
-		write_frame(&mut rsend, &RouteTo { agent: "GHOST".into() })
+		write_frame(&mut rsend, &RelayRequest::Route { agent: "GHOST".into() })
 			.await
 			.unwrap();
 		rsend.write_all(b"hello?").await.unwrap();
@@ -895,6 +913,38 @@ mod tests {
 			}
 			other => panic!("expected a stream reset for an unknown agent, got {other:?}"),
 		}
+	}
+
+	#[tokio::test]
+	async fn a_fetch_logs_request_is_served_by_the_relay_itself() {
+		let (relay_ep, addr) = relay_server();
+		let relay = Relay::default();
+
+		// Seed the relay's own log ring so the snapshot has something to return.
+		logbook::info("relay listening on udp/0.0.0.0:47600");
+
+		let (_cep, ctrl_conn, ctrl_view) = connect(&relay_ep, addr).await;
+		let (events_send, _events_recv) = open_events(&ctrl_conn, &ctrl_view).await;
+		tokio::spawn({
+			let relay = relay.clone();
+			async move { serve_controller(relay, ctrl_view, events_send).await }
+		});
+
+		// A FetchLogs stream is answered by the relay itself (not routed to an agent):
+		// it replies with a LogsResult drawn from its own log buffer.
+		let (mut rsend, mut rrecv) = ctrl_conn.open_bi().await.unwrap();
+		write_frame(&mut rsend, &RelayRequest::FetchLogs { max_lines: None })
+			.await
+			.unwrap();
+		let _ = rsend.finish();
+		let result: libretether_protocol::LogsResult =
+			with_timeout("read relay logs", read_frame_capped(&mut rrecv, MAX_CONTROL_FRAME))
+				.await
+				.unwrap();
+		assert!(
+			result.lines.iter().any(|l| l.message.contains("relay listening")),
+			"the relay returns its own recorded log lines"
+		);
 	}
 
 	#[test]

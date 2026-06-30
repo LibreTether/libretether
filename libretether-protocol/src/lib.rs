@@ -248,18 +248,19 @@ pub struct LogLine {
 	pub message: String,
 }
 
-/// The agent's recent log lines, oldest first. `dropped` is true when the ring
-/// buffer evicted older lines before this snapshot, so the UI can flag that the
-/// history is partial.
+/// A sender's recent log lines, oldest first — produced by both the agent (its own
+/// log) and the relay (its server log). `dropped` is true when the ring buffer
+/// evicted older lines before this snapshot, so the UI can flag that the history is
+/// partial.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LogsResult {
 	pub lines: Vec<LogLine>,
 	pub dropped: bool,
-	/// The agent's wall clock (Unix seconds) when it took this snapshot. The
+	/// The sender's wall clock (Unix seconds) when it took this snapshot. The
 	/// controller re-anchors every line's `ts_secs` to its own clock using
-	/// `controller_now - agent_now_secs`, so a client in another timezone or with a
-	/// skewed clock still renders at the correct local time alongside other logs.
-	pub agent_now_secs: u64,
+	/// `controller_now - now_secs`, so an agent or relay in another timezone or with
+	/// a skewed clock still renders at the correct local time alongside other logs.
+	pub now_secs: u64,
 }
 
 /// How to reach the RDP server the agent just enabled.
@@ -569,7 +570,7 @@ mod tests {
 				},
 			],
 			dropped: true,
-			agent_now_secs: 200,
+			now_secs: 200,
 		});
 		let back: ControlResponse = round_trip(&logs);
 		let ControlResponse::Logs(r) = back else {

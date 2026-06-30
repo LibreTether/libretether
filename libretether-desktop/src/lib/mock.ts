@@ -254,6 +254,18 @@ export function mockInvoke(cmd: string, args?: Record<string, unknown>): Promise
 					ts_secs: NOW - 90
 				}
 			] satisfies LogEntry[])
+		case "relay_logs":
+			return delay([
+				{ level: "info", message: "relay listening on udp/0.0.0.0:47600", source: "relay", ts_secs: NOW - 600 },
+				{ level: "info", message: "controller connected (a1b2c3d4…)", source: "relay", ts_secs: NOW - 540 },
+				{ level: "info", message: "agent connected (9f2c7b41…)", source: "relay", ts_secs: NOW - 120 },
+				{
+					level: "warn",
+					message: "agent connection refused: at agent capacity",
+					source: "relay",
+					ts_secs: NOW - 40
+				}
+			] satisfies LogEntry[])
 		case "set_settings":
 			settings.rdp_client = (args?.rdpClient as string | null) ?? null
 			settings.terminal = (args?.terminal as string | null) ?? null

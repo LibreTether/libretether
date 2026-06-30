@@ -12,9 +12,13 @@ import type { ClientDto, LogEntry, LogLevel } from "../lib/types"
 const LEVELS: LogLevel[] = ["error", "warn", "info", "debug", "trace"]
 
 /** Sources produced by the controller itself (its own buffer) — everything else is
- *  an agent's name. Used so a refresh of the controller buffer replaces these in
- *  place without duplicating them, while leaving on-demand agent logs untouched. */
+ *  an agent's name (or the relay). Used so a refresh of the controller buffer
+ *  replaces these in place without duplicating them, while leaving on-demand agent
+ *  and relay logs untouched. */
 const CONTROLLER_SOURCES = new Set(["controller", "tunnel", "rdp"])
+
+/** Source tag for lines pulled from the relay server itself (relay mode only). */
+const RELAY_SOURCE = "relay"
 
 /** Keep the view bounded — a live controller can emit indefinitely. */
 const MAX_ROWS = 3000
@@ -48,7 +52,17 @@ function cap(r: Row[]): Row[] {
 	return r.length > MAX_ROWS ? r.slice(r.length - MAX_ROWS) : r
 }
 
-export function LogsPage({ clients, hotkeysEnabled }: { clients: ClientDto[]; hotkeysEnabled: boolean }) {
+export function LogsPage({
+	clients,
+	hotkeysEnabled,
+	relayMode
+}: {
+	clients: ClientDto[]
+	hotkeysEnabled: boolean
+	/** True when the active controller runs in relay mode — gates the "relay logs"
+	 *  control, since only then is there a relay server to pull logs from. */
+	relayMode: boolean
+}) {
 	const toast = useToast()
 	const [rows, setRows] = useState<Row[]>([])
 	const [levels, setLevels] = useState<Set<LogLevel>>(() => new Set(LEVELS))
@@ -56,6 +70,7 @@ export function LogsPage({ clients, hotkeysEnabled }: { clients: ClientDto[]; ho
 	const [search, setSearch] = useState("")
 	const [agentId, setAgentId] = useState("")
 	const [fetching, setFetching] = useState(false)
+	const [relayFetching, setRelayFetching] = useState(false)
 	const searchRef = useRef<HTMLInputElement>(null)
 
 	useHotkeys([{ combo: "/", handler: () => searchRef.current?.focus() }], hotkeysEnabled)
@@ -105,6 +120,21 @@ export function LogsPage({ clients, hotkeysEnabled }: { clients: ClientDto[]; ho
 			toast.error("Couldn't fetch agent logs", api.errString(e))
 		} finally {
 			setFetching(false)
+		}
+	}
+
+	const loadRelayLogs = async () => {
+		setRelayFetching(true)
+		try {
+			const fresh = tag(await api.relayLogs())
+			// Replace any previously-loaded relay lines so re-fetching doesn't pile up
+			// duplicates (the relay is a single source, like one agent).
+			setRows((prev) => cap([...prev.filter((r) => r.source !== RELAY_SOURCE), ...fresh]))
+			if (fresh.length === 0) toast.info("No relay logs", "The relay reported an empty log buffer.")
+		} catch (e) {
+			toast.error("Couldn't fetch relay logs", api.errString(e))
+		} finally {
+			setRelayFetching(false)
 		}
 	}
 
@@ -226,26 +256,37 @@ export function LogsPage({ clients, hotkeysEnabled }: { clients: ClientDto[]; ho
 						/>
 					</div>
 
-					<div className="ml-auto flex items-center gap-2">
-						<span className="eyebrow">Agent logs</span>
-						<Combobox
-							className="w-44"
-							disabled={online.length === 0}
-							emptyText="No machines online"
-							onChange={setAgentId}
-							options={online.map((c) => ({ label: c.name, value: c.id }))}
-							placeholder="Pick a machine…"
-							value={agentId || null}
-						/>
-						<Button
-							disabled={online.length === 0 || !agentId}
-							loading={fetching}
-							onClick={loadAgentLogs}
-							size="sm"
-							variant="soft"
-						>
-							Load
-						</Button>
+					<div className="ml-auto flex items-center gap-4">
+						{/* Relay-mode only: the relay server has its own log we can pull. */}
+						{relayMode && (
+							<div className="flex items-center gap-2">
+								<span className="eyebrow">Relay</span>
+								<Button loading={relayFetching} onClick={loadRelayLogs} size="sm" variant="soft">
+									Load relay logs
+								</Button>
+							</div>
+						)}
+						<div className="flex items-center gap-2">
+							<span className="eyebrow">Agent logs</span>
+							<Combobox
+								className="w-44"
+								disabled={online.length === 0}
+								emptyText="No machines online"
+								onChange={setAgentId}
+								options={online.map((c) => ({ label: c.name, value: c.id }))}
+								placeholder="Pick a machine…"
+								value={agentId || null}
+							/>
+							<Button
+								disabled={online.length === 0 || !agentId}
+								loading={fetching}
+								onClick={loadAgentLogs}
+								size="sm"
+								variant="soft"
+							>
+								Load
+							</Button>
+						</div>
 					</div>
 				</div>
 			</div>

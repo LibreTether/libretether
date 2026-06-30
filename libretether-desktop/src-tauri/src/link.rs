@@ -12,7 +12,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use libretether_protocol::frame::write_frame;
-use libretether_protocol::relay::RouteTo;
+use libretether_protocol::relay::RelayRequest;
 use libretether_protocol::{StreamAuth, StreamOpen};
 use quinn::{Connection, RecvStream, SendStream};
 
@@ -71,7 +71,7 @@ impl AgentLink {
 					.open_bi()
 					.await
 					.map_err(|e| AppError::msg(format!("open relay stream: {e}")))?;
-				write_frame(&mut send, &RouteTo { agent: agent.clone() }).await?;
+				write_frame(&mut send, &RelayRequest::Route { agent: agent.clone() }).await?;
 				Ok((send, recv))
 			}
 		}

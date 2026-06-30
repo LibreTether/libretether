@@ -196,6 +196,10 @@ pub struct ActiveController {
 	pub sessions: Mutex<HashMap<Uuid, SessionHandle>>,
 	/// Active loopback tunnels keyed by `(client, remote_port)`.
 	pub tunnels: Mutex<HashMap<(Uuid, u16), TunnelHandle>>,
+	/// The live relay connection in relay mode, so commands can open a stream to the
+	/// relay itself (e.g. fetching its server log). `None` in direct/Tailscale mode
+	/// and while the relay session is down/reconnecting.
+	pub relay_conn: Mutex<Option<quinn::Connection>>,
 	/// Serializes registry persisters so their disk writes stay ordered with the
 	/// snapshots they took — without holding the `store` lock across the fsync.
 	persist_lock: Mutex<()>,
@@ -210,6 +214,7 @@ impl ActiveController {
 			live: Mutex::new(HashMap::new()),
 			sessions: Mutex::new(HashMap::new()),
 			tunnels: Mutex::new(HashMap::new()),
+			relay_conn: Mutex::new(None),
 			persist_lock: Mutex::new(()),
 		}
 	}

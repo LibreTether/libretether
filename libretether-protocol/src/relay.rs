@@ -71,12 +71,22 @@ pub enum RelayEvent {
 	Heartbeat,
 }
 
-/// First frame the controller writes on each *routed* stream it opens to the
-/// relay, naming the agent the stream should be piped to. Everything after this
-/// frame is piped verbatim to (and from) that agent.
+/// First frame the controller writes on each stream it opens to the relay.
+///
+/// Most streams are [`Self::Route`] — the relay strips this header and pipes
+/// everything after it verbatim to (and from) the addressed agent, end-to-end.
+/// [`Self::FetchLogs`] is the exception: the relay serves it itself, replying with
+/// its own recent log lines (a [`crate::LogsResult`]) so an operator can read the
+/// relay's activity from the controller's Logs page without shelling into the relay
+/// host.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RouteTo {
-	pub agent: String,
+#[serde(tag = "t", rename_all = "snake_case")]
+pub enum RelayRequest {
+	/// Pipe this stream to the agent named by its Ed25519 public key.
+	Route { agent: String },
+	/// Return the relay's own recent log lines (most recent last), capped at
+	/// `max_lines` when set. Answered by the relay, not forwarded to an agent.
+	FetchLogs { max_lines: Option<u32> },
 }
 
 /// The client side of the relay handshake, shared by the agent and the

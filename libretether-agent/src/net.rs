@@ -72,7 +72,7 @@ impl LogRing {
 		LogsResult {
 			lines: self.lines.iter().skip(self.lines.len() - take).cloned().collect(),
 			dropped: self.dropped,
-			agent_now_secs: host::now_secs(),
+			now_secs: host::now_secs(),
 		}
 	}
 }

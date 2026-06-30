@@ -13,9 +13,9 @@ use std::time::Duration;
 use libretether_common::Backoff;
 use libretether_protocol::crypto;
 use libretether_protocol::frame::{read_frame, read_frame_capped, write_frame, MAX_CONTROL_FRAME};
-use libretether_protocol::relay::{self, RelayEvent, RelayRole};
+use libretether_protocol::relay::{self, RelayEvent, RelayRequest, RelayRole};
 use libretether_protocol::{
-	tls, Challenge, ControlRequest, ControlResponse, Hello, HelloAck, SessionGrant, StreamOpen,
+	tls, Challenge, ControlRequest, ControlResponse, Hello, HelloAck, LogsResult, SessionGrant, StreamOpen,
 	DEFAULT_EXEC_TIMEOUT_SECS, MAX_EXEC_TIMEOUT_SECS, PROTOCOL_VERSION,
 };
 use quinn::Endpoint;
@@ -139,8 +139,10 @@ pub async fn serve_relay(state: AppState, ctrl: Arc<ActiveController>) {
 			Ok(()) => backoff.reset(),
 			Err(e) => relay_log(&state, &format!("relay error: {e:#}")),
 		}
-		// The relay is gone, so every agent is unreachable.
+		// The relay is gone, so every agent is unreachable and the connection a
+		// `relay_logs` fetch would use is dead.
 		ctrl.live.lock().unwrap().clear();
+		*ctrl.relay_conn.lock().unwrap() = None;
 		state.notify_changed();
 		let wait = backoff.next_delay();
 		relay_log(&state, &format!("reconnecting to relay in {}s", wait.as_secs()));
@@ -171,6 +173,9 @@ async fn relay_session(
 	let (_send, mut recv) =
 		relay::client_handshake(&conn, RelayRole::Controller, owner_secret, &ctrl.profile.identity()?).await?;
 	relay_log(state, "connected to relay; awaiting agents");
+	// Publish the live connection so commands can reach the relay itself (e.g. the
+	// Logs page fetching the relay's server log). Cleared when the session ends.
+	*ctrl.relay_conn.lock().unwrap() = Some(conn.clone());
 	if let Some(app) = state.0.app.get() {
 		let _ = app.emit(EVENT_RELAY_CONNECTED, ());
 	}
@@ -221,6 +226,21 @@ async fn relay_session(
 			}
 		}
 	}
+}
+
+/// Fetch the relay server's own recent log lines over the live relay connection
+/// (relay mode only). Opens a fresh stream, leads with [`RelayRequest::FetchLogs`]
+/// so the relay answers it itself rather than routing it to an agent, and reads the
+/// [`LogsResult`] back. Uses the wide `read_frame` cap because a full log snapshot
+/// can exceed the 1 MiB control cap.
+pub async fn fetch_relay_logs(conn: &quinn::Connection, max_lines: Option<u32>) -> AppResult<LogsResult> {
+	let (mut send, mut recv) = conn
+		.open_bi()
+		.await
+		.map_err(|e| AppError::msg(format!("open relay stream: {e}")))?;
+	write_frame(&mut send, &RelayRequest::FetchLogs { max_lines }).await?;
+	let _ = send.finish();
+	Ok(read_frame::<_, LogsResult>(&mut recv).await?)
 }
 
 // ---------------------------------------------------------------- shared

@@ -692,7 +692,7 @@ pub async fn client_logs(
 	// guest VMs), so trusting the absolute value makes its lines render at the wrong
 	// local time. Shifting every line by (our_now - their_now) keeps each line's age
 	// intact but expresses it in the controller's frame, matching controller/RDP logs.
-	let offset = libretether_common::now_secs() as i64 - result.agent_now_secs as i64;
+	let offset = libretether_common::now_secs() as i64 - result.now_secs as i64;
 	Ok(result
 		.lines
 		.into_iter()
@@ -700,6 +700,44 @@ pub async fn client_logs(
 			ts_secs: (l.ts_secs as i64 + offset).max(0) as u64,
 			level: l.level,
 			source: source.clone(),
+			message: l.message,
+		})
+		.collect())
+}
+
+/// Fetch the relay server's own recent log lines (relay-mode controllers only),
+/// normalised into the same [`crate::logbook::LogEntry`] shape as controller/agent
+/// logs and tagged with the source `"relay"`, so the Logs page can show them
+/// alongside the rest. Fails closed for a non-relay controller, and with a clear
+/// "still connecting" error while the relay session is down.
+#[tauri::command]
+pub async fn relay_logs(
+	state: State<'_, AppState>,
+	max_lines: Option<u32>,
+) -> AppResult<Vec<crate::logbook::LogEntry>> {
+	let ctrl = state.require_active()?;
+	if ctrl.profile.kind.relay().is_none() {
+		return Err(AppError::msg("this controller isn't using a relay"));
+	}
+	// Clone the connection out and drop the lock before awaiting — never hold a
+	// std mutex across an await point.
+	let conn = ctrl
+		.relay_conn
+		.lock()
+		.unwrap()
+		.clone()
+		.ok_or_else(|| AppError::msg("not connected to the relay yet — still connecting"))?;
+	let result = crate::server::fetch_relay_logs(&conn, max_lines).await?;
+	// Re-anchor the relay's timestamps to OUR clock, exactly as `client_logs` does
+	// for agents — the relay host may be in another timezone or have a skewed clock.
+	let offset = libretether_common::now_secs() as i64 - result.now_secs as i64;
+	Ok(result
+		.lines
+		.into_iter()
+		.map(|l| crate::logbook::LogEntry {
+			ts_secs: (l.ts_secs as i64 + offset).max(0) as u64,
+			level: l.level,
+			source: "relay".to_string(),
 			message: l.message,
 		})
 		.collect())
