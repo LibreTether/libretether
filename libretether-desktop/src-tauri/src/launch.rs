@@ -21,6 +21,10 @@ pub fn split_template(template: &str) -> AppResult<(&str, std::str::SplitWhitesp
 }
 
 /// Spawn `cmd`, mapping a launch failure to a readable error tagged with `label`.
+///
+/// Linux-only: only the Linux SSH launcher spawns a terminal this way (macOS goes
+/// through `osascript`, Windows spawns `ssh.exe` with `CREATE_NEW_CONSOLE`).
+#[cfg(target_os = "linux")]
 pub fn spawn(mut cmd: Command, label: &str) -> AppResult<()> {
 	cmd.spawn()
 		.map(|_| ())
