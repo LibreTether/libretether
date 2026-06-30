@@ -42,6 +42,25 @@ export interface CreateClientResult {
 	deploy_script: string
 }
 
+/** Result of starting a phone-pairing (`open_pairing`): the pending client, the
+ *  short code to read aloud, and the portal URL the new machine opens. The pairing
+ *  then completes in the background — listen for `onPairingCompleted`. */
+export interface PairingStarted {
+	client: ClientDto
+	code: string
+	portal_url: string
+}
+
+/** Payload of the `pairing:completed` event. `code` identifies which pairing it
+ *  refers to; `phrase` is the verify phrase on success, `error` the reason on
+ *  failure. */
+export interface PairingCompleted {
+	ok: boolean
+	code: string
+	phrase?: string
+	error?: string
+}
+
 export interface TailscaleInfo {
 	installed: boolean
 	running: boolean

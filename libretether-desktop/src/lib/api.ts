@@ -11,6 +11,8 @@ import type {
 	ExecResult,
 	InputEvent,
 	LogEntry,
+	PairingCompleted,
+	PairingStarted,
 	ScreenshotResult,
 	SessionConfig,
 	SessionMeta,
@@ -40,6 +42,7 @@ export const removeClient = (id: string) => call<void>("remove_client", { id })
 export const renameClient = (id: string, name: string) => call<void>("rename_client", { id, name })
 export const getDeployScript = (id: string, os?: ClientOs) => call<string>("get_deploy_script", { id, os })
 export const resetToken = (id: string) => call<CreateClientResult>("reset_token", { id })
+export const openPairing = (name: string, os: ClientOs) => call<PairingStarted>("open_pairing", { name, os })
 
 // ---------------------------------------------------------------- live control
 export const clientStatus = (id: string) => call<AgentStatus>("client_status", { id })
@@ -102,6 +105,8 @@ export const onSessionClosed = (id: string, cb: () => void): Promise<UnlistenFn>
 	sub(`session:closed:${id}`, () => cb())
 export const onSessionError = (id: string, cb: (msg: string) => void): Promise<UnlistenFn> =>
 	sub<string>(`session:error:${id}`, (e) => cb(e.payload))
+export const onPairingCompleted = (cb: (e: PairingCompleted) => void): Promise<UnlistenFn> =>
+	sub<PairingCompleted>("pairing:completed", (e) => cb(e.payload))
 
 /** Normalise an error thrown from `invoke` into a readable string. Tauri can
  *  reject with a plain object (e.g. `{ message }`) rather than a string/Error, so

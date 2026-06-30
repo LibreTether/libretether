@@ -19,16 +19,28 @@ use crate::frame::{read_frame_capped, write_frame, MAX_CONTROL_FRAME};
 pub enum RelayRole {
 	Controller,
 	Agent,
+	/// A not-yet-enrolled machine joining a pairing mailbox by nameplate (see
+	/// [`crate::pairing`]). It presents no secret — the relay only matches it to a
+	/// controller's open pairing slot and pipes the two together; the PAKE over that
+	/// pipe is the real authentication, so the relay never trusts this peer.
+	Pairing,
 }
 
 /// First frame a client sends on its control stream to the relay.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RelayHello {
 	pub role: RelayRole,
-	/// Owner secret (controller) or agent secret (agent).
+	/// Owner secret (controller) or agent secret (agent). Empty for the `Pairing`
+	/// role, which carries no secret.
 	pub secret: String,
-	/// Ed25519 public key — the agent's routing key (and identity).
+	/// Ed25519 public key — the agent's routing key (and identity). Empty for the
+	/// `Pairing` role (the joining machine isn't trusted by key yet).
 	pub public_key: String,
+	/// The pairing nameplate, set only for the `Pairing` role: the relay-visible
+	/// routing id that matches this joiner to a controller's open pairing slot. The
+	/// code's secret half is never sent — see [`crate::pairing`].
+	#[serde(default)]
+	pub nameplate: Option<String>,
 }
 
 /// Relay → client, after a valid secret: a nonce the client must sign with the
@@ -89,6 +101,11 @@ pub enum RelayRequest {
 	/// incrementally and passes back the previous response's `next_seq`); `None`
 	/// returns all retained lines. Answered by the relay, not forwarded to an agent.
 	FetchLogs { after_seq: Option<u64> },
+	/// Open a pairing mailbox under `nameplate`: the relay parks this stream until a
+	/// `Pairing`-role peer joins with the same nameplate, then pipes the two together
+	/// so the controller and the new machine can run the PAKE end-to-end (see
+	/// [`crate::pairing`]). The relay only matches by nameplate and forwards bytes.
+	OpenPairing { nameplate: String },
 }
 
 /// The client side of the relay handshake, shared by the agent and the
@@ -115,6 +132,7 @@ pub async fn client_handshake(
 			role,
 			secret: secret.to_string(),
 			public_key: identity.public_b64(),
+			nameplate: None,
 		},
 	)
 	.await?;
@@ -135,5 +153,33 @@ pub async fn client_handshake(
 			format!("relay rejected connection: {}", ack.reason.unwrap_or_default()),
 		));
 	}
+	Ok((send, recv))
+}
+
+/// The not-yet-enrolled machine's side of joining a pairing mailbox: open a stream,
+/// announce the nameplate, and return its halves to run the PAKE over. The relay
+/// pipes this stream to the controller's matching open slot. There is no ack — if no
+/// slot matches (wrong/expired nameplate), the relay resets the stream and the PAKE
+/// read/write that follows fails, which the caller surfaces as a pairing error.
+pub async fn pairing_join(
+	conn: &quinn::Connection,
+	nameplate: &str,
+) -> std::io::Result<(quinn::SendStream, quinn::RecvStream)> {
+	let (mut send, recv) = conn.open_bi().await.map_err(|e| {
+		std::io::Error::new(
+			std::io::ErrorKind::ConnectionRefused,
+			format!("open pairing stream: {e}"),
+		)
+	})?;
+	write_frame(
+		&mut send,
+		&RelayHello {
+			role: RelayRole::Pairing,
+			secret: String::new(),
+			public_key: String::new(),
+			nameplate: Some(nameplate.to_string()),
+		},
+	)
+	.await?;
 	Ok((send, recv))
 }

@@ -8,12 +8,14 @@
 #
 # Or download and run: powershell -ExecutionPolicy Bypass -File .\install-windows.ps1 -Token ...
 param(
-	[Parameter(Mandatory = $true)][string]$Token,
+	[string]$Token,
 	[string]$Controller,
 	[string]$Relay,
 	[string]$RelaySecret,
 	[string]$TailscaleKey,
 	[string]$ControllerKey,
+	[switch]$Pair,
+	[string]$Code,
 	[string]$Name = $env:COMPUTERNAME,
 	[string]$AgentUrl,
 	[switch]$NoRdp
@@ -80,11 +82,19 @@ function Test-Checksum {
 	Write-Host "==> Verified agent checksum."
 }
 
-if ($Relay -and $Controller) { throw "Use -Relay or -Controller, not both." }
-if ($Relay) {
-	if (-not $RelaySecret) { throw "-Relay requires -RelaySecret." }
-} elseif (-not $Controller) {
-	throw "Provide -Relay HOST:PORT -RelaySecret SECRET, or -Controller HOST:PORT."
+# Pairing mode (a short code from the browser portal) needs only the relay; the
+# token, secret and controller key all arrive over the PAKE channel. Otherwise it's
+# classic enrollment with a token.
+if ($Code) {
+	if (-not $Relay) { throw "-Code requires -Relay HOST:PORT." }
+} else {
+	if (-not $Token) { throw "Provide -Token (or use -Pair -Code for a portal code)." }
+	if ($Relay -and $Controller) { throw "Use -Relay or -Controller, not both." }
+	if ($Relay) {
+		if (-not $RelaySecret) { throw "-Relay requires -RelaySecret." }
+	} elseif (-not $Controller) {
+		throw "Provide -Relay HOST:PORT -RelaySecret SECRET, or -Controller HOST:PORT."
+	}
 }
 
 $BinDir = Join-Path $env:LOCALAPPDATA "LibreTether"
@@ -171,13 +181,18 @@ function Enable-RemoteDesktop {
 	}
 }
 
-# 3. Enroll and register the logon task. The controller key (when supplied) pins
-#    the controller identity so the agent only accepts that controller.
-$KeyArgs = if ($ControllerKey) { @('--controller-key', $ControllerKey) } else { @() }
-if ($Relay) {
-	Invoke-Agent (@('enroll', '--relay', $Relay, '--relay-secret', $RelaySecret, '--token', $Token) + $KeyArgs)
+# 3. Pair (portal code) or enroll (token), then register the logon task. In pair
+#    mode the controller key + token arrive over the PAKE channel; in enroll mode the
+#    controller key (when supplied) pins the controller identity.
+if ($Code) {
+	Invoke-Agent @('pair', '--relay', $Relay, '--code', $Code)
 } else {
-	Invoke-Agent (@('enroll', '--controller', $Controller, '--token', $Token) + $KeyArgs)
+	$KeyArgs = if ($ControllerKey) { @('--controller-key', $ControllerKey) } else { @() }
+	if ($Relay) {
+		Invoke-Agent (@('enroll', '--relay', $Relay, '--relay-secret', $RelaySecret, '--token', $Token) + $KeyArgs)
+	} else {
+		Invoke-Agent (@('enroll', '--controller', $Controller, '--token', $Token) + $KeyArgs)
+	}
 }
 Invoke-Agent @('install')
 

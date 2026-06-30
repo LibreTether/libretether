@@ -30,6 +30,7 @@ use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 mod logbook;
+mod portal;
 
 /// First 8 characters of a public key, for log lines (the full key is long and
 /// noisy; the prefix is enough to correlate an agent across log entries).
@@ -63,25 +64,43 @@ const RATE_WINDOW: Duration = Duration::from_secs(10);
 /// addressed agent isn't connected, so the controller can tell "agent offline"
 /// apart from a transport drop.
 const AGENT_UNAVAILABLE: u32 = 0x10;
+/// QUIC application error code the relay resets a pairing-join stream with when no
+/// open slot matches its nameplate, so the joining machine gets an attributable
+/// "no such pairing" rather than an opaque close.
+const PAIRING_UNAVAILABLE: u32 = 0x11;
+/// How long a controller's open pairing slot waits for a machine to join before the
+/// relay drops it. A phone-driven install completes in well under this; a slot left
+/// dangling (operator closed the dialog) is swept rather than parked forever.
+const PAIRING_TTL: Duration = Duration::from_secs(300);
+/// Ceiling on simultaneously-parked pairing slots, so a controller can't grow the
+/// map without bound. Far above any real fan-out (one operator pairs one machine at
+/// a time); expired slots are swept first when this is hit.
+const MAX_PENDING_PAIRINGS: usize = 64;
+/// How often the relay sweeps expired pairing slots.
+const PAIRING_SWEEP_INTERVAL: Duration = Duration::from_secs(30);
 
 #[derive(Serialize, Deserialize)]
 struct ServerConfig {
-	listen_addr: String,
 	owner_secret: String,
 	agent_secret: String,
 	cert_der: String,
 	key_der: String,
+	/// Optional browser portal (serves the embedded SPA so a new machine can pair
+	/// from a browser). Absent on existing relays — the portal is opt-in; the relay
+	/// runs QUIC-only without it.
+	#[serde(default)]
+	portal: Option<portal::PortalConfig>,
 }
 
 impl ServerConfig {
 	fn generate() -> Self {
 		let (cert_der, key_der) = tls::self_signed();
 		Self {
-			listen_addr: format!("0.0.0.0:{DEFAULT_PORT}"),
 			owner_secret: random_alnum(24),
 			agent_secret: random_alnum(24),
 			cert_der: B64.encode(cert_der),
 			key_der: B64.encode(key_der),
+			portal: None,
 		}
 	}
 
@@ -99,6 +118,34 @@ impl ServerConfig {
 		}
 		Ok(())
 	}
+}
+
+/// Env var overriding the QUIC listen address, so a relay can be reconfigured from
+/// docker-compose without a custom command. Falls back to [`default_listen`].
+const LISTEN_ENV: &str = "LIBRETETHER_LISTEN";
+
+/// The default QUIC listen address: dual-stack on the default port. `[::]` accepts
+/// IPv6 and — on a normal dual-stack host — IPv4-mapped clients too. The listen
+/// address is a deployment knob, not persisted config, so the image is dual-stack
+/// out of the box; override it with `--listen` or [`LISTEN_ENV`].
+fn default_listen() -> String {
+	format!("[::]:{DEFAULT_PORT}")
+}
+
+/// Resolve the QUIC listen address: the `--listen` flag, else [`LISTEN_ENV`], else
+/// the dual-stack [`default_listen`].
+fn resolve_listen(flag: Option<String>) -> String {
+	resolve_listen_inner(flag, std::env::var(LISTEN_ENV).ok())
+}
+
+/// [`resolve_listen`] split from its env read so the precedence is testable.
+fn resolve_listen_inner(flag: Option<String>, env: Option<String>) -> String {
+	[flag, env]
+		.into_iter()
+		.flatten()
+		.map(|s| s.trim().to_string())
+		.find(|s| !s.is_empty())
+		.unwrap_or_else(default_listen)
 }
 
 fn config_path(arg: Option<PathBuf>) -> PathBuf {
@@ -167,10 +214,25 @@ struct ControllerSession {
 
 type ControllerSlot = Arc<Mutex<Option<ControllerSession>>>;
 
+/// A controller's parked pairing slot: the relay-side halves of the stream the
+/// controller opened with [`RelayRequest::OpenPairing`], held until a `Pairing`
+/// peer joins with the matching nameplate (then piped together) or the slot
+/// expires. Dropping it resets both streams, which the controller surfaces as
+/// "pairing expired".
+struct Pending {
+	send: SendStream,
+	recv: RecvStream,
+	created: Instant,
+}
+
 #[derive(Clone, Default)]
 struct Relay {
 	agents: Arc<Mutex<HashMap<String, quinn::Connection>>>,
 	controller: ControllerSlot,
+	/// Open pairing slots keyed by nameplate (see [`crate::Pending`]). The relay only
+	/// matches by nameplate and pipes the two streams; it never sees the PAKE password
+	/// or the enrollment bundle that flow over the pipe.
+	pairings: Arc<Mutex<HashMap<String, Pending>>>,
 	/// Per-source-IP fixed-window connection counters for rate limiting.
 	limiter: Arc<Mutex<HashMap<IpAddr, (u32, Instant)>>>,
 }
@@ -207,6 +269,49 @@ impl Relay {
 		entry.0 += 1;
 		entry.0 <= RATE_LIMIT_PER_WINDOW
 	}
+
+	/// Park a controller's pairing slot under `nameplate`. Returns `false` (caller
+	/// should reset the controller's stream) only if the map is genuinely full of
+	/// live slots. Last-writer-wins on a nameplate collision — the controller owns its
+	/// own random nameplates, so a clash just means it reused one.
+	fn register_pairing(&self, nameplate: String, pending: Pending) -> bool {
+		self.register_pairing_at(nameplate, pending, Instant::now())
+	}
+
+	/// [`Relay::register_pairing`] with an injectable clock for deterministic tests.
+	fn register_pairing_at(&self, nameplate: String, pending: Pending, now: Instant) -> bool {
+		let mut map = self.pairings.lock().unwrap();
+		// Reclaim expired slots before enforcing the cap so a burst of abandoned slots
+		// can't wedge pairing for everyone.
+		map.retain(|_, p| now.duration_since(p.created) < PAIRING_TTL);
+		if map.len() >= MAX_PENDING_PAIRINGS && !map.contains_key(&nameplate) {
+			return false;
+		}
+		map.insert(nameplate, pending);
+		true
+	}
+
+	/// Remove and return the slot for `nameplate`, but only if present and unexpired
+	/// (single-use: a joined or expired slot is gone). An expired slot is dropped here,
+	/// resetting the controller's parked stream.
+	fn take_pairing(&self, nameplate: &str) -> Option<Pending> {
+		self.take_pairing_at(nameplate, Instant::now())
+	}
+
+	/// [`Relay::take_pairing`] with an injectable clock for deterministic tests.
+	fn take_pairing_at(&self, nameplate: &str, now: Instant) -> Option<Pending> {
+		let pending = self.pairings.lock().unwrap().remove(nameplate)?;
+		(now.duration_since(pending.created) < PAIRING_TTL).then_some(pending)
+	}
+
+	/// Drop every expired pairing slot. Run on a timer so a slot the operator opened
+	/// and abandoned (closed the dialog) doesn't sit parked until the process exits.
+	fn sweep_pairings_at(&self, now: Instant) {
+		self.pairings
+			.lock()
+			.unwrap()
+			.retain(|_, p| now.duration_since(p.created) < PAIRING_TTL);
+	}
 }
 
 #[derive(Parser)]
@@ -224,7 +329,8 @@ struct Cli {
 enum Command {
 	/// Run the relay.
 	Run {
-		/// Override the listen address (e.g. 0.0.0.0:47600).
+		/// Override the QUIC listen address (default `[::]:47600`, dual-stack; also
+		/// settable via the `LIBRETETHER_LISTEN` env var).
 		#[arg(long)]
 		listen: Option<String>,
 	},
@@ -240,22 +346,27 @@ async fn main() -> Result<()> {
 	match cli.command {
 		Command::Info => {
 			// Read-only: never generate a config, so we can't print secrets that
-			// wouldn't match the running relay — see `load`.
-			print_credentials(&load(&path)?);
+			// wouldn't match the running relay — see `load`. The listen address isn't in
+			// the config, so report the one `run` would resolve from the env/default.
+			print_credentials(&load(&path)?, &resolve_listen(None));
 			Ok(())
 		}
 		Command::Run { listen } => {
-			let mut cfg = load_or_create(&path)?;
-			if let Some(listen) = listen {
-				cfg.listen_addr = listen;
-			}
-			run(cfg).await
+			let cfg = load_or_create(&path)?;
+			let listen_addr = resolve_listen(listen);
+			// The data dir (where the config lives) is where the portal's ACME cache goes,
+			// so an auto-issued cert persists in the same volume across restarts.
+			let data_dir = path
+				.parent()
+				.map(Path::to_path_buf)
+				.unwrap_or_else(|| PathBuf::from("."));
+			run(cfg, data_dir, listen_addr).await
 		}
 	}
 }
 
-fn print_credentials(cfg: &ServerConfig) {
-	println!("listen:       {}", cfg.listen_addr);
+fn print_credentials(cfg: &ServerConfig, listen: &str) {
+	println!("listen:       {listen}");
 	println!("owner secret: {}", cfg.owner_secret);
 	println!("agent secret: {}", cfg.agent_secret);
 	println!();
@@ -263,15 +374,27 @@ fn print_credentials(cfg: &ServerConfig) {
 	println!("deploy clients with the agent secret.");
 }
 
-async fn run(cfg: ServerConfig) -> Result<()> {
+async fn run(cfg: ServerConfig, data_dir: PathBuf, listen_addr: String) -> Result<()> {
 	let (cert, key) = cfg.cert_key()?;
-	let addr: SocketAddr = cfg.listen_addr.parse().context("invalid listen address")?;
+	let addr: SocketAddr = listen_addr.parse().context("invalid listen address")?;
 	let endpoint = Endpoint::server(tls::server_config(cert, key), addr)?;
 	logbook::info(&format!("relay listening on udp/{addr}"));
 	// Don't echo the secrets on every `run` — they'd persist in the journal /
 	// `docker logs` for the life of the deployment. `libretether-relay info` prints
 	// them on demand.
 	logbook::info("run `libretether-relay info` to print the owner/agent secrets");
+
+	// Bring up the browser portal (serves the embedded pairing SPA) when configured —
+	// via the config's `portal` block or env vars (so docker-compose alone can enable
+	// it). It runs in its own tasks; a bind failure disables it rather than taking down
+	// the relay's QUIC service.
+	if let Some(portal_cfg) = portal::resolve_config(cfg.portal) {
+		tokio::spawn(async move {
+			if let Err(e) = portal::run(portal_cfg, data_dir).await {
+				logbook::warn(&format!("portal disabled: {e:#}"));
+			}
+		});
+	}
 
 	let relay = Relay::default();
 	let secrets = Arc::new((cfg.owner_secret, cfg.agent_secret));
@@ -281,8 +404,15 @@ async fn run(cfg: ServerConfig) -> Result<()> {
 	// auth, so this is acquired inside `handle` once the peer proves it's an agent.
 	let agent_limit = Arc::new(Semaphore::new(MAX_CONNECTIONS - CONTROLLER_RESERVED));
 
+	// Drop abandoned pairing slots on a timer so they don't park until shutdown.
+	let mut pairing_sweep = tokio::time::interval(PAIRING_SWEEP_INTERVAL);
+
 	loop {
 		tokio::select! {
+			_ = pairing_sweep.tick() => {
+				relay.sweep_pairings_at(Instant::now());
+				continue;
+			}
 			incoming = endpoint.accept() => {
 				let Some(incoming) = incoming else { break };
 				// Shed obvious abuse before doing any handshake work: rate-limit per
@@ -343,6 +473,13 @@ async fn handle(
 
 	match authed.role {
 		RelayRole::Controller => serve_controller(relay, conn, authed.send).await,
+		RelayRole::Pairing => {
+			// A pairing join holds no long-lived resource and isn't trusted: match it to
+			// a controller's open slot by nameplate and pipe, or reset it.
+			let nameplate = authed.nameplate.unwrap_or_default();
+			let recv = authed.recv.expect("pairing authed carries its recv half");
+			serve_pairing_join(relay, nameplate, authed.send, recv).await
+		}
 		RelayRole::Agent => {
 			// Reserve controller headroom: agents acquire from the smaller agent pool
 			// so an agent-secret holder opening connections in bulk (even under freshly
@@ -357,16 +494,26 @@ async fn handle(
 	}
 }
 
-/// A successfully-authenticated relay peer.
+/// A successfully-authenticated (or, for pairing, accepted-without-auth) relay peer.
 struct Authed {
 	role: RelayRole,
-	/// The hello stream's send half — the controller keeps writing presence events on it.
+	/// The hello stream's send half — the controller keeps writing presence events on
+	/// it; for a pairing join it's piped to the matched controller slot.
 	send: SendStream,
+	/// The hello stream's recv half, kept only for a pairing join (to pipe).
+	recv: Option<RecvStream>,
 	public_key: String,
+	/// The nameplate, set only for a pairing join.
+	nameplate: Option<String>,
 }
 
 /// Validate a peer's secret and prove it holds the private key for the public key
 /// it presented. Returns `Some` on success, `None` if cleanly rejected.
+///
+/// The `Pairing` role is the exception: it carries no secret and isn't trusted by
+/// the relay at all — the relay only matches it to a controller's open slot by
+/// nameplate and pipes the two together, so the PAKE over that pipe is the actual
+/// authentication. It's accepted here without a secret or key-ownership proof.
 async fn authenticate(conn: &quinn::Connection, secrets: &(String, String)) -> Result<Option<Authed>> {
 	let (mut send, mut recv) = conn.accept_bi().await.context("accept hello stream")?;
 	let hello: RelayHello = read_frame_capped(&mut recv, MAX_CONTROL_FRAME).await?;
@@ -374,6 +521,22 @@ async fn authenticate(conn: &quinn::Connection, secrets: &(String, String)) -> R
 	let (expected, role_label) = match hello.role {
 		RelayRole::Controller => (&secrets.0, "controller"),
 		RelayRole::Agent => (&secrets.1, "agent"),
+		RelayRole::Pairing => {
+			// No secret, no proof — see the doc comment. Require a non-empty nameplate;
+			// a malformed pairing hello is a clean rejection.
+			let Some(nameplate) = hello.nameplate.filter(|n| !n.trim().is_empty()) else {
+				logbook::warn("rejected pairing join: missing nameplate");
+				return Ok(None);
+			};
+			logbook::debug("pairing join received");
+			return Ok(Some(Authed {
+				role: RelayRole::Pairing,
+				send,
+				recv: Some(recv),
+				public_key: String::new(),
+				nameplate: Some(nameplate),
+			}));
+		}
 	};
 	// Constant-time compare so the secret can't be recovered byte-by-byte via
 	// response timing.
@@ -427,7 +590,9 @@ async fn authenticate(conn: &quinn::Connection, secrets: &(String, String)) -> R
 	Ok(Some(Authed {
 		role: hello.role,
 		send,
+		recv: None,
 		public_key,
+		nameplate: None,
 	}))
 }
 
@@ -546,6 +711,23 @@ async fn serve_controller(relay: Relay, conn: quinn::Connection, mut events: Sen
 						}
 					}
 				}
+				// Park this stream as a pairing slot. The relay holds its halves until a
+				// `Pairing` peer joins with the same nameplate (then pipes them) or the
+				// slot expires; it never reads the PAKE/bundle that flow over the pipe.
+				RelayRequest::OpenPairing { nameplate } => {
+					let parked = Pending {
+						send: c_send,
+						recv: c_recv,
+						created: Instant::now(),
+					};
+					if relay.register_pairing(nameplate, parked) {
+						logbook::debug("parked a pairing slot");
+					} else {
+						// On refusal `register_pairing` drops the `Pending`, closing the
+						// controller's stream so its pairing attempt fails fast.
+						logbook::warn("refused a pairing slot: at capacity");
+					}
+				}
 			}
 		});
 	}
@@ -607,6 +789,27 @@ async fn serve_agent(
 		logbook::info(&format!("agent {}… deregistered (offline)", key8(&public_key)));
 		relay.notify(RelayEvent::AgentOffline { public_key });
 	}
+	Ok(())
+}
+
+/// Serve a `Pairing` join: take the controller's parked slot for this nameplate and
+/// pipe the two streams together so the controller and the joining machine run the
+/// PAKE end-to-end. If no live slot matches (wrong/expired nameplate, or it was
+/// already claimed), reset the join stream with [`PAIRING_UNAVAILABLE`] so the
+/// machine gets an attributable failure. The relay never reads what flows over the
+/// pipe — only the nameplate matched here is ever visible to it.
+async fn serve_pairing_join(relay: Relay, nameplate: String, mut send: SendStream, recv: RecvStream) -> Result<()> {
+	let Some(slot) = relay.take_pairing(&nameplate) else {
+		logbook::debug("pairing join with no matching slot — resetting");
+		let _ = send.reset(PAIRING_UNAVAILABLE.into());
+		return Ok(());
+	};
+	logbook::info("pairing slot matched — piping controller ↔ machine");
+	// Pipe: controller (parked `slot`) ↔ joining machine (`send`/`recv`). The two ran
+	// `RelayRequest::OpenPairing` / the pairing hello respectively, both already
+	// stripped, so only their PAKE traffic flows.
+	pipe(slot.recv, send, recv, slot.send).await;
+	logbook::debug("pairing pipe closed");
 	Ok(())
 }
 
@@ -680,6 +883,7 @@ mod tests {
 					role: RelayRole::Controller,
 					secret: "owner-secret".into(),
 					public_key: id.public_b64(),
+					nameplate: None,
 				},
 			)
 			.await
@@ -722,6 +926,7 @@ mod tests {
 					role: RelayRole::Agent,
 					secret: "wrong-secret".into(),
 					public_key: id.public_b64(),
+					nameplate: None,
 				},
 			)
 			.await
@@ -753,6 +958,7 @@ mod tests {
 					role: RelayRole::Agent,
 					secret: "agent-secret".into(),
 					public_key: id.public_b64(),
+					nameplate: None,
 				},
 			)
 			.await
@@ -1015,6 +1221,24 @@ mod tests {
 		assert!(cfg.validate().is_err(), "a blank agent secret must be rejected");
 	}
 
+	#[test]
+	fn resolve_listen_prefers_flag_then_env_then_dual_stack_default() {
+		// Default is dual-stack, so the image binds IPv6 (+ IPv4-mapped) with no flag.
+		assert_eq!(resolve_listen_inner(None, None), format!("[::]:{DEFAULT_PORT}"));
+		// The env var (e.g. from docker-compose) is honored when there's no flag.
+		assert_eq!(resolve_listen_inner(None, Some("0.0.0.0:1234".into())), "0.0.0.0:1234");
+		// The flag wins over the env.
+		assert_eq!(
+			resolve_listen_inner(Some("[::1]:9000".into()), Some("0.0.0.0:1234".into())),
+			"[::1]:9000"
+		);
+		// Blank values fall through to the next source.
+		assert_eq!(
+			resolve_listen_inner(Some("  ".into()), None),
+			format!("[::]:{DEFAULT_PORT}")
+		);
+	}
+
 	#[tokio::test]
 	async fn a_new_controller_displaces_and_closes_the_previous_one() {
 		let (relay_ep, addr) = relay_server();
@@ -1112,5 +1336,239 @@ mod tests {
 			.await
 			.unwrap();
 		assert!(matches!(offline, RelayEvent::AgentOffline { public_key } if public_key == key));
+	}
+
+	// ------------------------------------------------------ pairing mailbox
+
+	use libretether_protocol::pairing::{self, PairBundle, PairingCode};
+
+	fn sample_bundle() -> PairBundle {
+		PairBundle {
+			enrollment_token: "tok-xyz".into(),
+			controller_key: "Q29udHJvbGxlcktleQ==".into(),
+			agent_secret: "agent-sekret".into(),
+			name: Some("kitchen-pc".into()),
+		}
+	}
+
+	/// A live relay-side stream pair, for constructing a [`Pending`] in unit tests.
+	async fn stream_pair(client: &quinn::Connection, server: &quinn::Connection) -> (SendStream, RecvStream) {
+		let (mut cs, _cr) = client.open_bi().await.unwrap();
+		cs.write_all(b"\x00").await.unwrap(); // materialize so the server can accept it
+		server.accept_bi().await.unwrap()
+	}
+
+	#[tokio::test]
+	async fn take_pairing_is_single_use_and_honors_the_ttl() {
+		let (_rep, relay_conn, _pep, peer_conn) = loopback().await;
+		let relay = Relay::default();
+		let (s, r) = stream_pair(&peer_conn, &relay_conn).await;
+		let t0 = Instant::now();
+		assert!(relay.register_pairing_at(
+			"NP1".into(),
+			Pending {
+				send: s,
+				recv: r,
+				created: t0
+			},
+			t0
+		));
+
+		// A second take finds nothing (single-use), and an unrelated nameplate misses.
+		assert!(relay.take_pairing_at("ghost", t0).is_none());
+		assert!(
+			relay.take_pairing_at("NP1", t0).is_some(),
+			"the live slot is taken once"
+		);
+		assert!(
+			relay.take_pairing_at("NP1", t0).is_none(),
+			"and is gone after being claimed"
+		);
+
+		// A slot older than the TTL is treated as absent (and dropped).
+		let (s2, r2) = stream_pair(&peer_conn, &relay_conn).await;
+		assert!(relay.register_pairing_at(
+			"NP2".into(),
+			Pending {
+				send: s2,
+				recv: r2,
+				created: t0
+			},
+			t0
+		));
+		let expired = t0 + PAIRING_TTL + Duration::from_secs(1);
+		assert!(
+			relay.take_pairing_at("NP2", expired).is_none(),
+			"an expired slot is not returned"
+		);
+	}
+
+	#[tokio::test]
+	async fn register_pairing_caps_live_slots_but_allows_overwriting_one() {
+		let (_rep, relay_conn, _pep, peer_conn) = loopback().await;
+		let relay = Relay::default();
+		let t0 = Instant::now();
+		for i in 0..MAX_PENDING_PAIRINGS {
+			let (s, r) = stream_pair(&peer_conn, &relay_conn).await;
+			assert!(relay.register_pairing_at(
+				format!("slot{i}"),
+				Pending {
+					send: s,
+					recv: r,
+					created: t0
+				},
+				t0
+			));
+		}
+		// At capacity: a brand-new nameplate is refused…
+		let (s, r) = stream_pair(&peer_conn, &relay_conn).await;
+		assert!(!relay.register_pairing_at(
+			"overflow".into(),
+			Pending {
+				send: s,
+				recv: r,
+				created: t0
+			},
+			t0
+		));
+		// …but reusing an existing nameplate (last-writer-wins) is allowed.
+		let (s, r) = stream_pair(&peer_conn, &relay_conn).await;
+		assert!(relay.register_pairing_at(
+			"slot0".into(),
+			Pending {
+				send: s,
+				recv: r,
+				created: t0
+			},
+			t0
+		));
+		// And once a window passes, the sweep frees them so new slots fit again.
+		relay.sweep_pairings_at(t0 + PAIRING_TTL + Duration::from_secs(1));
+		assert!(
+			relay.pairings.lock().unwrap().is_empty(),
+			"the sweep drops every expired slot"
+		);
+	}
+
+	#[tokio::test]
+	async fn a_pairing_join_with_no_slot_is_reset_with_its_own_code() {
+		let (relay_ep, addr) = relay_server();
+		let relay = Relay::default();
+
+		// A machine opens a pairing stream the relay has no slot for.
+		let (_jep, join_conn, join_view) = connect(&relay_ep, addr).await;
+		let join = tokio::spawn(async move {
+			let (mut s, mut r) = join_conn.open_bi().await.unwrap();
+			write_frame(
+				&mut s,
+				&RelayHello {
+					role: RelayRole::Pairing,
+					secret: String::new(),
+					public_key: String::new(),
+					nameplate: Some("GHOST".into()),
+				},
+			)
+			.await
+			.unwrap();
+			// The relay strips the hello then resets — the next read carries the code.
+			let res = r.read_to_end(64).await;
+			(res, join_conn)
+		});
+
+		// Relay side: read the pairing hello and route it through serve_pairing_join.
+		let (rs, mut rr) = join_view.accept_bi().await.unwrap();
+		let hello: RelayHello = read_frame_capped(&mut rr, MAX_CONTROL_FRAME).await.unwrap();
+		assert!(matches!(hello.role, RelayRole::Pairing));
+		serve_pairing_join(relay, hello.nameplate.unwrap(), rs, rr)
+			.await
+			.unwrap();
+
+		let (res, _conn) = with_timeout("join reset", join).await.unwrap();
+		match res {
+			Err(quinn::ReadToEndError::Read(quinn::ReadError::Reset(code))) => {
+				assert_eq!(
+					code,
+					PAIRING_UNAVAILABLE.into(),
+					"an unmatched join is reset with the pairing code"
+				);
+			}
+			other => panic!("expected a reset for a missing pairing slot, got {other:?}"),
+		}
+	}
+
+	#[tokio::test]
+	async fn pairing_mailbox_pipes_a_full_pake_end_to_end() {
+		// The whole point, end to end: a controller parks a slot, a not-yet-enrolled
+		// machine joins by nameplate, and the real PAKE runs over the relay-piped
+		// channel — delivering the bundle without the relay seeing the password.
+		let (relay_ep, addr) = relay_server();
+		let relay = Relay::default();
+		let code = PairingCode::generate();
+		let bundle = sample_bundle();
+
+		// Controller connection, served so it can open a pairing slot.
+		let (_cep, ctrl_conn, ctrl_view) = connect(&relay_ep, addr).await;
+		let (events_send, _er) = open_events(&ctrl_conn, &ctrl_view).await;
+		tokio::spawn({
+			let relay = relay.clone();
+			async move { serve_controller(relay, ctrl_view, events_send).await }
+		});
+
+		// Controller opens the pairing slot and runs its side of the PAKE.
+		let ctrl_task = {
+			let (code, bundle) = (code.clone(), bundle.clone());
+			tokio::spawn(async move {
+				let (mut cs, mut cr) = ctrl_conn.open_bi().await.unwrap();
+				write_frame(
+					&mut cs,
+					&RelayRequest::OpenPairing {
+						nameplate: code.nameplate.clone(),
+					},
+				)
+				.await
+				.unwrap();
+				let phrase = pairing::controller_pair(&mut cs, &mut cr, &code, &bundle).await;
+				(phrase, ctrl_conn)
+			})
+		};
+		wait_until({
+			let (relay, np) = (relay.clone(), code.nameplate.clone());
+			move || relay.pairings.lock().unwrap().contains_key(&np)
+		})
+		.await;
+
+		// The machine joins by nameplate; drive the relay's pairing side, then run the
+		// agent's side of the PAKE on the client connection.
+		let (_jep, join_conn, join_view) = connect(&relay_ep, addr).await;
+		tokio::spawn({
+			let relay = relay.clone();
+			async move {
+				let (rs, mut rr) = join_view.accept_bi().await.unwrap();
+				let hello: RelayHello = read_frame_capped(&mut rr, MAX_CONTROL_FRAME).await.unwrap();
+				serve_pairing_join(relay, hello.nameplate.unwrap(), rs, rr)
+					.await
+					.unwrap();
+			}
+		});
+		let agent_task = {
+			let code = code.clone();
+			tokio::spawn(async move {
+				let (mut s, mut r) = libretether_protocol::relay::pairing_join(&join_conn, &code.nameplate)
+					.await
+					.unwrap();
+				let out = pairing::agent_pair(&mut s, &mut r, &code).await;
+				(out, join_conn)
+			})
+		};
+
+		let (ctrl_phrase, _c) = with_timeout("controller pair", ctrl_task).await.unwrap();
+		let (agent_out, _j) = with_timeout("agent pair", agent_task).await.unwrap();
+		let ctrl_phrase = ctrl_phrase.expect("controller side succeeds");
+		let (got_bundle, agent_phrase) = agent_out.expect("agent side succeeds");
+		assert_eq!(
+			got_bundle, bundle,
+			"the agent receives the exact bundle through the relay"
+		);
+		assert_eq!(ctrl_phrase, agent_phrase, "both ends show the same verify phrase");
 	}
 }

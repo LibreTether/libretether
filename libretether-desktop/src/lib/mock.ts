@@ -13,11 +13,16 @@ import type {
 	CreateClientResult,
 	ExecResult,
 	LogEntry,
+	PairingStarted,
 	ScreenshotResult,
 	Settings
 } from "./types"
 
 const NOW = Math.floor(Date.now() / 1000)
+
+// The code from the most recent mock `open_pairing`, so the faked
+// `pairing:completed` event can echo it back (the UI matches on it).
+let lastPairingCode = ""
 
 function status(over: Partial<AgentStatus["host"]> & Partial<AgentStatus>): AgentStatus {
 	return {
@@ -236,6 +241,25 @@ export function mockInvoke(cmd: string, args?: Record<string, unknown>): Promise
 			const c = find(id) ?? CLIENTS[0]
 			return delay({ client: c, deploy_script: deployScript(c.name) } satisfies CreateClientResult)
 		}
+		case "open_pairing": {
+			const name = (args?.name as string) ?? "machine"
+			lastPairingCode = "4F9K-2A7C"
+			return delay({
+				client: {
+					created_at: NOW,
+					enrolled: false,
+					id: `pair-${name}`,
+					last_seen: null,
+					name,
+					online: false,
+					os: (args?.os as ClientDto["os"]) ?? "linux",
+					public_key: null,
+					status: null
+				},
+				code: lastPairingCode,
+				portal_url: "https://relay.example.com"
+			} satisfies PairingStarted)
+		}
 		case "client_exec":
 			return delay({
 				code: 0,
@@ -289,6 +313,14 @@ export function mockListen(event: string, cb: (e: { payload: unknown }) => void)
 	// Give the live-control overlay a resolution so it leaves the "starting" state.
 	if (event.startsWith("session:meta:")) {
 		const t = setTimeout(() => cb({ payload: { display: 0, height: 1080, width: 1920 } }), 300)
+		return () => clearTimeout(t)
+	}
+	// Fake a successful pairing shortly after the phone-install view subscribes.
+	if (event === "pairing:completed") {
+		const t = setTimeout(
+			() => cb({ payload: { code: lastPairingCode, ok: true, phrase: "tiger-river-otter-maple" } }),
+			2500
+		)
 		return () => clearTimeout(t)
 	}
 	return () => {}

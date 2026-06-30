@@ -16,10 +16,12 @@
 
 pub mod crypto;
 pub mod frame;
+pub mod pairing;
 pub mod relay;
 pub mod secret;
 pub mod tls;
 pub mod video;
+mod wordlist;
 
 use serde::{Deserialize, Serialize};
 

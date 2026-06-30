@@ -18,6 +18,9 @@ COPY libretether-common ./libretether-common
 COPY libretether-agent ./libretether-agent
 COPY libretether-relay ./libretether-relay
 COPY libretether-desktop/src-tauri ./libretether-desktop/src-tauri
+# The relay embeds the pairing portal SPA at compile time (include_dir!), so the
+# static page must be in the build context.
+COPY libretether-portal/static ./libretether-portal/static
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/build/target \
     cargo build -p libretether-relay --release \
@@ -36,8 +39,11 @@ COPY --from=build /usr/local/bin/libretether-relay /usr/local/bin/libretether-re
 
 USER libretether
 VOLUME ["/data"]
-# QUIC runs over UDP.
+# QUIC runs over UDP. The optional browser pairing portal (when configured) serves
+# HTTP/HTTPS over TCP — publish 80/443 too if you enable it.
 EXPOSE 47600/udp
+EXPOSE 80/tcp
+EXPOSE 443/tcp
 
 # `--config` is a global flag, so it applies to both `run` (the default below)
 # and `info`. Override the command, e.g. `docker run … info`, to read secrets.

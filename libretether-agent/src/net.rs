@@ -14,7 +14,8 @@ use anyhow::{anyhow, Context, Result};
 use libretether_common::{pipe_bidirectional, Backoff};
 use libretether_protocol::crypto::{self, Identity};
 use libretether_protocol::frame::{read_frame_capped, write_frame, MAX_CONTROL_FRAME};
-use libretether_protocol::relay::{client_handshake, RelayRole};
+use libretether_protocol::pairing::{agent_pair, PairBundle, PairingCode};
+use libretether_protocol::relay::{client_handshake, pairing_join, RelayRole};
 use libretether_protocol::{
 	tls, Challenge, ControlRequest, Hello, HelloAck, LogLevel, LogLine, LogsResult, SessionGrant, StreamAuth,
 	StreamOpen, PROTOCOL_VERSION,
@@ -225,6 +226,23 @@ async fn dial(endpoint: &Endpoint, addr: SocketAddr, server_name: &str) -> Resul
 		.await
 		.map_err(|_| anyhow!("dial timed out after {CONNECT_TIMEOUT_SECS}s"))?
 		.context("quic handshake")
+}
+
+/// One-shot pairing for the `pair` subcommand: dial the relay, join the pairing
+/// mailbox under the code's nameplate, and run the agent side of the PAKE. Returns
+/// the enrollment [`PairBundle`] and the verify phrase to show the operator. No
+/// secret or identity is trusted by the relay — the PAKE is the authentication, and
+/// a wrong code (or any tampering) makes this fail closed.
+pub async fn pair(relay_addr: &str, code: &PairingCode, server_name: &str) -> Result<(PairBundle, String)> {
+	let addr = tls::resolve(relay_addr).await.context("resolving the relay address")?;
+	let endpoint = tls::client_endpoint(addr).context("binding client socket")?;
+	let conn = dial(&endpoint, addr, server_name).await.context("dialing the relay")?;
+	let (mut send, mut recv) = pairing_join(&conn, &code.nameplate)
+		.await
+		.context("joining the pairing mailbox")?;
+	agent_pair(&mut send, &mut recv, code)
+		.await
+		.context("pairing handshake (wrong code, or the slot expired)")
 }
 
 /// Complete the controller handshake, then service control/session/tunnel

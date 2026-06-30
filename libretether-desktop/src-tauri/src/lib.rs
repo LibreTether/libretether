@@ -66,6 +66,7 @@ pub fn run() {
 			commands::rename_client,
 			commands::get_deploy_script,
 			commands::reset_token,
+			commands::open_pairing,
 			commands::client_status,
 			commands::client_exec,
 			commands::client_screenshot,

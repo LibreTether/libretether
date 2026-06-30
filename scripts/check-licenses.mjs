@@ -48,6 +48,11 @@ const ALLOW = new Set([
 	// SIL Open Font License — the bundled @fontsource webfonts (Geist, Geist Mono,
 	// Space Grotesk). Compatible by aggregation; see the note above.
 	"OFL-1.1",
+	// Community Data License Agreement – Permissive 2.0 — `webpki-roots`, the bundled
+	// Mozilla CA trust-anchor list the relay's ACME client uses to verify Let's
+	// Encrypt's API. A permissive *data* license over a separate cert bundle (not
+	// merged into our code), compatible by aggregation like OFL above.
+	"CDLA-Permissive-2.0",
 	"(MIT OR Apache-2.0)",
 	"IJG"
 ])

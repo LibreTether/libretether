@@ -38,6 +38,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use config::{default_config_path, normalize_addr, AgentConfig};
 use libretether_protocol::crypto::Identity;
+use libretether_protocol::pairing::{PairBundle, PairingCode};
 
 #[derive(Parser)]
 #[command(name = "libretether-agent", version, about = "LibreTether remote-control agent")]
@@ -71,6 +72,20 @@ enum Command {
 		/// command) — there is no trust-on-first-use.
 		#[arg(long)]
 		controller_key: String,
+		/// TLS server name to expect (advanced; defaults to libretether.local).
+		#[arg(long, default_value = "libretether.local")]
+		server_name: String,
+	},
+	/// Pair with a controller through a relay using a short spoken code, then write
+	/// config — the phone-friendly alternative to `enroll` with no keys to type. The
+	/// controller hands over the enrollment details over a PAKE-secured channel.
+	Pair {
+		/// Relay address as `host[:port]` (the same relay the controller uses).
+		#[arg(long)]
+		relay: String,
+		/// The pairing code from the controller, `NAMEPLATE-PASSWORD` (e.g. 4F9K-2A7C).
+		#[arg(long)]
+		code: String,
 		/// TLS server name to expect (advanced; defaults to libretether.local).
 		#[arg(long, default_value = "libretether.local")]
 		server_name: String,
@@ -144,6 +159,28 @@ async fn dispatch(cli: Cli, cfg_path: std::path::PathBuf) -> Result<()> {
 			println!("Next: `libretether-agent install` to run it in the background, or `libretether-agent run`.");
 			Ok(())
 		}
+		Command::Pair {
+			relay,
+			code,
+			server_name,
+		} => {
+			let code = PairingCode::parse(&code).ok_or_else(|| {
+				anyhow::anyhow!("invalid pairing code — expected the NAMEPLATE-PASSWORD the controller showed")
+			})?;
+			let relay = normalize_addr(&relay);
+			println!("Pairing with the controller via {relay}…");
+			let (bundle, phrase) = net::pair(&relay, &code, &server_name).await?;
+			// The PAKE already guarantees no one is in the middle; the phrase lets the
+			// human confirm the *right* machine paired (it matches the controller's).
+			println!("Verify phrase: {phrase}");
+			let identity = Identity::generate();
+			let cfg = config_from_pairing(relay, server_name, bundle, &identity);
+			cfg.save(&cfg_path)?;
+			println!("Paired. Config written to {}", cfg_path.display());
+			println!("Public key: {}", identity.public_b64());
+			println!("Next: `libretether-agent install` to run it in the background, or `libretether-agent run`.");
+			Ok(())
+		}
 		Command::Run => net::run(cfg_path).await,
 		Command::Status => {
 			let info = host::host_info();
@@ -187,5 +224,48 @@ async fn dispatch(cli: Cli, cfg_path: std::path::PathBuf) -> Result<()> {
 			service::install(&cfg_path)
 		}
 		Command::Uninstall => service::uninstall(),
+	}
+}
+
+/// Build the agent config from a pairing bundle. Pairing is always relay mode (the
+/// machine reached the controller *through* the relay it just paired over), so the
+/// relay address and agent secret come from there; the controller key is pinned
+/// exactly as a pasted `enroll --controller-key` would, with no trust-on-first-use.
+fn config_from_pairing(relay: String, server_name: String, bundle: PairBundle, identity: &Identity) -> AgentConfig {
+	AgentConfig {
+		controller_addr: String::new(),
+		relay_addr: Some(relay),
+		relay_secret: Some(bundle.agent_secret),
+		server_name,
+		enrollment_token: Some(bundle.enrollment_token),
+		controller_key: Some(bundle.controller_key),
+		identity_seed: identity.seed_b64(),
+		client_id: None,
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn config_from_pairing_pins_the_bundle_in_relay_mode() {
+		let bundle = PairBundle {
+			enrollment_token: "tok-1".into(),
+			controller_key: "Q3RybEtleQ==".into(),
+			agent_secret: "agent-sekret".into(),
+			name: Some("kitchen-pc".into()),
+		};
+		let id = Identity::generate();
+		let cfg = config_from_pairing("relay.example:47600".into(), "libretether.local".into(), bundle, &id);
+
+		// Relay mode with the bundle's routing + pinned controller key.
+		assert_eq!(cfg.relay(), Some("relay.example:47600"));
+		assert_eq!(cfg.relay_secret.as_deref(), Some("agent-sekret"));
+		assert_eq!(cfg.enrollment_token.as_deref(), Some("tok-1"));
+		assert_eq!(cfg.require_controller_key().unwrap(), "Q3RybEtleQ==");
+		assert!(cfg.controller_addr.is_empty(), "pairing never uses direct mode");
+		// The identity is usable (round-trips to the same public key).
+		assert_eq!(cfg.identity().unwrap().public_b64(), id.public_b64());
 	}
 }

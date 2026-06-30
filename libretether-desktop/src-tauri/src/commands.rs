@@ -2,12 +2,15 @@
 //! commands operate on saved profiles; everything else operates on the single
 //! currently-active controller (and errors if none is connected).
 
+use libretether_protocol::frame::write_frame;
+use libretether_protocol::pairing::{controller_pair, PairBundle, PairingCode};
+use libretether_protocol::relay::RelayRequest;
 use libretether_protocol::{
 	AgentStatus, ControlRequest, ControlResponse, ExecResult, InputEvent, ScreenshotResult, SessionConfig,
 	DEFAULT_PORT, PROTOCOL_VERSION,
 };
 use serde::Serialize;
-use tauri::State;
+use tauri::{Emitter, State};
 use uuid::Uuid;
 
 use crate::error::{AppError, AppResult};
@@ -56,6 +59,16 @@ pub struct ClientDto {
 pub struct CreateClientResult {
 	pub client: ClientDto,
 	pub deploy_script: String,
+}
+
+/// Result of starting a phone-pairing: the pending client, the short code to read
+/// aloud, and the portal URL the new machine opens. The pairing then completes in
+/// the background; the UI listens for a `pairing:completed` event.
+#[derive(Serialize)]
+pub struct PairingStarted {
+	pub client: ClientDto,
+	pub code: String,
+	pub portal_url: String,
 }
 
 /// A saved controller, for the selection screen. Includes the full `kind` (with
@@ -509,6 +522,98 @@ pub async fn reset_token(state: State<'_, AppState>, id: String) -> AppResult<Cr
 		client: to_dto(&client, ctrl.is_online(id), None),
 		deploy_script,
 	})
+}
+
+/// Start a phone-friendly pairing for a new machine (relay controllers only). Mints
+/// a pending client + token like `create_client`, then drives the controller side of
+/// the PAKE in the background; the machine joins via the browser portal with the
+/// short code. Returns the code + portal URL to show the operator; the outcome
+/// arrives later as a `pairing:completed` event.
+#[tauri::command]
+pub async fn open_pairing(state: State<'_, AppState>, name: String, os: ClientOs) -> AppResult<PairingStarted> {
+	let state = state.inner().clone();
+	let ctrl = state.require_active()?;
+	let (relay_addr, agent_secret) = match &ctrl.profile.kind {
+		ControllerKind::Relay {
+			address, agent_secret, ..
+		} => (address.clone(), agent_secret.clone()),
+		_ => {
+			return Err(AppError::msg(
+				"Phone install needs a relay controller — the new machine reaches you through the relay.",
+			))
+		}
+	};
+	let name = non_empty_name(name)?;
+	// Mint the client + one-time token now (it shows as awaiting enrollment, exactly
+	// like the paste flow); the bundle carries that token to the new machine.
+	let client = ctrl.mutate_store(|s| Ok(s.create(name, os)))?;
+	state.notify_changed();
+
+	let bundle = PairBundle {
+		enrollment_token: client.enrollment_token.clone().unwrap_or_default(),
+		controller_key: ctrl.profile.public_key(),
+		agent_secret,
+		name: Some(client.name.clone()),
+	};
+	let code = PairingCode::generate();
+	let portal_url = portal_url_for(&relay_addr);
+
+	// Drive the PAKE in the background and report the outcome via an event. The slot
+	// lives on the relay until the machine joins or the relay's TTL sweeps it (which
+	// surfaces here as a pairing error).
+	let relay_conn = ctrl.relay_conn.lock().unwrap().clone();
+	let app = state.0.app.get().cloned();
+	let pake_code = code.clone();
+	let event_code = code.full();
+	tauri::async_runtime::spawn(async move {
+		let outcome = run_controller_pairing(relay_conn, &pake_code, &bundle).await;
+		if let Some(app) = app {
+			let payload = match outcome {
+				Ok(phrase) => serde_json::json!({ "ok": true, "code": event_code, "phrase": phrase }),
+				Err(e) => serde_json::json!({ "ok": false, "code": event_code, "error": e.to_string() }),
+			};
+			let _ = app.emit("pairing:completed", payload);
+		}
+	});
+
+	Ok(PairingStarted {
+		client: to_dto(&client, false, None),
+		code: code.full(),
+		portal_url,
+	})
+}
+
+/// Open the pairing mailbox on the relay and run the controller side of the PAKE,
+/// returning the verify phrase on success. Factored out so the spawned task stays
+/// small and the error mapping lives in one place.
+async fn run_controller_pairing(
+	relay_conn: Option<quinn::Connection>,
+	code: &PairingCode,
+	bundle: &PairBundle,
+) -> AppResult<String> {
+	let conn = relay_conn.ok_or_else(|| AppError::msg("the relay isn't connected"))?;
+	let (mut send, mut recv) = conn
+		.open_bi()
+		.await
+		.map_err(|e| AppError::msg(format!("opening the pairing stream: {e}")))?;
+	write_frame(
+		&mut send,
+		&RelayRequest::OpenPairing {
+			nameplate: code.nameplate.clone(),
+		},
+	)
+	.await
+	.map_err(|e| AppError::msg(e.to_string()))?;
+	controller_pair(&mut send, &mut recv, code, bundle)
+		.await
+		.map_err(|e| AppError::msg(e.to_string()))
+}
+
+/// The portal URL for a relay address: HTTPS at the relay host (the portal sits on
+/// the same host as the relay's QUIC, fronted by TLS), with the QUIC port dropped.
+fn portal_url_for(relay_addr: &str) -> String {
+	let host = relay_addr.rsplit_once(':').map_or(relay_addr, |(h, _)| h);
+	format!("https://{host}")
 }
 
 // ---------------------------------------------------------------- live control
@@ -1150,6 +1255,24 @@ mod tests {
 			},
 			&["client", "deploy_script"],
 		);
+		assert_fields(
+			PairingStarted {
+				client: ClientDto {
+					id: "id".into(),
+					name: "n".into(),
+					os: ClientOs::Linux,
+					created_at: 0,
+					enrolled: false,
+					online: false,
+					last_seen: None,
+					status: None,
+					public_key: None,
+				},
+				code: "AB12-CD34".into(),
+				portal_url: "https://relay.example.com".into(),
+			},
+			&["client", "code", "portal_url"],
+		);
 		let kind = ControllerKind::Direct {
 			advertise_addr: None,
 			listen_port: 47600,
@@ -1308,5 +1431,13 @@ mod tests {
 		assert_eq!(serde_json::to_value(ClientOs::Linux).unwrap(), "linux");
 		assert_eq!(serde_json::to_value(ClientOs::Macos).unwrap(), "macos");
 		assert_eq!(serde_json::to_value(ClientOs::Windows).unwrap(), "windows");
+	}
+
+	#[test]
+	fn portal_url_drops_the_relay_quic_port() {
+		// The portal lives at HTTPS on the relay host; the QUIC port is irrelevant there.
+		assert_eq!(portal_url_for("relay.example.com:47600"), "https://relay.example.com");
+		// A bare host (no port) is taken as-is.
+		assert_eq!(portal_url_for("relay.example.com"), "https://relay.example.com");
 	}
 }

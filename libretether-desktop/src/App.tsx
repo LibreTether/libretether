@@ -238,7 +238,7 @@ function Shell({ active, onExit }: { active: ActiveInfo; onExit: () => void }) {
 
 			<CommandPalette commands={commands} onClose={() => setPaletteOpen(false)} open={paletteOpen} />
 			<ShortcutsOverlay onClose={() => setShortcutsOpen(false)} open={shortcutsOpen} />
-			<AddMachineDrawer onClose={() => setAddOpen(false)} onCreated={reload} open={addOpen} />
+			<AddMachineDrawer active={active} onClose={() => setAddOpen(false)} onCreated={reload} open={addOpen} />
 			{detail && (
 				<DetailDrawer active={active} client={detail} key={detail.id} onClose={() => setDetailId(null)} open />
 			)}

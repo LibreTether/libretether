@@ -21,3 +21,17 @@ anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 dirs = "6"
 base64 = "0.22"
+# Portal HTTP server (serves the embedded SPA). httparse parses the tiny GET
+# surface; include_dir embeds the built SPA into the binary; tokio-rustls (ring,
+# matching the rest of the workspace — no aws-lc) terminates TLS when the operator
+# supplies a cert. Auto-HTTPS for those who'd rather not is their reverse proxy.
+httparse = "1"
+include_dir = "0.7"
+tokio-rustls = { version = "0.26", default-features = false, features = ["logging", "tls12", "ring"] }
+rustls-pemfile = "2"
+rustls-acme = { version = "0.15.3", default-features = false, features = ["ring", "tls12", "tokio", "webpki-roots"] }
+tokio-stream = { version = "0.1.18", features = ["net"] }
+
+[dev-dependencies]
+# Generate a throwaway cert/key (PEM) so the portal's TLS path is testable on loopback.
+rcgen = { version = "0.13", default-features = false, features = ["crypto", "ring", "pem"] }

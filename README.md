@@ -91,6 +91,66 @@ docker exec libretether-relay libretether-relay --config /data/config.json info
 Authentication is layered: the secrets gate access to the relay, and the agent still proves
 its identity to the controller end-to-end with Ed25519 — the relay only forwards bytes.
 
+#### Phone-friendly install (pairing portal)
+
+For someone you're guiding over the phone — who can't paste a command — a relay can also
+serve a **browser pairing portal**. In the app, **Add machine → Phone install** mints a short
+code; you read out *"go to `your-relay`, code `4F9K-2A7C`"*. They open the site, type the code,
+and download a one-click installer — no command, no keys to dictate.
+
+Under the hood this is a [SPAKE2](https://datatracker.ietf.org/doc/html/draft-irtf-cfrg-spake2)
+PAKE brokered by the relay (`libretether-portal`, embedded in the relay binary): the code splits
+into a nameplate the relay routes on and a password it never sees, so the relay can't read the
+enrollment bundle or machine-in-the-middle it, and a wrong code gets a single online guess before
+the slot is burned. The controller pins its key exactly as the pasted flow does — no
+trust-on-first-use. Both ends show a matching verify phrase as a final cross-check.
+
+The portal must be reached over HTTPS so the page can't be tampered with. The easiest way is to
+let the relay get its own Let's Encrypt certificate — **entirely from docker-compose, no config
+editing**. Point a DNS record at the host and run:
+
+```yaml
+services:
+  relay:
+    image: ghcr.io/libretether/libretether-relay:latest
+    restart: unless-stopped
+    volumes: [libretether:/data]
+    # The container runs unprivileged, so it listens high inside and we map the public
+    # 80/443 to those. 443 must be the public port — ACME (TLS-ALPN-01) validates there.
+    ports: ["47600:47600/udp", "80:8080", "443:8443"]
+    environment:
+      LIBRETETHER_PORTAL_DOMAIN: "relay.example.com"      # the hostname users open
+      LIBRETETHER_PORTAL_ACME: "1"                         # get + renew a Let's Encrypt cert
+      LIBRETETHER_PORTAL_HTTP_LISTEN: "0.0.0.0:8080"
+      LIBRETETHER_PORTAL_HTTPS_LISTEN: "0.0.0.0:8443"
+      LIBRETETHER_PORTAL_ACME_CONTACT: "you@example.com"  # optional
+      # LIBRETETHER_PORTAL_ACME_STAGING: "1"              # test against LE staging first
+volumes: { libretether: {} }
+```
+
+The relay obtains and renews the cert itself (caching it in `/data/acme`) and serves the portal on
+the public 443, redirecting 80→443. The ACME client is `rustls-acme` pinned to *ring* — no extra
+build tooling.
+
+**Other TLS options** (if you'd rather not use the relay's ACME):
+
+- **Your own certificate** — set `tls_cert_path`/`tls_key_path` (PEM) in the `portal` config block
+  below and the relay terminates TLS itself.
+- **A reverse proxy** — set only `LIBRETETHER_PORTAL_DOMAIN`, leave ACME off, and run the relay
+  behind Caddy/Traefik/nginx (which do ACME for you), pointed at the plain-HTTP port (80).
+
+Everything env vars set can also live in the relay config (`/data/config.json`) under a `portal`
+block, if you prefer config files — `LIBRETETHER_PORTAL_DOMAIN` overrides `portal.domain` when both
+are set:
+
+```jsonc
+"portal": {
+  "domain": "relay.example.com",
+  "tls_cert_path": "/data/fullchain.pem", // optional: relay terminates TLS itself…
+  "tls_key_path": "/data/privkey.pem"     // …omit both to serve plain HTTP behind a TLS proxy
+}
+```
+
 ### The background agent
 
 The deploy script installs `libretether-agent` as a **per-user** background service so the
@@ -159,6 +219,11 @@ Every method rides Tailscale straight to the client's private IP — no extra tu
   *availability* too — whoever holds it can claim the relay's controller slot.)
 - A **one-time enrollment token** (baked into the deploy script) binds the very first
   connection, then is burned.
+- **Phone pairing** (the browser portal) carries enrollment over a SPAKE2 PAKE keyed by the
+  short spoken code. The relay routes the two sides by a nameplate but never learns the
+  code's secret half, so it can't read the enrollment bundle or machine-in-the-middle it; the
+  controller key is still pinned (no trust-on-first-use), and a wrong code is allowed a single
+  online guess before the slot is burned.
 - Config files holding secrets (identity seeds, enrollment tokens, relay/owner secrets, the
   TLS key) are written owner-only (`0600`).
 - QUIC encrypts the transport (TLS 1.3); on a tailnet the link is end-to-end encrypted on

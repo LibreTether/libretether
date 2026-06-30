@@ -48,10 +48,11 @@ RELAY=""
 RELAY_SECRET=""
 TAILSCALE_KEY=""
 CONTROLLER_KEY=""
+CODE=""
 NAME="$(hostname 2>/dev/null || echo this-mac)"
 
 usage() {
-	echo "usage: install-macos.sh --token TOKEN (--relay HOST:PORT --relay-secret SECRET | --controller HOST:PORT [--tailscale-key KEY]) [--name NAME]" >&2
+	echo "usage: install-macos.sh (--pair --relay HOST:PORT --code CODE | --token TOKEN (--relay HOST:PORT --relay-secret SECRET | --controller HOST:PORT [--tailscale-key KEY])) [--name NAME]" >&2
 }
 
 while [ $# -gt 0 ]; do
@@ -62,6 +63,8 @@ while [ $# -gt 0 ]; do
 		--relay-secret) RELAY_SECRET="$2"; shift 2 ;;
 		--tailscale-key) TAILSCALE_KEY="$2"; shift 2 ;;
 		--controller-key) CONTROLLER_KEY="$2"; shift 2 ;;
+		--code) CODE="$2"; shift 2 ;;
+		--pair) shift ;;  # marker; pair mode is implied by --code
 		--name) NAME="$2"; shift 2 ;;
 		--agent-url) LIBRETETHER_AGENT_URL="$2"; shift 2 ;;
 		-h|--help) usage; exit 0 ;;
@@ -69,14 +72,21 @@ while [ $# -gt 0 ]; do
 	esac
 done
 
-[ -n "$TOKEN" ] || { echo "!! --token is required" >&2; usage; exit 1; }
-if [ -n "$RELAY" ] && [ -n "$CONTROLLER" ]; then
-	echo "!! use --relay or --controller, not both" >&2; exit 1
-fi
-if [ -n "$RELAY" ]; then
-	[ -n "$RELAY_SECRET" ] || { echo "!! --relay requires --relay-secret" >&2; exit 1; }
-elif [ -z "$CONTROLLER" ]; then
-	echo "!! provide --relay HOST:PORT --relay-secret SECRET, or --controller HOST:PORT" >&2; exit 1
+# Pairing mode (a short code from the browser portal) needs only the relay; the
+# token, secret and controller key all arrive over the PAKE channel. Otherwise it's
+# classic enrollment with a token.
+if [ -n "$CODE" ]; then
+	[ -n "$RELAY" ] || { echo "!! --code requires --relay HOST:PORT" >&2; usage; exit 1; }
+else
+	[ -n "$TOKEN" ] || { echo "!! --token is required (or use --pair --code for a portal code)" >&2; usage; exit 1; }
+	if [ -n "$RELAY" ] && [ -n "$CONTROLLER" ]; then
+		echo "!! use --relay or --controller, not both" >&2; exit 1
+	fi
+	if [ -n "$RELAY" ]; then
+		[ -n "$RELAY_SECRET" ] || { echo "!! --relay requires --relay-secret" >&2; exit 1; }
+	elif [ -z "$CONTROLLER" ]; then
+		echo "!! provide --relay HOST:PORT --relay-secret SECRET, or --controller HOST:PORT" >&2; exit 1
+	fi
 fi
 
 BIN_DIR="$HOME/.local/bin"
@@ -113,13 +123,18 @@ else
 	chmod +x "$BIN"
 fi
 
-# 3. Enroll and install the LaunchAgent. The controller key (when supplied) pins
-#    the controller identity so the agent only accepts that controller.
-if [ -n "$CONTROLLER_KEY" ]; then set -- --controller-key "$CONTROLLER_KEY"; else set --; fi
-if [ -n "$RELAY" ]; then
-	"$BIN" enroll --relay "$RELAY" --relay-secret "$RELAY_SECRET" --token "$TOKEN" "$@"
+# 3. Pair (portal code) or enroll (token), then install the LaunchAgent. In pair
+#    mode the controller key + token arrive over the PAKE channel; in enroll mode the
+#    controller key (when supplied) is pinned via the positional parameters.
+if [ -n "$CODE" ]; then
+	"$BIN" pair --relay "$RELAY" --code "$CODE"
 else
-	"$BIN" enroll --controller "$CONTROLLER" --token "$TOKEN" "$@"
+	if [ -n "$CONTROLLER_KEY" ]; then set -- --controller-key "$CONTROLLER_KEY"; else set --; fi
+	if [ -n "$RELAY" ]; then
+		"$BIN" enroll --relay "$RELAY" --relay-secret "$RELAY_SECRET" --token "$TOKEN" "$@"
+	else
+		"$BIN" enroll --controller "$CONTROLLER" --token "$TOKEN" "$@"
+	fi
 fi
 "$BIN" install
 
