@@ -49,17 +49,27 @@ function Invoke-WebWithRetry {
 # (-Required:$false) we warn and continue.
 function Test-Checksum {
 	param([string]$Url, [string]$File, [bool]$Required)
+	# Download the sidecar to a temp file and read it back, rather than reading the
+	# response's .Content. GitHub serves every release asset (the .sha256 included)
+	# as application/octet-stream, and Invoke-WebRequest -UseBasicParsing yields an
+	# empty .Content string for a non-text content type — so reading .Content makes a
+	# present checksum look missing and aborts the install. -OutFile writes the raw
+	# bytes regardless of content type, exactly like the agent download above.
+	$sumFile = "$File.sha256"
 	try {
-		$expected = (Invoke-WebWithRetry -Uri "$Url.sha256").Content.Trim()
+		Invoke-WebWithRetry -Uri "$Url.sha256" -OutFile $sumFile | Out-Null
+		$expected = (Get-Content -Path $sumFile -Raw).Trim()
 	} catch {
 		$expected = $null
+	} finally {
+		Remove-Item $sumFile -ErrorAction SilentlyContinue
 	}
 	if ([string]::IsNullOrWhiteSpace($expected)) {
 		if ($Required) {
 			Remove-Item $File -ErrorAction SilentlyContinue
-			throw "Couldn't fetch a checksum for $Url — refusing to install an unverified agent."
+			throw "Couldn't fetch a checksum for $Url - refusing to install an unverified agent."
 		}
-		Write-Host "==> No published checksum for $Url (custom URL) — skipping integrity check."
+		Write-Host "==> No published checksum for $Url (custom URL) - skipping integrity check."
 		return
 	}
 	$actual = (Get-FileHash -Algorithm SHA256 -Path $File).Hash
