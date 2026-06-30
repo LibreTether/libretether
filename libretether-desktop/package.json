@@ -31,5 +31,5 @@
 	"license": "AGPL-3.0-only",
 	"name": "libretether",
 	"type": "module",
-	"version": "0.25.0"
+	"version": "0.26.0"
 }
