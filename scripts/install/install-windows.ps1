@@ -180,17 +180,34 @@ function Invoke-Agent {
 # with an RDP host (Windows Home has none); best-effort, never blocks the install.
 function Enable-RemoteDesktop {
 	$admin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltinRole]::Administrator)
-	if (-not $admin) {
-		Write-Host "==> Skipped enabling Remote Desktop (not elevated). Re-run as Administrator, or turn on Settings > System > Remote Desktop, to use RDP. Screen control works regardless."
+	if ($admin) {
+		try {
+			Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name 'fDenyTSConnections' -Value 0 -ErrorAction Stop
+			# Canonical (locale-independent) Remote Desktop firewall group.
+			Enable-NetFirewallRule -Group '@FirewallAPI.dll,-28752' -ErrorAction SilentlyContinue
+			Write-Host "==> Remote Desktop enabled."
+		} catch {
+			Write-Host "==> Could not enable Remote Desktop automatically ($_). Turn it on in Settings > System > Remote Desktop to use RDP."
+		}
 		return
 	}
+	# Not elevated. Enabling RDP flips fDenyTSConnections (HKLM) + a firewall rule —
+	# both system-wide, so they need admin. We deliberately don't run the whole
+	# installer elevated (the agent must stay non-elevated to control the user's
+	# session), so instead self-elevate *just* this step with a one-time UAC prompt.
+	# RDP is optional — live Control/Watch/SSH work without it — so a declined prompt
+	# just skips it.
+	Write-Host "==> Enabling Remote Desktop needs a one-time admin approval — click Yes on the prompt. (Skipping is fine; screen control works without it.)"
+	$enableCmd = "Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name 'fDenyTSConnections' -Value 0; Enable-NetFirewallRule -Group '@FirewallAPI.dll,-28752'"
+	$encoded = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($enableCmd))
 	try {
-		Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name 'fDenyTSConnections' -Value 0 -ErrorAction Stop
-		# Canonical (locale-independent) Remote Desktop firewall group.
-		Enable-NetFirewallRule -Group '@FirewallAPI.dll,-28752' -ErrorAction SilentlyContinue
-		Write-Host "==> Remote Desktop enabled."
+		# -Verb RunAs raises the UAC prompt; -EncodedCommand sidesteps all quoting. If
+		# the user declines (or can't elevate), Start-Process throws → we skip cleanly.
+		Start-Process -FilePath "powershell.exe" -Verb RunAs -WindowStyle Hidden -Wait `
+			-ArgumentList '-NoProfile', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', $encoded | Out-Null
+		Write-Host "==> Remote Desktop enabled (via a one-time elevation)."
 	} catch {
-		Write-Host "==> Could not enable Remote Desktop automatically ($_). Turn it on in Settings > System > Remote Desktop to use RDP."
+		Write-Host "==> Skipped Remote Desktop (admin approval declined). Screen control works without it; to enable RDP later, turn it on in Settings > System > Remote Desktop, or re-run the installer as administrator."
 	}
 }
 
