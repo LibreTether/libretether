@@ -128,7 +128,12 @@ pub fn debug(msg: &str) {
 /// the in-memory ring the controller can fetch.
 pub fn log_at(level: LogLevel, msg: &str) {
 	let line = format!("[libretether-agent] {msg}");
-	eprintln!("{line}");
+	// Write to stderr *fallibly*. A service launched with no console — the Windows
+	// HKCU Run entry / scheduled task, where the windowless (GUI-subsystem) binary
+	// has an invalid stderr handle — makes `eprintln!` PANIC on the failed write,
+	// which under `panic = "abort"` would kill the agent the instant it logged its
+	// first line (leaving an empty `agent.log`). A missing console is fine to ignore.
+	let _ = writeln!(std::io::stderr(), "{line}");
 	if let Some(file) = LOG_FILE.get() {
 		if let Ok(mut file) = file.lock() {
 			let _ = writeln!(file, "{line}");
