@@ -1,4 +1,4 @@
-import { Keyboard, Loader2, MousePointer2, Power } from "lucide-react"
+import { Eye, Keyboard, Loader2, MousePointer2, Power } from "lucide-react"
 import { useCallback, useEffect, useRef, useState } from "react"
 import * as api from "../lib/api"
 import type { ClientDto, InputEvent, MouseButton, SessionConfig, SessionMeta } from "../lib/types"
@@ -11,7 +11,16 @@ const BUTTONS: Record<number, MouseButton> = { 0: "left", 1: "middle", 2: "right
 // retune it live from the QualityControls menu.
 const INITIAL_CONFIG: SessionConfig = { auto: true, display: 0, max_fps: 30, quality: 70, scale: 100 }
 
-export function ControlOverlay({ client, onClose }: { client: ClientDto; onClose: () => void }) {
+export function ControlOverlay({
+	client,
+	onClose,
+	readOnly = false
+}: {
+	client: ClientDto
+	onClose: () => void
+	/** Watch mode: receive and render the stream but forward no input to the agent. */
+	readOnly?: boolean
+}) {
 	const canvasRef = useRef<HTMLCanvasElement>(null)
 	const surfaceRef = useRef<HTMLDivElement>(null)
 	const [meta, setMeta] = useState<SessionMeta | null>(null)
@@ -50,11 +59,15 @@ export function ControlOverlay({ client, onClose }: { client: ClientDto; onClose
 
 	const send = useCallback(
 		(event: InputEvent) => {
+			// Watch mode is read-only: never forward input to the agent. This is the
+			// single choke point every handler routes through, so guarding it here is
+			// enough to guarantee no input leaves the controller.
+			if (readOnly) return
 			api.sendInput(client.id, event).catch(() => {
 				/* session closing — ignore */
 			})
 		},
-		[client.id]
+		[client.id, readOnly]
 	)
 
 	// Decode a frame's changed tiles and composite them onto the canvas. A keyframe
@@ -163,9 +176,9 @@ export function ControlOverlay({ client, onClose }: { client: ClientDto; onClose
 	// or a toast. Escape closes the overlay; everything else is forwarded.
 	useEffect(() => {
 		const onKeyDown = (e: KeyboardEvent) => {
-			e.preventDefault()
 			// A double-tap of Escape (two presses within 500ms) exits the overlay; a
 			// single Escape falls through and is forwarded to the remote like any key.
+			// Esc-Esc works in watch mode too, so this runs before the read-only gate.
 			if (e.key === "Escape" && !e.repeat) {
 				if (e.timeStamp - escapeAt.current < 500) {
 					onClose()
@@ -173,10 +186,15 @@ export function ControlOverlay({ client, onClose }: { client: ClientDto; onClose
 				}
 				escapeAt.current = e.timeStamp
 			}
+			// Watch mode forwards nothing, so don't capture the keyboard — let every
+			// other key reach the host normally.
+			if (readOnly) return
+			e.preventDefault()
 			pressedKeys.current.add(e.code)
 			send({ code: e.code, pressed: true, t: "key" })
 		}
 		const onKeyUp = (e: KeyboardEvent) => {
+			if (readOnly) return
 			e.preventDefault()
 			pressedKeys.current.delete(e.code)
 			send({ code: e.code, pressed: false, t: "key" })
@@ -192,14 +210,15 @@ export function ControlOverlay({ client, onClose }: { client: ClientDto; onClose
 			window.removeEventListener("keyup", onKeyUp)
 			window.removeEventListener("blur", onBlur)
 		}
-	}, [send, releaseAll, onClose])
+	}, [send, releaseAll, onClose, readOnly])
 
 	// Forward wheel scroll to the agent and stop it from scrolling/zooming the
 	// host webview. React's synthetic `onWheel` is passive (preventDefault is a
 	// no-op there), so attach a non-passive native listener.
 	useEffect(() => {
 		const el = surfaceRef.current
-		if (!el) return
+		// Watch mode forwards no scroll, so don't intercept the wheel at all.
+		if (!el || readOnly) return
 		const onWheelNative = (e: WheelEvent) => {
 			e.preventDefault()
 			const dy = Math.round(e.deltaY / 100) || Math.sign(e.deltaY)
@@ -208,7 +227,7 @@ export function ControlOverlay({ client, onClose }: { client: ClientDto; onClose
 		}
 		el.addEventListener("wheel", onWheelNative, { passive: false })
 		return () => el.removeEventListener("wheel", onWheelNative)
-	}, [send])
+	}, [send, readOnly])
 
 	const norm = (e: React.PointerEvent | React.MouseEvent): { x: number; y: number } | null => {
 		const el = canvasRef.current
@@ -274,15 +293,24 @@ export function ControlOverlay({ client, onClose }: { client: ClientDto; onClose
 		<div className="fixed inset-0 z-[60] flex flex-col bg-black/95" style={{ animation: "var(--animate-fade-in)" }}>
 			<div className="no-drag flex items-center gap-3 border-b border-white/10 bg-black px-4 py-2.5 text-white">
 				<span className="signal-live h-2.5 w-2.5 shrink-0 rounded-full bg-success" />
-				<MousePointer2 className="h-4 w-4 text-primary-strong" />
+				{readOnly ? (
+					<Eye className="h-4 w-4 text-primary-strong" />
+				) : (
+					<MousePointer2 className="h-4 w-4 text-primary-strong" />
+				)}
 				<span className="font-display font-semibold">{client.name}</span>
+				{readOnly && (
+					<span className="rounded-md bg-white/10 px-1.5 py-0.5 font-mono text-[0.65rem] uppercase tracking-wide text-white/60">
+						read-only
+					</span>
+				)}
 				<span className="font-mono text-xs text-white/45">
 					{meta ? `${meta.width}×${meta.height}` : "connecting…"}
 					{fps > 0 && ` · ${fps} fps`}
 				</span>
 				<span className="ml-auto flex items-center gap-2 text-xs text-white/45">
-					<Keyboard className="h-3.5 w-3.5" />
-					<span>type to control</span>
+					{readOnly ? <Eye className="h-3.5 w-3.5" /> : <Keyboard className="h-3.5 w-3.5" />}
+					<span>{readOnly ? "watching — input disabled" : "type to control"}</span>
 					<span className="text-white/25">·</span>
 					<span className="inline-flex items-center gap-1">
 						<kbd className="kbd h-5 min-w-5 border-white/20 bg-white/10 text-white/70">Esc</kbd>

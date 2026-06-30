@@ -1,4 +1,5 @@
 import {
+	Eye,
 	MonitorSmartphone,
 	MonitorUp,
 	Plug,
@@ -35,7 +36,9 @@ function Shell({ active, onExit }: { active: ActiveInfo; onExit: () => void }) {
 	const [clients, setClients] = useState<ClientDto[]>([])
 	const [loading, setLoading] = useState(true)
 
-	const [controlId, setControlId] = useState<string | null>(null)
+	// The live-session overlay, or null. `watch` opens it read-only: it receives the
+	// stream but forwards no input (see ControlOverlay's `readOnly`).
+	const [controlSession, setControlSession] = useState<{ id: string; watch: boolean } | null>(null)
 	const [detailId, setDetailId] = useState<string | null>(null)
 	const [addOpen, setAddOpen] = useState(false)
 	const [deploy, setDeploy] = useState<DeployState | null>(null)
@@ -61,12 +64,12 @@ function Shell({ active, onExit }: { active: ActiveInfo; onExit: () => void }) {
 
 	// Derive the open overlays from live `clients` so they stay in sync (and close
 	// themselves if a machine is removed underneath them).
-	const control = controlId ? (clients.find((c) => c.id === controlId) ?? null) : null
+	const control = controlSession ? (clients.find((c) => c.id === controlSession.id) ?? null) : null
 	const detail = detailId ? (clients.find((c) => c.id === detailId) ?? null) : null
 	useEffect(() => {
-		if (controlId && !clients.some((c) => c.id === controlId)) setControlId(null)
+		if (controlSession && !clients.some((c) => c.id === controlSession.id)) setControlSession(null)
 		if (detailId && !clients.some((c) => c.id === detailId)) setDetailId(null)
-	}, [clients, controlId, detailId])
+	}, [clients, controlSession, detailId])
 
 	const exit = async () => {
 		try {
@@ -155,7 +158,16 @@ function Shell({ active, onExit }: { active: ActiveInfo; onExit: () => void }) {
 					id: `ctl:${c.id}`,
 					keywords: `control screen takeover ${kw}`,
 					label: "Take control",
-					run: () => setControlId(c.id)
+					run: () => setControlSession({ id: c.id, watch: false })
+				},
+				{
+					disabled: !c.online,
+					group: c.name,
+					icon: <Eye className="h-4 w-4" />,
+					id: `watch:${c.id}`,
+					keywords: `watch view observe read-only screen ${kw}`,
+					label: "Watch (read-only)",
+					run: () => setControlSession({ id: c.id, watch: true })
 				},
 				{
 					disabled: !c.online,
@@ -215,8 +227,9 @@ function Shell({ active, onExit }: { active: ActiveInfo; onExit: () => void }) {
 						hotkeysEnabled={!controlling && !overlayOpen}
 						loading={loading}
 						onAdd={() => setAddOpen(true)}
-						onControl={(c) => setControlId(c.id)}
+						onControl={(c) => setControlSession({ id: c.id, watch: false })}
 						onDetail={(c) => setDetailId(c.id)}
+						onWatch={(c) => setControlSession({ id: c.id, watch: true })}
 					/>
 				)}
 				{page === "controller" && <ConnectionPage active={active} />}
@@ -258,7 +271,13 @@ function Shell({ active, onExit }: { active: ActiveInfo; onExit: () => void }) {
 					<DeployScript name={deploy.name} os={deploy.os} script={deploy.script} />
 				</Drawer>
 			)}
-			{control && <ControlOverlay client={control} onClose={() => setControlId(null)} />}
+			{control && (
+				<ControlOverlay
+					client={control}
+					onClose={() => setControlSession(null)}
+					readOnly={controlSession?.watch}
+				/>
+			)}
 		</div>
 	)
 }

@@ -29,6 +29,7 @@ const GROUPS: { name: string; items: Shortcut[] }[] = [
 			{ keys: ["/"], label: "Search the list" },
 			{ keys: ["J", "K"], label: "Move selection" },
 			{ keys: ["↵"], label: "Take control" },
+			{ keys: ["W"], label: "Watch (read-only)" },
 			{ keys: ["S"], label: "Connect via SSH" },
 			{ keys: ["R"], label: "Connect via RDP" },
 			{ keys: ["D"], label: "Open details" }

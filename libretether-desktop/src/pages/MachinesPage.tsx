@@ -1,5 +1,6 @@
 import {
 	Camera,
+	Eye,
 	Info,
 	MonitorSmartphone,
 	MonitorUp,
@@ -37,6 +38,7 @@ export function MachinesPage({
 	clients,
 	loading,
 	onControl,
+	onWatch,
 	onDetail,
 	onAdd,
 	actions,
@@ -45,6 +47,7 @@ export function MachinesPage({
 	clients: ClientDto[]
 	loading: boolean
 	onControl: (c: ClientDto) => void
+	onWatch: (c: ClientDto) => void
 	onDetail: (c: ClientDto) => void
 	onAdd: () => void
 	actions: Actions
@@ -103,6 +106,7 @@ export function MachinesPage({
 			{ combo: "arrowup", handler: () => move(-1) },
 			{ combo: "k", handler: () => move(-1) },
 			{ combo: "enter", handler: () => selected?.online && onControl(selected) },
+			{ combo: "w", handler: () => selected?.online && onWatch(selected) },
 			{ combo: "s", handler: () => selected?.online && actions.ssh(selected) },
 			{ combo: "r", handler: () => selected?.online && actions.rdp(selected) },
 			{ combo: "d", handler: () => selected?.online && onDetail(selected) }
@@ -191,6 +195,7 @@ export function MachinesPage({
 								onControl={() => onControl(c)}
 								onDetail={() => onDetail(c)}
 								onSelect={() => setSelectedId(c.id)}
+								onWatch={() => onWatch(c)}
 								selected={c.id === selectedId}
 							/>
 						))}
@@ -207,6 +212,7 @@ function MachineRow({
 	index,
 	onSelect,
 	onControl,
+	onWatch,
 	onDetail,
 	actions
 }: {
@@ -215,6 +221,7 @@ function MachineRow({
 	index: number
 	onSelect: () => void
 	onControl: () => void
+	onWatch: () => void
 	onDetail: () => void
 	actions: Actions
 }) {
@@ -272,11 +279,7 @@ function MachineRow({
 			data-id={client.id}
 			style={{ animation: `var(--animate-row-in)`, animationDelay: `${Math.min(index, 12) * 22}ms` }}
 		>
-			<div
-				className="flex items-center gap-3.5 px-3.5 py-3"
-				onClick={onSelect}
-				onDoubleClick={() => client.online && onControl()}
-			>
+			<div className="flex items-center gap-3.5 px-3.5 py-3" onClick={onSelect}>
 				<StatusDot className="shrink-0" state={dotState(client)} />
 
 				<div className="grid h-10 w-10 shrink-0 place-items-center rounded-xl bg-surface-3 text-muted">
@@ -306,6 +309,16 @@ function MachineRow({
 						variant="primary"
 					>
 						Control
+					</Button>
+					<Button
+						disabled={offline}
+						icon={<Eye className="h-4 w-4" />}
+						onClick={onWatch}
+						size="sm"
+						title="Watch (read-only) (w)"
+						variant="outline"
+					>
+						Watch
 					</Button>
 					<Button
 						disabled={offline || busy[`ssh:${client.id}`]}
