@@ -117,10 +117,39 @@ fn main() -> Result<()> {
 		x11env::ensure();
 	}
 
+	let result = dispatch_blocking(cli, cfg_path.clone());
+	// Leave a trace even for the one-shot commands (enroll/pair/install). On the
+	// Windows GUI-subsystem build there's no console and stderr is discarded, so a
+	// failure would otherwise vanish with no `agent.log` (only `run` writes one) —
+	// append it next to the config so the installer can point an operator at it.
+	if let Err(err) = &result {
+		log_fatal(&cfg_path, err);
+	}
+	result
+}
+
+fn dispatch_blocking(cli: Cli, cfg_path: PathBuf) -> Result<()> {
 	tokio::runtime::Builder::new_multi_thread()
 		.enable_all()
 		.build()?
 		.block_on(dispatch(cli, cfg_path))
+}
+
+/// Append a fatal error to `agent.log` beside the config (best-effort), so a failed
+/// one-shot command leaves a diagnosable trace where stderr goes nowhere.
+fn log_fatal(cfg_path: &std::path::Path, err: &anyhow::Error) {
+	let Some(dir) = cfg_path.parent() else { return };
+	if std::fs::create_dir_all(dir).is_err() {
+		return;
+	}
+	if let Ok(mut f) = std::fs::OpenOptions::new()
+		.create(true)
+		.append(true)
+		.open(dir.join("agent.log"))
+	{
+		use std::io::Write;
+		let _ = writeln!(f, "[{}] error: {err:#}", host::now_secs());
+	}
 }
 
 async fn dispatch(cli: Cli, cfg_path: std::path::PathBuf) -> Result<()> {

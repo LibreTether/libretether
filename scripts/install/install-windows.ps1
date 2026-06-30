@@ -151,14 +151,27 @@ if ($env:LIBRETETHER_AGENT_BIN) {
 
 # Run an agent subcommand and fail loudly. The agent is a GUI-subsystem binary
 # (no console window for the background service), which PowerShell's call operator
-# would NOT wait for — so use Start-Process -Wait and check the exit code.
+# would NOT wait for — so use Start-Process -Wait and check the exit code. We also
+# redirect stdout/stderr to files: a GUI-subsystem process discards its output
+# otherwise, so this is the only way to actually see *why* a step failed (the error
+# the agent printed), rather than just a bare exit code.
 function Invoke-Agent {
 	param([string[]]$AgentArgs)
-	$p = Start-Process -FilePath $Bin -ArgumentList $AgentArgs -NoNewWindow -Wait -PassThru
-	if ($p.ExitCode -ne 0) {
-		# The agent writes its log next to its config (dirs::config_dir()), i.e.
-		# %APPDATA%\libretether-agent, NOT next to the binary.
-		throw "agent '$($AgentArgs[0])' failed (exit $($p.ExitCode)); see $env:APPDATA\libretether-agent\agent.log"
+	$outFile = [System.IO.Path]::GetTempFileName()
+	$errFile = [System.IO.Path]::GetTempFileName()
+	try {
+		$p = Start-Process -FilePath $Bin -ArgumentList $AgentArgs -NoNewWindow -Wait -PassThru `
+			-RedirectStandardOutput $outFile -RedirectStandardError $errFile
+		$out = (Get-Content -Raw $outFile -ErrorAction SilentlyContinue)
+		$err = (Get-Content -Raw $errFile -ErrorAction SilentlyContinue)
+		if ($out) { Write-Host $out.TrimEnd() }
+		if ($p.ExitCode -ne 0) {
+			$detail = (@($err, $out) | Where-Object { $_ -and $_.Trim() } | ForEach-Object { $_.Trim() }) -join "`n"
+			if (-not $detail) { $detail = "(the agent produced no output)" }
+			throw "agent '$($AgentArgs[0])' failed (exit $($p.ExitCode)):`n$detail`n`nFull log: $env:APPDATA\libretether-agent\agent.log"
+		}
+	} finally {
+		Remove-Item $outFile, $errFile -Force -ErrorAction SilentlyContinue
 	}
 }
 

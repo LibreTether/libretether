@@ -25,9 +25,18 @@ pub fn uninstall() -> Result<()> {
 }
 
 fn run(cmd: &mut Command) -> Result<()> {
-	let status = cmd.no_window().status().with_context(|| format!("running {cmd:?}"))?;
-	if !status.success() {
-		return Err(anyhow!("command failed ({status}): {cmd:?}"));
+	// Capture output (not inherit) so the underlying tool's own error — e.g. what
+	// `schtasks`/`systemctl`/`launchctl` actually complained about — is in the error
+	// we return, instead of a bare exit status that tells an operator nothing.
+	let output = cmd.no_window().output().with_context(|| format!("running {cmd:?}"))?;
+	if !output.status.success() {
+		let stderr = String::from_utf8_lossy(&output.stderr);
+		let stdout = String::from_utf8_lossy(&output.stdout);
+		let detail = [stderr.trim(), stdout.trim()]
+			.into_iter()
+			.find(|s| !s.is_empty())
+			.unwrap_or("(no output)");
+		return Err(anyhow!("command failed ({}): {cmd:?} — {detail}", output.status));
 	}
 	Ok(())
 }
