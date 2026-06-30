@@ -1,8 +1,27 @@
 name: Release
 
+# The whole release runs in the master BRANCH cache scope, not on the tag. Every
+# heavy build here caches its work — the agent/relay Rust builds and the desktop
+# Tauri bundle via rust-cache, the relay image via buildx's `type=gha` layer cache
+# — and GitHub only lets a run *restore* caches created on its own ref or the
+# default branch. A tag-triggered run (refs/tags/vX) can therefore never reuse the
+# cache a previous tag run saved, so each release would rebuild everything cold.
+#
+# The `release` Runfile task pushes the `chore: release vX` commit to master right
+# before the tag, so we trigger on that commit: every job saves AND restores under
+# refs/heads/master, which the next release's master-push run can read — so each
+# release warms the next. The tag itself is pushed first (see the Runfile) purely
+# so it exists when the jobs below check it out / attach assets to it.
+
 on:
   push:
-    tags: ["v*.*.*"]
+    branches: [master]
+    # The version bump rewrites tauri.conf.json on every release commit; the
+    # `prepare` job's guard further restricts this to actual `chore: release`
+    # commits, so an unrelated edit to that file spins up (and skips) `prepare`
+    # without running a release.
+    paths:
+      - "libretether-desktop/src-tauri/tauri.conf.json"
   workflow_dispatch:
     inputs:
       tag:
@@ -10,24 +29,48 @@ on:
         required: true
 
 jobs:
+  # Resolve the release tag from the committed manifest (the source of truth the
+  # `release` task bumps) and gate the whole workflow to release commits. Every
+  # other job `needs` this — when the guard is false `prepare` is skipped and the
+  # rest skip with it, so a non-release push to master builds nothing.
+  prepare:
+    name: Resolve release tag
+    if: "${{ github.event_name == 'workflow_dispatch' || startsWith(github.event.head_commit.message, 'chore: release ') }}"
+    runs-on: ubuntu-24.04
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v6.0.2
+      - name: Resolve tag
+        id: tag
+        env:
+          DISPATCH_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          if [ -n "${DISPATCH_TAG:-}" ]; then
+            tag="$DISPATCH_TAG"
+          else
+            tag="v$(jq -r '.version' libretether-desktop/package.json)"
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "Release tag: $tag"
+
   # Create the GitHub release up front (notes only, no assets) so every other job
-  # attaches to it. This lets the foundational artifacts — the agent/relay CLIs,
-  # install scripts, and the relay Docker image — land in the release first, and the
-  # heavy Tauri desktop build (the `desktop` job below) run LAST: if it fails,
-  # everything else is already published.
+  # attaches to it. The guard keeps a re-run from failing on an existing release.
   create-release:
     name: Create release
+    needs: prepare
     permissions:
       contents: write
     runs-on: ubuntu-24.04
     steps:
-      # No checkout needed: `gh` talks to the API and the tag already exists (this
-      # runs on a tag push). Create notes-only here; assets are attached by the
-      # later jobs. The guard keeps a re-run from failing on an existing release.
+      # No checkout needed: `gh` talks to the API and the tag already exists (the
+      # `release` task pushes it before the branch that triggered this run). Create
+      # notes-only here; assets are attached by the later jobs.
       - name: Create the release if it doesn't exist
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ inputs.tag || github.ref_name }}
+          TAG: ${{ needs.prepare.outputs.tag }}
         run: |
           gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 \
             || gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --title "$TAG" --generate-notes
@@ -35,10 +78,11 @@ jobs:
   # Build the headless libretether-agent and the libretether-relay relay for every
   # supported platform and attach them to the release. The agent's Wayland/PipeWire
   # support is a Linux-target dependency, so the same `cargo build` is correct on
-  # every platform; the relay has no system deps.
+  # every platform; the relay has no system deps. rust-cache (via the toolchain
+  # action) carries the dependency build across releases in the master scope.
   binaries:
     name: Binaries (${{ matrix.key }})
-    needs: create-release
+    needs: [prepare, create-release]
     permissions:
       contents: write
       id-token: write
@@ -123,7 +167,7 @@ jobs:
       - name: Upload to release
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ inputs.tag || github.ref_name }}
+          TAG: ${{ needs.prepare.outputs.tag }}
         shell: bash
         run: |
           set -euo pipefail
@@ -152,7 +196,7 @@ jobs:
   # the matching agent build. Runs after `binaries` so the agent assets exist.
   install-scripts:
     name: Install scripts
-    needs: [create-release, binaries]
+    needs: [prepare, create-release, binaries]
     permissions:
       contents: write
     runs-on: ubuntu-24.04
@@ -162,7 +206,7 @@ jobs:
       - name: Pin and upload installers
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ inputs.tag || github.ref_name }}
+          TAG: ${{ needs.prepare.outputs.tag }}
         run: |
           set -euo pipefail
           src="https://github.com/LibreTether/libretether/releases/latest/download"
@@ -176,9 +220,11 @@ jobs:
   # Build the libretether-relay relay container per-arch on a NATIVE runner (no QEMU
   # emulation — the arm64 leg uses an ARM runner, like the binaries job), push
   # each by digest, then `docker-merge` stitches them into one multi-arch image
-  # at ghcr.io/<owner>/libretether-relay. Independent of the GitHub release above.
+  # at ghcr.io/<owner>/libretether-relay. The buildx `type=gha` layer cache lands
+  # in the master scope, so it carries across releases like the Rust builds.
   docker:
     name: Docker image (${{ matrix.platform }})
+    needs: prepare
     permissions:
       contents: read
       packages: write
@@ -243,7 +289,7 @@ jobs:
   # Combine the per-arch digests into a single multi-arch manifest and tag it.
   docker-merge:
     name: Docker image (manifest)
-    needs: docker
+    needs: [prepare, docker]
     permissions:
       contents: read
       packages: write
@@ -276,8 +322,8 @@ jobs:
         with:
           images: ${{ env.REGISTRY_IMAGE }}
           tags: |
-            type=semver,pattern={{version}},value=${{ inputs.tag || github.ref_name }}
-            type=semver,pattern={{major}}.{{minor}},value=${{ inputs.tag || github.ref_name }}
+            type=semver,pattern={{version}},value=${{ needs.prepare.outputs.tag }}
+            type=semver,pattern={{major}}.{{minor}},value=${{ needs.prepare.outputs.tag }}
             type=raw,value=latest
 
       - name: Create and push manifest list
@@ -290,17 +336,16 @@ jobs:
       - name: Inspect
         run: docker buildx imagetools inspect "${REGISTRY_IMAGE}:${{ steps.meta.outputs.version }}"
 
-  # Build the Tauri desktop bundles LAST and attach them to the release created at
-  # the top. The shared publisher (configured in .publisher.json) creates the
-  # release only if it's missing, so here it just uploads the bundles to the
-  # existing one. Gated behind the CLI + install-script jobs so a desktop-build
-  # failure can't strand them. (The Docker job is independent of the release and
-  # runs in parallel — it doesn't gate this.)
+  # Build the Tauri desktop bundles via the shared publisher and attach them to the
+  # release. Runs in parallel with the jobs above — they're independent jobs, so a
+  # desktop-build failure can't strand the already-uploaded binaries/installers,
+  # and the publisher creates-or-reuses the release and uploads with --clobber. The
+  # reusable workflow inherits this run's master ref, so its rust-cache is warm too.
   desktop:
     name: Desktop bundles
-    needs: [create-release, binaries, install-scripts]
+    needs: prepare
     uses: Skiley/rust-binary-publish/.github/workflows/release.yml@v3.2.0
     permissions:
       contents: write
     with:
-      tag: ${{ inputs.tag || github.ref_name }}
+      tag: ${{ needs.prepare.outputs.tag }}

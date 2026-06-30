@@ -64,10 +64,10 @@
 				"echo Tagging {{ VAR.tag }}",
 				"git commit libretether-desktop/package.json Cargo.toml libretether-desktop/src-tauri/tauri.conf.json Cargo.lock -m {{ shell_quote(concat('chore: release ', VAR.tag)) }}",
 				"git tag {{ shell_quote(VAR.tag) }}",
-				"git push",
-				"git push --tags"
+				"git push --tags",
+				"git push"
 			],
-			"description": "Bump the version (major/minor/patch) across manifests, refresh Cargo.lock, commit, tag v<new>, then push so the release workflow runs",
+			"description": "Bump the version (major/minor/patch) across manifests, refresh Cargo.lock, commit, tag v<new>, then push the tag BEFORE the branch — release-desktop.yml triggers on the branch push and checks out the tag, so the tag must already exist when that build starts",
 			"forceShell": "sh"
 		},
 		"setup": {
