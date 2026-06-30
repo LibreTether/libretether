@@ -1,9 +1,11 @@
-import { Search, Trash2 } from "lucide-react"
+import { Eraser, RotateCw, Search } from "lucide-react"
 import { useCallback, useEffect, useMemo, useRef, useState } from "react"
+import { Combobox } from "../components/Combobox"
 import { PageHeader } from "../components/PageHeader"
 import { Button, EmptyState, Input } from "../components/ui"
 import * as api from "../lib/api"
 import { cn } from "../lib/cn"
+import { useHotkeys } from "../lib/hotkeys"
 import { useToast } from "../lib/toast"
 import type { ClientDto, LogEntry, LogLevel } from "../lib/types"
 
@@ -20,7 +22,7 @@ const MAX_ROWS = 3000
 const LEVEL_TEXT: Record<LogLevel, string> = {
 	debug: "text-muted",
 	error: "text-danger",
-	info: "text-primary dark:text-primary-strong",
+	info: "text-accent",
 	trace: "text-subtle",
 	warn: "text-warning"
 }
@@ -28,7 +30,7 @@ const LEVEL_TEXT: Record<LogLevel, string> = {
 const LEVEL_PILL: Record<LogLevel, string> = {
 	debug: "bg-surface-3 text-muted",
 	error: "bg-danger-soft text-danger",
-	info: "bg-primary-soft text-primary dark:text-primary-strong",
+	info: "bg-accent/12 text-accent",
 	trace: "bg-surface-3 text-subtle",
 	warn: "bg-warning-soft text-warning"
 }
@@ -45,7 +47,7 @@ function cap(r: Row[]): Row[] {
 	return r.length > MAX_ROWS ? r.slice(r.length - MAX_ROWS) : r
 }
 
-export function LogsPage({ clients }: { clients: ClientDto[] }) {
+export function LogsPage({ clients, hotkeysEnabled }: { clients: ClientDto[]; hotkeysEnabled: boolean }) {
 	const toast = useToast()
 	const [rows, setRows] = useState<Row[]>([])
 	const [levels, setLevels] = useState<Set<LogLevel>>(() => new Set(LEVELS))
@@ -53,6 +55,9 @@ export function LogsPage({ clients }: { clients: ClientDto[] }) {
 	const [search, setSearch] = useState("")
 	const [agentId, setAgentId] = useState("")
 	const [fetching, setFetching] = useState(false)
+	const searchRef = useRef<HTMLInputElement>(null)
+
+	useHotkeys([{ combo: "/", handler: () => searchRef.current?.focus() }], hotkeysEnabled)
 
 	const idRef = useRef(0)
 	const tag = useCallback((es: LogEntry[]): Row[] => es.map((e) => ({ ...e, _id: idRef.current++ })), [])
@@ -153,11 +158,16 @@ export function LogsPage({ clients }: { clients: ClientDto[] }) {
 			<PageHeader
 				actions={
 					<>
-						<Button onClick={refreshController} size="sm" variant="soft">
+						<Button
+							icon={<RotateCw className="h-4 w-4" />}
+							onClick={refreshController}
+							size="sm"
+							variant="soft"
+						>
 							Refresh
 						</Button>
 						<Button
-							icon={<Trash2 className="h-4 w-4" />}
+							icon={<Eraser className="h-4 w-4" />}
 							onClick={() => setRows([])}
 							size="sm"
 							variant="ghost"
@@ -166,6 +176,7 @@ export function LogsPage({ clients }: { clients: ClientDto[] }) {
 						</Button>
 					</>
 				}
+				eyebrow="Activity"
 				subtitle="Live controller activity, plus agent logs you pull from a machine"
 				title="Logs"
 			/>
@@ -179,6 +190,7 @@ export function LogsPage({ clients }: { clients: ClientDto[] }) {
 							className="pl-9"
 							onChange={(e) => setSearch(e.target.value)}
 							placeholder="Search messages…"
+							ref={searchRef}
 							value={search}
 						/>
 					</div>
@@ -188,7 +200,7 @@ export function LogsPage({ clients }: { clients: ClientDto[] }) {
 							return (
 								<button
 									className={cn(
-										"no-drag rounded-full px-2.5 py-1 text-xs font-semibold capitalize transition",
+										"no-drag rounded-full px-2.5 py-1 font-mono text-xs font-semibold uppercase tracking-wide transition",
 										on ? LEVEL_PILL[level] : "bg-surface-2 text-subtle line-through opacity-60"
 									)}
 									key={level}
@@ -203,40 +215,27 @@ export function LogsPage({ clients }: { clients: ClientDto[] }) {
 				</div>
 
 				<div className="flex flex-wrap items-center gap-2 text-sm">
-					<label className="flex items-center gap-1.5 text-muted">
-						<span className="text-xs font-semibold">Source</span>
-						<select
-							className="no-drag rounded-lg border border-border bg-surface-2 px-2 py-1 text-sm text-text outline-none focus:border-primary"
-							onChange={(e) => setSource(e.target.value)}
+					<div className="flex items-center gap-1.5 text-muted">
+						<span className="eyebrow">Source</span>
+						<Combobox
+							className="w-44"
+							onChange={setSource}
+							options={[{ label: "All sources", value: "all" }, ...sources.map((s) => ({ value: s }))]}
 							value={source}
-						>
-							<option value="all">All sources</option>
-							{sources.map((s) => (
-								<option key={s} value={s}>
-									{s}
-								</option>
-							))}
-						</select>
-					</label>
+						/>
+					</div>
 
 					<div className="ml-auto flex items-center gap-2">
-						<span className="text-xs font-semibold text-muted">Agent logs</span>
-						<select
-							className="no-drag max-w-44 rounded-lg border border-border bg-surface-2 px-2 py-1 text-sm text-text outline-none focus:border-primary disabled:opacity-50"
+						<span className="eyebrow">Agent logs</span>
+						<Combobox
+							className="w-44"
 							disabled={online.length === 0}
-							onChange={(e) => setAgentId(e.target.value)}
-							value={agentId}
-						>
-							{online.length === 0 ? (
-								<option value="">No machines online</option>
-							) : (
-								online.map((c) => (
-									<option key={c.id} value={c.id}>
-										{c.name}
-									</option>
-								))
-							)}
-						</select>
+							emptyText="No machines online"
+							onChange={setAgentId}
+							options={online.map((c) => ({ label: c.name, value: c.id }))}
+							placeholder="Pick a machine…"
+							value={agentId || null}
+						/>
 						<Button
 							disabled={online.length === 0 || !agentId}
 							loading={fetching}

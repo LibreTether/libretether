@@ -1,6 +1,6 @@
 [package]
 name = "libretether-common"
-version = "0.1.0"
+version.workspace = true
 description = "Shared host-side utilities for LibreTether (time, shutdown signal, process helpers)"
 edition = "2021"
 license = "AGPL-3.0-only"

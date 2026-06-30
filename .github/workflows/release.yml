@@ -10,23 +10,35 @@ on:
         required: true
 
 jobs:
-  # The Tauri controller bundles + GitHub release are produced by the shared
-  # publisher (configured in .publisher.json). This also creates the release the
-  # agent job below uploads its binaries to.
-  release:
-    uses: Skiley/rust-binary-publish/.github/workflows/release.yml@v3.1.0
+  # Create the GitHub release up front (notes only, no assets) so every other job
+  # attaches to it. This lets the foundational artifacts — the agent/relay CLIs,
+  # install scripts, and the relay Docker image — land in the release first, and the
+  # heavy Tauri desktop build (the `desktop` job below) run LAST: if it fails,
+  # everything else is already published.
+  create-release:
+    name: Create release
     permissions:
       contents: write
-    with:
-      tag: ${{ inputs.tag || github.ref_name }}
+    runs-on: ubuntu-24.04
+    steps:
+      # No checkout needed: `gh` talks to the API and the tag already exists (this
+      # runs on a tag push). Create notes-only here; assets are attached by the
+      # later jobs. The guard keeps a re-run from failing on an existing release.
+      - name: Create the release if it doesn't exist
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 \
+            || gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --title "$TAG" --generate-notes
 
   # Build the headless libretether-agent and the libretether-relay relay for every
-  # supported platform and attach them to the same release. The agent's
-  # Wayland/PipeWire support is a Linux-target dependency, so the same
-  # `cargo build` is correct on every platform; the relay has no system deps.
+  # supported platform and attach them to the release. The agent's Wayland/PipeWire
+  # support is a Linux-target dependency, so the same `cargo build` is correct on
+  # every platform; the relay has no system deps.
   binaries:
     name: Binaries (${{ matrix.key }})
-    needs: release
+    needs: create-release
     permissions:
       contents: write
       id-token: write
@@ -111,20 +123,36 @@ jobs:
       - name: Upload to release
         env:
           GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag || github.ref_name }}
         shell: bash
         run: |
-          gh release upload "${{ inputs.tag || github.ref_name }}" \
-            "libretether-agent-${{ matrix.key }}${{ matrix.ext }}" \
-            "libretether-agent-${{ matrix.key }}${{ matrix.ext }}.sha256" \
-            "libretether-relay-${{ matrix.key }}${{ matrix.ext }}" \
-            "libretether-relay-${{ matrix.key }}${{ matrix.ext }}.sha256" --clobber
+          set -euo pipefail
+          assets=(
+            "libretether-agent-${{ matrix.key }}${{ matrix.ext }}"
+            "libretether-agent-${{ matrix.key }}${{ matrix.ext }}.sha256"
+            "libretether-relay-${{ matrix.key }}${{ matrix.ext }}"
+            "libretether-relay-${{ matrix.key }}${{ matrix.ext }}.sha256"
+          )
+          # GitHub's asset API can fail partway through a multi-file batch (e.g. the
+          # binary lands but its .sha256 doesn't), leaving a release with a missing
+          # checksum. Retry the whole upload — `--clobber` makes it idempotent, so a
+          # retry re-uploads everything and fills in whatever the last attempt missed.
+          for attempt in 1 2 3; do
+            if gh release upload "$TAG" "${assets[@]}" --clobber; then
+              exit 0
+            fi
+            echo "::warning::release upload attempt $attempt failed; retrying in 5s"
+            sleep 5
+          done
+          echo "::error::release upload failed after 3 attempts"
+          exit 1
 
   # Publish the one-line agent installers. They're pinned to this exact release
   # (and repo, so forks stay self-contained) so a downloaded script always pulls
   # the matching agent build. Runs after `binaries` so the agent assets exist.
   install-scripts:
     name: Install scripts
-    needs: [release, binaries]
+    needs: [create-release, binaries]
     permissions:
       contents: write
     runs-on: ubuntu-24.04
@@ -261,3 +289,18 @@ jobs:
 
       - name: Inspect
         run: docker buildx imagetools inspect "${REGISTRY_IMAGE}:${{ steps.meta.outputs.version }}"
+
+  # Build the Tauri desktop bundles LAST and attach them to the release created at
+  # the top. The shared publisher (configured in .publisher.json) creates the
+  # release only if it's missing, so here it just uploads the bundles to the
+  # existing one. Gated behind the CLI + install-script jobs so a desktop-build
+  # failure can't strand them. (The Docker job is independent of the release and
+  # runs in parallel — it doesn't gate this.)
+  desktop:
+    name: Desktop bundles
+    needs: [create-release, binaries, install-scripts]
+    uses: Skiley/rust-binary-publish/.github/workflows/release.yml@v3.2.0
+    permissions:
+      contents: write
+    with:
+      tag: ${{ inputs.tag || github.ref_name }}

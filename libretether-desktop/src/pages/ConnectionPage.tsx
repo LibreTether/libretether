@@ -24,7 +24,9 @@ function CopyRow({ value, secret = false }: { value: string; secret?: boolean })
 			.catch((e) => toast.error("Copy failed", api.errString(e)))
 	return (
 		<div className="flex items-center gap-2 rounded-xl border border-border bg-surface-2 px-3.5 py-2.5">
-			<code className="flex-1 truncate text-text">{masked ? "•".repeat(Math.min(value.length, 24)) : value}</code>
+			<code className="flex-1 truncate font-mono text-[0.82rem] text-text">
+				{masked ? "•".repeat(Math.min(value.length, 24)) : value}
+			</code>
 			{secret && (
 				<Button
 					icon={revealed ? <EyeOff className="h-3.5 w-3.5" /> : <Eye className="h-3.5 w-3.5" />}
@@ -38,6 +40,15 @@ function CopyRow({ value, secret = false }: { value: string; secret?: boolean })
 			<Button icon={<Copy className="h-3.5 w-3.5" />} onClick={copy} size="sm" variant="ghost">
 				Copy
 			</Button>
+		</div>
+	)
+}
+
+function SectionTitle({ icon, children }: { icon: React.ReactNode; children: React.ReactNode }) {
+	return (
+		<div className="flex items-center gap-2.5">
+			<span className="text-primary dark:text-primary-strong">{icon}</span>
+			<h2 className="font-display font-semibold text-text">{children}</h2>
 		</div>
 	)
 }
@@ -80,6 +91,7 @@ export function ConnectionPage({ active }: { active: ActiveInfo }) {
 						<span className="capitalize">{kind.type}</span>
 					</Badge>
 				}
+				eyebrow="Controller"
 				subtitle={`How agents reach “${active.name}”. Edit the type from the launch screen.`}
 				title="Connection"
 			/>
@@ -87,10 +99,9 @@ export function ConnectionPage({ active }: { active: ActiveInfo }) {
 			<div className="min-h-0 flex-1 overflow-y-auto px-7 py-6">
 				<div className="mx-auto flex max-w-2xl flex-col gap-4">
 					<section className="card flex flex-col gap-3 p-5">
-						<div className="flex items-center gap-2.5">
-							<Network className="h-5 w-5 text-primary dark:text-primary-strong" />
-							<h2 className="font-semibold text-text">Agents reach this controller at</h2>
-						</div>
+						<SectionTitle icon={<Network className="h-5 w-5" />}>
+							Agents reach this controller at
+						</SectionTitle>
 						{active.reachable_at ? (
 							<CopyRow value={active.reachable_at} />
 						) : (
@@ -103,10 +114,9 @@ export function ConnectionPage({ active }: { active: ActiveInfo }) {
 					</section>
 
 					{kind.type === "tailscale" && (
-						<section className="card p-5">
-							<div className="mb-3 flex items-center gap-2.5">
-								<Wifi className="h-5 w-5 text-primary dark:text-primary-strong" />
-								<h2 className="font-semibold text-text">Tailscale</h2>
+						<section className="card flex flex-col gap-3 p-5">
+							<div className="flex items-center gap-2.5">
+								<SectionTitle icon={<Wifi className="h-5 w-5" />}>Tailscale</SectionTitle>
 								{ts?.running ? (
 									<Badge tone="success">connected</Badge>
 								) : ts?.installed ? (
@@ -127,12 +137,10 @@ export function ConnectionPage({ active }: { active: ActiveInfo }) {
 
 					{kind.type === "relay" && (
 						<section className="card flex flex-col gap-3 p-5">
-							<div className="flex items-center gap-2.5">
-								<Server className="h-5 w-5 text-primary dark:text-primary-strong" />
-								<h2 className="font-semibold text-text">Relay secrets</h2>
-							</div>
+							<SectionTitle icon={<Server className="h-5 w-5" />}>Relay secrets</SectionTitle>
 							<p className="text-xs text-muted">
-								The controller and agents authenticate to <code>libretether-relay</code> with these.
+								The controller and agents authenticate to{" "}
+								<code className="font-mono">libretether-relay</code> with these.
 							</p>
 							<Field label="Owner secret">
 								<CopyRow secret value={kind.owner_secret} />
@@ -144,9 +152,8 @@ export function ConnectionPage({ active }: { active: ActiveInfo }) {
 					)}
 
 					<section className="card flex flex-col gap-4 p-5">
-						<div className="flex items-center gap-2.5">
-							<ScreenShare className="h-5 w-5 text-primary dark:text-primary-strong" />
-							<h2 className="font-semibold text-text">Host tools</h2>
+						<div className="flex flex-wrap items-center gap-2.5">
+							<SectionTitle icon={<ScreenShare className="h-5 w-5" />}>Host tools</SectionTitle>
 							<span className="text-xs text-subtle">apply to every controller on this machine</span>
 						</div>
 
@@ -167,6 +174,7 @@ export function ConnectionPage({ active }: { active: ActiveInfo }) {
 						{rdpMode === "custom" && (
 							<Field hint="Placeholders: {host} {port} {user} {password}" label="Custom RDP command">
 								<Input
+									className="font-mono"
 									onChange={(e) => setRdpCustom(e.target.value)}
 									placeholder="e.g. remmina -c rdp://{user}:{password}@{host}:{port}"
 									value={rdpCustom}
@@ -179,6 +187,7 @@ export function ConnectionPage({ active }: { active: ActiveInfo }) {
 							label="Terminal (SSH)"
 						>
 							<Input
+								className="font-mono"
 								onChange={(e) => setTerminal(e.target.value)}
 								placeholder="auto-detect (gnome-terminal --, konsole -e, …)"
 								value={terminal}
@@ -192,19 +201,19 @@ export function ConnectionPage({ active }: { active: ActiveInfo }) {
 								onClick={savePrefs}
 								variant="primary"
 							>
-								Save
+								Save preferences
 							</Button>
 						</div>
 					</section>
 
 					<section className="card flex items-center gap-4 p-5">
-						<div className="grid h-11 w-11 place-items-center rounded-xl bg-surface-2 text-primary dark:text-primary-strong">
+						<div className="grid h-11 w-11 shrink-0 place-items-center rounded-xl bg-surface-2 text-primary dark:text-primary-strong">
 							<Fingerprint className="h-5 w-5" />
 						</div>
-						<div className="flex-1">
-							<div className="text-sm font-semibold text-text">Identity</div>
-							<div className="text-sm text-muted">
-								Fingerprint <code className="text-text">{active.fingerprint}</code>
+						<div className="min-w-0 flex-1">
+							<div className="eyebrow">Identity</div>
+							<div className="mt-0.5 text-sm text-muted">
+								Controller fingerprint <code className="font-mono text-text">{active.fingerprint}</code>
 							</div>
 						</div>
 					</section>

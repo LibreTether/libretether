@@ -1,6 +1,6 @@
 [package]
 name = "libretether-protocol"
-version = "0.1.0"
+version.workspace = true
 description = "Shared wire protocol, transport and identity for LibreTether"
 edition = "2021"
 license = "AGPL-3.0-only"

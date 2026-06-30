@@ -72,7 +72,7 @@ export function RelayConnecting({
 				<div className="flex w-full max-w-lg flex-col gap-4">
 					<div className="flex flex-col items-center gap-2 text-center">
 						<Loader2 className="h-7 w-7 animate-spin text-primary dark:text-primary-strong" />
-						<h1 className="text-lg font-bold text-text">Connecting to “{controller.name}”…</h1>
+						<h1 className="font-display text-lg font-bold text-text">Connecting to “{controller.name}”…</h1>
 						<p className="text-sm text-muted">
 							Establishing the relay connection — you'll go to the controller once the relay accepts.
 						</p>

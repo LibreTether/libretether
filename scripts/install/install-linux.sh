@@ -18,13 +18,22 @@ set -eu
 # so a versioned script always pulls the matching agent build.
 RELEASE_BASE="https://github.com/LibreTether/libretether/releases/latest/download"
 
-# Verify a downloaded file against its published <url>.sha256 sidecar. A custom
-# LIBRETETHER_AGENT_URL may have no sidecar; in that case we warn and continue.
+# Verify a downloaded file against its published <url>.sha256 sidecar. `curl --retry`
+# rides out a transient fetch failure (5xx/timeout) so a network blip isn't
+# mistaken for an absent checksum — only a genuine 404 (no sidecar) falls through
+# below. The official release always ships a sidecar, so its absence there is a hard
+# failure ($required=1 — fail closed rather than install an unverified agent). A custom
+# LIBRETETHER_AGENT_URL may legitimately have none; for that ($required=0) we warn on.
 verify_checksum() {
-	url="$1"; file="$2"
-	expected="$(curl -fsSL "$url.sha256" 2>/dev/null | tr -d '[:space:]')" || true
+	url="$1"; file="$2"; required="$3"
+	expected="$(curl -fsSL --retry 3 --retry-delay 2 "$url.sha256" 2>/dev/null | tr -d '[:space:]')" || true
 	if [ -z "$expected" ]; then
-		echo "==> No published checksum for $url — skipping integrity check." >&2
+		if [ "$required" = 1 ]; then
+			echo "!! No published checksum for $url — refusing to install an unverified agent. Aborting." >&2
+			rm -f "$file"
+			exit 1
+		fi
+		echo "==> No published checksum for $url (custom URL) — skipping integrity check." >&2
 		return 0
 	fi
 	actual="$(sha256sum "$file" | awk '{print $1}')"
@@ -111,19 +120,21 @@ mkdir -p "$BIN_DIR"
 if [ -n "${LIBRETETHER_AGENT_BIN:-}" ]; then
 	install -m 0755 "$LIBRETETHER_AGENT_BIN" "$BIN"
 else
+	# A custom URL may lack a checksum sidecar (require=0); the official release
+	# always has one (require=1).
 	if [ -n "${LIBRETETHER_AGENT_URL:-}" ]; then
-		URL="$LIBRETETHER_AGENT_URL"
+		URL="$LIBRETETHER_AGENT_URL"; REQUIRE_SUM=0
 	else
 		case "$(uname -m)" in
 			x86_64|amd64) ARCH=x86_64 ;;
 			aarch64|arm64) ARCH=aarch64 ;;
 			*) echo "!! Unsupported architecture $(uname -m). Set LIBRETETHER_AGENT_BIN or LIBRETETHER_AGENT_URL." >&2; exit 1 ;;
 		esac
-		URL="$RELEASE_BASE/libretether-agent-linux-$ARCH"
+		URL="$RELEASE_BASE/libretether-agent-linux-$ARCH"; REQUIRE_SUM=1
 	fi
 	echo "==> Downloading agent from $URL"
-	curl -fsSL "$URL" -o "$BIN"
-	verify_checksum "$URL" "$BIN"
+	curl -fsSL --retry 3 --retry-delay 2 "$URL" -o "$BIN"
+	verify_checksum "$URL" "$BIN" "$REQUIRE_SUM"
 	chmod +x "$BIN"
 fi
 

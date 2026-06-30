@@ -1,6 +1,6 @@
 [package]
 name = "libretether"
-version = "0.17.0"
+version.workspace = true
 description = "LibreTether — a self-hosted remote desktop controller"
 authors = ["LibreTether contributors"]
 license = "AGPL-3.0-only"

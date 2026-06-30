@@ -1,68 +1,67 @@
 @import "tailwindcss";
 
 /* Dark mode is driven by a `.dark` class on <html> so we can toggle it ourselves
-   and also honour the OS preference. */
+   and also honour the OS preference. The app ships dark — these are control-room
+   tools that live in dark — but light is fully supported. */
 @custom-variant dark (&:where(.dark, .dark *));
 
 /* ------------------------------------------------------------------ *
- * Design tokens                                                       *
+ * Design tokens — "the live tether"                                   *
+ * Signal amber on cool slate ink. Status semantics stay conventional  *
+ * (green online, orange warn, red danger); amber is brand/action.     *
  * ------------------------------------------------------------------ */
 :root {
-	--bg: #f4f5fb;
-	--bg-grad-a: #eef0fb;
-	--bg-grad-b: #f7f5ff;
+	--bg: #f3f5f8;
 	--surface: #ffffff;
-	--surface-2: #f7f8fc;
-	--surface-3: #eef1f8;
-	--border: #e4e7f0;
-	--border-strong: #d3d8e6;
-	--text: #1b1f2a;
-	--text-muted: #5b6478;
-	--text-subtle: #8a92a6;
-	--primary: #6d5cff;
-	--primary-strong: #5b46f5;
+	--surface-2: #f4f6f9;
+	--surface-3: #e8ecf2;
+	--border: #e3e7ef;
+	--border-strong: #ccd4e0;
+	--text: #121724;
+	--text-muted: #586173;
+	--text-subtle: #8b94a6;
+	--primary: #a9670a;
+	--primary-strong: #875206;
 	--primary-fg: #ffffff;
-	--primary-soft: #ece9ff;
-	--accent: #19c6b8;
-	--success: #18a957;
-	--success-soft: #e2f6ea;
-	--warning: #d98a00;
-	--warning-soft: #fbf0d8;
-	--danger: #e23d4f;
-	--danger-soft: #fbe5e8;
-	--ring: #8a7bff;
-	--shadow-color: 230 232 245;
+	--primary-soft: #f7ecd2;
+	--accent: #0e7fb8;
+	--success: #168a4d;
+	--success-soft: #e0f3e8;
+	--warning: #b5601c;
+	--warning-soft: #f9ebda;
+	--danger: #d3394a;
+	--danger-soft: #fbe4e7;
+	--ring: #c4881d;
+	--shadow-color: 214 219 230;
 }
 
 .dark {
-	--bg: #0a0c12;
-	--bg-grad-a: #0c0e17;
-	--bg-grad-b: #0a0b13;
-	--surface: #12141e;
-	--surface-2: #171a26;
-	--surface-3: #1d2130;
-	--border: #232838;
-	--border-strong: #313851;
-	--text: #eef1f8;
-	--text-muted: #9aa3ba;
-	--text-subtle: #6b7488;
-	--primary: #7c6bff;
-	--primary-strong: #8e7dff;
-	--primary-fg: #ffffff;
-	--primary-soft: #1e1c3a;
-	--accent: #2bd9c9;
-	--success: #2bd06f;
-	--success-soft: #11271b;
-	--warning: #e2a032;
-	--warning-soft: #2a2113;
-	--danger: #ff5c6c;
-	--danger-soft: #2c1419;
-	--ring: #7c6bff;
+	--bg: #090c12;
+	--surface: #10141d;
+	--surface-2: #161b27;
+	--surface-3: #1f2533;
+	--border: #222a39;
+	--border-strong: #323d54;
+	--text: #e9eef7;
+	--text-muted: #99a4ba;
+	--text-subtle: #606b81;
+	--primary: #f2a93c;
+	--primary-strong: #ffc063;
+	--primary-fg: #1a1204;
+	--primary-soft: #2a1d0a;
+	--accent: #5cc8ff;
+	--success: #34d27f;
+	--success-soft: #0f2a1d;
+	--warning: #ff9a4d;
+	--warning-soft: #2a1a0e;
+	--danger: #ff5d6c;
+	--danger-soft: #2a1318;
+	--ring: #f2a93c;
 	--shadow-color: 0 0 0;
 }
 
 /* ------------------------------------------------------------------ *
- * Expose tokens as Tailwind theme colours                             *
+ * Expose tokens as Tailwind theme colours + type/scale               *
  * ------------------------------------------------------------------ */
 @theme inline {
 	--color-bg: var(--bg);
@@ -88,17 +87,22 @@
 	--color-ring: var(--ring);
 
 	--font-sans:
-		"Inter", ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto,
-		Helvetica, Arial, sans-serif;
+		"Geist Variable", ui-sans-serif, system-ui, -apple-system, "Segoe UI",
+		Roboto, Helvetica, Arial, sans-serif;
+	--font-display:
+		"Space Grotesk", "Geist Variable", ui-sans-serif, system-ui, sans-serif;
 	--font-mono:
-		"JetBrains Mono", ui-monospace, "SF Mono", "Cascadia Code", Menlo,
-		monospace;
+		"Geist Mono Variable", ui-monospace, "JetBrains Mono", "SF Mono",
+		"Cascadia Code", Menlo, monospace;
 
-	--radius-xl: 1rem;
-	--radius-2xl: 1.25rem;
+	--radius-lg: 0.625rem;
+	--radius-xl: 0.75rem;
+	--radius-2xl: 0.875rem;
 
-	--animate-fade-in: fade-in 0.25s ease both;
-	--animate-slide-up: slide-up 0.3s cubic-bezier(0.22, 1, 0.36, 1) both;
+	--animate-fade-in: fade-in 0.2s ease both;
+	--animate-slide-up: slide-up 0.28s cubic-bezier(0.22, 1, 0.36, 1) both;
+	--animate-drawer-in: drawer-in 0.26s cubic-bezier(0.22, 1, 0.36, 1) both;
+	--animate-row-in: row-in 0.32s cubic-bezier(0.22, 1, 0.36, 1) both;
 }
 
 @keyframes fade-in {
@@ -113,7 +117,29 @@
 @keyframes slide-up {
 	from {
 		opacity: 0;
-		transform: translateY(8px);
+		transform: translateY(8px) scale(0.99);
+	}
+	to {
+		opacity: 1;
+		transform: translateY(0) scale(1);
+	}
+}
+
+@keyframes drawer-in {
+	from {
+		transform: translateX(16px);
+		opacity: 0;
+	}
+	to {
+		transform: translateX(0);
+		opacity: 1;
+	}
+}
+
+@keyframes row-in {
+	from {
+		opacity: 0;
+		transform: translateY(6px);
 	}
 	to {
 		opacity: 1;
@@ -121,9 +147,17 @@
 	}
 }
 
-@keyframes spin-slow {
-	to {
-		transform: rotate(360deg);
+/* The signature motion: an online machine's status dot "breathes" — the heartbeat
+   of a held connection. The single expressive animation in the app. */
+@keyframes signal-pulse {
+	0% {
+		box-shadow: 0 0 0 0 color-mix(in srgb, var(--success) 55%, transparent);
+	}
+	70% {
+		box-shadow: 0 0 0 6px color-mix(in srgb, var(--success) 0%, transparent);
+	}
+	100% {
+		box-shadow: 0 0 0 0 color-mix(in srgb, var(--success) 0%, transparent);
 	}
 }
 
@@ -145,29 +179,48 @@
 		margin: 0;
 		overflow: hidden;
 		font-family: var(--font-sans);
+		font-feature-settings: "cv01", "ss01";
 		-webkit-font-smoothing: antialiased;
 		-moz-osx-font-smoothing: grayscale;
 		font-synthesis-weight: none;
 		color: var(--color-text);
 		user-select: none;
 		background: var(--bg);
+		/* A quiet amber wash at the top edge + a faint depth vignette — the panel
+		   reads as "powered", without the marketing-gradient blobs. */
 		background-image:
 			radial-gradient(
-				1200px 600px at 100% -10%,
-				color-mix(in srgb, var(--primary) 14%, transparent),
-				transparent 60%
+				900px 360px at 70% -8%,
+				color-mix(in srgb, var(--primary) 9%, transparent),
+				transparent 70%
 			),
 			radial-gradient(
-				900px 500px at -10% 110%,
-				color-mix(in srgb, var(--accent) 12%, transparent),
-				transparent 55%
+				1100px 700px at 50% 120%,
+				color-mix(in srgb, #000 16%, transparent),
+				transparent 60%
 			);
 		background-attachment: fixed;
 		text-rendering: optimizeLegibility;
 	}
 
+	:root:not(.dark) body {
+		background-image: radial-gradient(
+			900px 360px at 70% -8%,
+			color-mix(in srgb, var(--primary) 7%, transparent),
+			transparent 70%
+		);
+	}
+
 	::selection {
-		background: color-mix(in srgb, var(--primary) 35%, transparent);
+		color: var(--text);
+		background: color-mix(in srgb, var(--primary) 32%, transparent);
+	}
+
+	code,
+	kbd,
+	samp,
+	pre {
+		font-family: var(--font-mono);
 	}
 
 	/* Scrollbars */
@@ -179,19 +232,38 @@
 		background: transparent;
 	}
 	::-webkit-scrollbar-thumb {
-		background: color-mix(in srgb, var(--text-subtle) 35%, transparent);
+		background: color-mix(in srgb, var(--text-subtle) 32%, transparent);
 		background-clip: content-box;
 		border: 2px solid transparent;
 		border-radius: 999px;
 	}
 	::-webkit-scrollbar-thumb:hover {
-		background: color-mix(in srgb, var(--text-subtle) 55%, transparent);
+		background: color-mix(in srgb, var(--text-subtle) 52%, transparent);
 		background-clip: content-box;
 	}
 
 	input,
 	textarea {
 		user-select: text;
+	}
+
+	/* Quality floor: a clear, on-brand focus ring for keyboard users everywhere. */
+	:focus-visible {
+		outline: 2px solid var(--ring);
+		outline-offset: 2px;
+	}
+
+	@media (prefers-reduced-motion: reduce) {
+		*,
+		*::before,
+		*::after {
+			/* biome-ignore lint/complexity/noImportantStyles: must override inline animation styles for reduced-motion users */
+			transition-duration: 0.001ms !important;
+			/* biome-ignore lint/complexity/noImportantStyles: must override inline animation styles for reduced-motion users */
+			animation-duration: 0.001ms !important;
+			/* biome-ignore lint/complexity/noImportantStyles: must override inline animation styles for reduced-motion users */
+			animation-iteration-count: 1 !important;
+		}
 	}
 }
 
@@ -206,9 +278,9 @@
 	}
 
 	.glass {
-		background: color-mix(in srgb, var(--surface) 78%, transparent);
-		-webkit-backdrop-filter: blur(16px) saturate(140%);
-		backdrop-filter: blur(16px) saturate(140%);
+		background: color-mix(in srgb, var(--surface) 82%, transparent);
+		-webkit-backdrop-filter: blur(18px) saturate(140%);
+		backdrop-filter: blur(18px) saturate(140%);
 	}
 
 	.btn {
@@ -216,33 +288,55 @@
 		gap: 0.5rem;
 		align-items: center;
 		justify-content: center;
-		padding: 0.6rem 0.95rem;
+		padding: 0.6rem 0.9rem;
 		font-size: 0.875rem;
 		font-weight: 600;
 		line-height: 1;
 		white-space: nowrap;
 		user-select: none;
-		border-radius: 0.75rem;
-		transition: all 0.16s ease;
+		border-radius: var(--radius-lg);
+		transition:
+			background-color 0.15s ease,
+			color 0.15s ease,
+			border-color 0.15s ease,
+			transform 0.08s ease,
+			box-shadow 0.15s ease;
+	}
+	.btn:active:not(:disabled) {
+		transform: translateY(0.5px) scale(0.985);
 	}
 	.btn:disabled {
 		cursor: not-allowed;
-		opacity: 0.5;
+		opacity: 0.45;
 	}
 
-	.gradient-text {
-		color: transparent;
-		background: linear-gradient(95deg, var(--primary), var(--accent));
-		-webkit-background-clip: text;
-		background-clip: text;
+	/* A keycap, for shortcut hints. Set in mono — the app's data voice. */
+	.kbd {
+		display: inline-flex;
+		align-items: center;
+		justify-content: center;
+		min-width: 1.4rem;
+		height: 1.4rem;
+		padding: 0 0.4rem;
+		font-family: var(--font-mono);
+		font-size: 0.72rem;
+		font-weight: 500;
+		line-height: 1;
+		color: var(--text-muted);
+		background: var(--surface-2);
+		border: 1px solid var(--border-strong);
+		border-bottom-width: 2px;
+		border-radius: 0.4rem;
 	}
 
-	.gradient-brand {
-		background-image: linear-gradient(
-			135deg,
-			var(--primary) 0%,
-			var(--accent) 100%
-		);
+	/* Section eyebrow — a small, tracked, mono label that names a region. */
+	.eyebrow {
+		font-family: var(--font-mono);
+		font-size: 0.66rem;
+		font-weight: 500;
+		color: var(--text-subtle);
+		text-transform: uppercase;
+		letter-spacing: 0.16em;
 	}
 }
 
@@ -251,4 +345,9 @@
 }
 @utility drag {
 	-webkit-app-region: drag;
+}
+
+/* The breathing online indicator. */
+@utility signal-live {
+	animation: signal-pulse 2.4s cubic-bezier(0.4, 0, 0.6, 1) infinite;
 }

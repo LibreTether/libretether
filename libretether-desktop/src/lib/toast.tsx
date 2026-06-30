@@ -31,7 +31,7 @@ const ICONS = {
 
 const ACCENT = {
 	error: "text-danger",
-	info: "text-primary",
+	info: "text-accent",
 	success: "text-success",
 	warning: "text-warning"
 } as const

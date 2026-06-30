@@ -1,386 +1,464 @@
 import {
+	Camera,
+	Info,
 	MonitorSmartphone,
 	MonitorUp,
+	Play,
 	Plus,
 	Rocket,
 	ScreenShare,
-	SlidersHorizontal,
+	Search,
+	SquareChevronRight,
 	Terminal,
-	Trash2
+	Trash2,
+	X
 } from "lucide-react"
-import { useEffect, useState } from "react"
-import { ClientDetailModal } from "../components/ClientDetailModal"
-import { Combobox } from "../components/Combobox"
-import { useConfirm } from "../components/confirm"
-import { DeployModal } from "../components/DeployModal"
+import { useEffect, useMemo, useRef, useState } from "react"
+import { Menu } from "../components/Menu"
 import { OsIcon, osLabel } from "../components/OsIcon"
-import { PageHeader } from "../components/PageHeader"
-import { Badge, Button, EmptyState, Field, Input, Modal } from "../components/ui"
+import { Button, EmptyState, Input, Spinner, StatusDot } from "../components/ui"
 import * as api from "../lib/api"
-import { relativeTime } from "../lib/format"
-import { OS_META } from "../lib/meta"
-import { useToast } from "../lib/toast"
-import type { ClientDto, ClientOs } from "../lib/types"
+import { cn } from "../lib/cn"
+import { formatUptime, relativeTime, tokenizeCommand } from "../lib/format"
+import { useHotkeys } from "../lib/hotkeys"
+import type { ClientDto, ExecResult } from "../lib/types"
 import { useAsyncAction } from "../lib/useAsyncAction"
+import type { useMachineActions } from "../lib/useMachineActions"
 
-const OS_OPTIONS = (Object.keys(OS_META) as ClientOs[]).map((os) => ({
-	icon: <OsIcon className="h-4 w-4" os={os} />,
-	label: OS_META[os].label,
-	value: os
-}))
+type Actions = ReturnType<typeof useMachineActions>
 
-interface DeployState {
-	name: string
-	os: ClientOs
-	script: string
+function dotState(c: ClientDto): "online" | "offline" | "pending" {
+	if (c.online) return "online"
+	if (!c.enrolled) return "pending"
+	return "offline"
 }
 
 export function MachinesPage({
 	clients,
 	loading,
 	onControl,
-	onReload
+	onDetail,
+	onAdd,
+	actions,
+	hotkeysEnabled
 }: {
 	clients: ClientDto[]
 	loading: boolean
 	onControl: (c: ClientDto) => void
-	onReload: () => void
+	onDetail: (c: ClientDto) => void
+	onAdd: () => void
+	actions: Actions
+	hotkeysEnabled: boolean
 }) {
-	const toast = useToast()
-	const confirm = useConfirm()
-	const action = useAsyncAction()
-	const [createOpen, setCreateOpen] = useState(false)
-	const [deploy, setDeploy] = useState<DeployState | null>(null)
-	const [detail, setDetail] = useState<ClientDto | null>(null)
+	const [query, setQuery] = useState("")
+	const [selectedId, setSelectedId] = useState<string | null>(null)
+	const searchRef = useRef<HTMLInputElement>(null)
+	const listRef = useRef<HTMLDivElement>(null)
+
 	// Re-render every 30s so relative "last seen" labels don't go stale between
-	// `clients:changed` events (e.g. for a machine that just went offline).
-	const [, tickTimes] = useState(0)
+	// `clients:changed` events.
+	const [, tick] = useState(0)
 	useEffect(() => {
-		const t = window.setInterval(() => tickTimes((n) => n + 1), 30_000)
+		const t = window.setInterval(() => tick((n) => n + 1), 30_000)
 		return () => window.clearInterval(t)
 	}, [])
 
-	// Per-card, per-action in-flight guard. A single shared `useAsyncAction` would
-	// disable every card at once and give no double-submit protection (the buttons
-	// don't read its `busy`); keying on `${op}:${id}` lets each button on each card
-	// disable independently while its own call is pending. RDP/SSH in particular do
-	// a multi-second reachability probe, so without this a user can fire several.
-	const [pending, setPending] = useState<Record<string, boolean>>({})
-	const runExclusive = async (key: string, fn: () => Promise<unknown>) => {
-		if (pending[key]) return
-		setPending((p) => ({ ...p, [key]: true }))
-		try {
-			await fn()
-		} finally {
-			setPending((p) => ({ ...p, [key]: false }))
-		}
+	const filtered = useMemo(() => {
+		const q = query.trim().toLowerCase()
+		if (!q) return clients
+		return clients.filter(
+			(c) =>
+				c.name.toLowerCase().includes(q) ||
+				osLabel(c.os).toLowerCase().includes(q) ||
+				(c.status?.host.hostname.toLowerCase().includes(q) ?? false)
+		)
+	}, [clients, query])
+
+	const online = clients.filter((c) => c.online).length
+	const awaiting = clients.filter((c) => !c.enrolled).length
+
+	const selected = filtered.find((c) => c.id === selectedId) ?? null
+
+	const move = (delta: number) => {
+		if (filtered.length === 0) return
+		const i = filtered.findIndex((c) => c.id === selectedId)
+		const next =
+			i === -1 ? (delta > 0 ? 0 : filtered.length - 1) : Math.min(filtered.length - 1, Math.max(0, i + delta))
+		setSelectedId(filtered[next].id)
 	}
 
-	const openDeploy = (client: ClientDto) =>
-		runExclusive(`deploy:${client.id}`, async () => {
-			// Decide from the client's own state — not by catching a failure — so an
-			// unrelated error (offline, backend hiccup) can't masquerade as "enrolled"
-			// and drop the user into the destructive reset dialog.
-			if (!client.enrolled) {
-				await action.run("Couldn't get the deploy script", async () => {
-					const script = await api.getDeployScript(client.id, client.os)
-					setDeploy({ name: client.name, os: client.os, script })
-				})
-				return
-			}
-			// Already enrolled — resetting issues a new one-time token and revokes the
-			// old agent key, so confirm first.
-			const ok = await confirm({
-				confirmLabel: "Reset & re-deploy",
-				message: `${client.name} is already enrolled. Resetting issues a new one-time token and revokes the old agent key. Continue?`,
-				title: "Re-deploy machine",
-				tone: "danger"
-			})
-			if (!ok) return
-			await action.run("Couldn't reset token", async () => {
-				const res = await api.resetToken(client.id)
-				setDeploy({ name: res.client.name, os: res.client.os, script: res.deploy_script })
-				onReload()
-			})
-		})
+	// Keep the highlighted row in view.
+	useEffect(() => {
+		if (selectedId)
+			listRef.current
+				?.querySelector<HTMLElement>(`[data-id="${selectedId}"]`)
+				?.scrollIntoView({ block: "nearest" })
+	}, [selectedId])
 
-	const remove = (client: ClientDto) =>
-		runExclusive(`remove:${client.id}`, async () => {
-			const ok = await confirm({
-				confirmLabel: "Remove",
-				message: `Remove ${client.name}? The agent on that machine will no longer be able to connect.`,
-				title: "Remove machine",
-				tone: "danger"
-			})
-			if (!ok) return
-			await action.run("Couldn't remove machine", async () => {
-				await api.removeClient(client.id)
-				onReload()
-			})
-		})
-
-	const rdp = (client: ClientDto) =>
-		runExclusive(`rdp:${client.id}`, () =>
-			action.run("RDP failed", async () => {
-				await api.connectRdp(client.id)
-				toast.info("Launching RDP", `Opening an RDP session to ${client.name}…`)
-			})
-		)
-
-	const ssh = (client: ClientDto) =>
-		runExclusive(`ssh:${client.id}`, () =>
-			action.run("SSH failed", async () => {
-				await api.connectSsh(client.id)
-				toast.info("Opening SSH", `Launching a terminal to ${client.name}…`)
-			})
-		)
+	useHotkeys(
+		[
+			{ combo: "/", handler: () => searchRef.current?.focus() },
+			{ combo: "arrowdown", handler: () => move(1) },
+			{ combo: "j", handler: () => move(1) },
+			{ combo: "arrowup", handler: () => move(-1) },
+			{ combo: "k", handler: () => move(-1) },
+			{ combo: "enter", handler: () => selected?.online && onControl(selected) },
+			{ combo: "s", handler: () => selected?.online && actions.ssh(selected) },
+			{ combo: "r", handler: () => selected?.online && actions.rdp(selected) },
+			{ combo: "d", handler: () => selected?.online && onDetail(selected) }
+		],
+		hotkeysEnabled
+	)
 
 	return (
 		<>
-			<PageHeader
-				actions={
-					<Button icon={<Plus className="h-4 w-4" />} onClick={() => setCreateOpen(true)} variant="primary">
+			<header className="drag flex flex-wrap items-center justify-between gap-x-4 gap-y-3 border-b border-border bg-surface/30 px-7 py-4">
+				<div className="min-w-0">
+					<div className="eyebrow mb-1">Fleet</div>
+					<h1 className="font-display text-xl font-bold tracking-tight text-text">Machines</h1>
+				</div>
+				<div className="no-drag flex items-center gap-2">
+					<div className="relative">
+						<Search className="-translate-y-1/2 pointer-events-none absolute top-1/2 left-3 h-4 w-4 text-subtle" />
+						<Input
+							className="w-56 pr-8 pl-9"
+							onChange={(e) => setQuery(e.target.value)}
+							onKeyDown={(e) => {
+								if (e.key === "Escape") {
+									setQuery("")
+									e.currentTarget.blur()
+								}
+							}}
+							placeholder="Search machines…"
+							ref={searchRef}
+							value={query}
+						/>
+						{!query && (
+							<kbd className="kbd -translate-y-1/2 absolute top-1/2 right-2 h-5 min-w-5 px-1 text-[0.65rem]">
+								/
+							</kbd>
+						)}
+					</div>
+					<Button icon={<Plus className="h-4 w-4" />} onClick={onAdd} variant="primary">
 						Add machine
 					</Button>
-				}
-				subtitle="Enrol, monitor and take control of your remote machines."
-				title="Machines"
-			/>
+				</div>
+			</header>
 
-			<div className="min-h-0 flex-1 overflow-y-auto px-7 py-6">
+			{/* Status strip: the fleet's reachability at a glance. */}
+			<div className="flex items-center gap-4 border-b border-border bg-surface/10 px-7 py-2.5 text-xs text-muted">
+				<span className="flex items-center gap-1.5">
+					<StatusDot state={online > 0 ? "online" : "offline"} />
+					<span className="font-mono font-semibold text-text">{online}</span>
+					<span className="text-subtle">/ {clients.length} online</span>
+				</span>
+				{awaiting > 0 && (
+					<span className="flex items-center gap-1.5">
+						<StatusDot state="pending" />
+						<span className="text-primary dark:text-primary-strong">{awaiting} awaiting enrollment</span>
+					</span>
+				)}
+			</div>
+
+			<div className="min-h-0 flex-1 overflow-y-auto px-4 py-4" ref={listRef}>
 				{loading ? (
-					<p className="text-sm text-subtle">Loading…</p>
+					<p className="px-3 text-sm text-subtle">Loading…</p>
 				) : clients.length === 0 ? (
 					<EmptyState
 						action={
-							<Button
-								icon={<Plus className="h-4 w-4" />}
-								onClick={() => setCreateOpen(true)}
-								variant="primary"
-							>
+							<Button icon={<Plus className="h-4 w-4" />} onClick={onAdd} variant="primary">
 								Add your first machine
 							</Button>
 						}
-						description="Create a machine to generate a one-click deployment script. Run it on the target computer to make it remotely controllable."
+						description="Create a machine to get a one-line deploy command. Run it on the target computer to make it remotely controllable."
 						icon={<MonitorSmartphone className="h-7 w-7" />}
 						title="No machines yet"
 					/>
+				) : filtered.length === 0 ? (
+					<EmptyState
+						description="No machine matches your search."
+						icon={<Search className="h-6 w-6" />}
+						title="Nothing matches"
+					/>
 				) : (
-					<div className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-3">
-						{clients.map((c) => (
-							<ClientCard
+					<div className="flex flex-col gap-1.5">
+						{filtered.map((c, i) => (
+							<MachineRow
+								actions={actions}
 								client={c}
-								deployBusy={!!pending[`deploy:${c.id}`]}
+								index={i}
 								key={c.id}
 								onControl={() => onControl(c)}
-								onDeploy={() => openDeploy(c)}
-								onDetail={() => setDetail(c)}
-								onRdp={() => rdp(c)}
-								onRemove={() => remove(c)}
-								onSsh={() => ssh(c)}
-								rdpBusy={!!pending[`rdp:${c.id}`]}
-								removeBusy={!!pending[`remove:${c.id}`]}
-								sshBusy={!!pending[`ssh:${c.id}`]}
+								onDetail={() => onDetail(c)}
+								onSelect={() => setSelectedId(c.id)}
+								selected={c.id === selectedId}
 							/>
 						))}
 					</div>
 				)}
 			</div>
-
-			<CreateModal
-				onClose={() => setCreateOpen(false)}
-				onCreated={(d) => {
-					setCreateOpen(false)
-					setDeploy(d)
-					onReload()
-				}}
-				open={createOpen}
-			/>
-			{deploy && (
-				<DeployModal
-					name={deploy.name}
-					onClose={() => setDeploy(null)}
-					open
-					os={deploy.os}
-					script={deploy.script}
-				/>
-			)}
-			{detail && <ClientDetailModal client={detail} key={detail.id} onClose={() => setDetail(null)} open />}
 		</>
 	)
 }
 
-function ClientCard({
+function MachineRow({
 	client,
+	selected,
+	index,
+	onSelect,
 	onControl,
 	onDetail,
-	onDeploy,
-	onRdp,
-	onRemove,
-	onSsh,
-	rdpBusy,
-	sshBusy,
-	removeBusy,
-	deployBusy
+	actions
 }: {
 	client: ClientDto
+	selected: boolean
+	index: number
+	onSelect: () => void
 	onControl: () => void
 	onDetail: () => void
-	onDeploy: () => void
-	onRdp: () => void
-	onRemove: () => void
-	onSsh: () => void
-	rdpBusy: boolean
-	sshBusy: boolean
-	removeBusy: boolean
-	deployBusy: boolean
+	actions: Actions
 }) {
 	const { status } = client
+	const meta =
+		client.online && status
+			? `${status.host.hostname} · up ${formatUptime(status.uptime_secs)} · ${status.displays} ${status.displays === 1 ? "display" : "displays"}`
+			: !client.enrolled
+				? "awaiting enrollment — run the deploy command"
+				: `last seen ${relativeTime(client.last_seen)}`
+
+	// Run-command and screenshot act on the machine right here, inline under the row
+	// (toggled open), so they don't need the details drawer.
+	const [panel, setPanel] = useState<null | "exec" | "shot">(null)
+	const [cmd, setCmd] = useState("")
+	const [exec, setExec] = useState<ExecResult | null>(null)
+	const [shot, setShot] = useState<string | null>(null)
+	const execAction = useAsyncAction()
+	const shotAction = useAsyncAction()
+
+	const run = () => {
+		const parts = tokenizeCommand(cmd)
+		if (parts.length === 0) return
+		setExec(null)
+		execAction.run("Command failed", async () => setExec(await api.clientExec(client.id, parts[0], parts.slice(1))))
+	}
+
+	const capture = () =>
+		shotAction.run("Screenshot failed", async () => {
+			const s = await api.clientScreenshot(client.id)
+			setShot(`data:image/png;base64,${s.png_base64}`)
+		})
+
+	const toggleExec = () => setPanel((p) => (p === "exec" ? null : "exec"))
+	const toggleShot = () => {
+		if (panel === "shot") {
+			setPanel(null)
+			return
+		}
+		setPanel("shot")
+		if (!shot) capture()
+	}
+
+	const busy = actions.pending
+	const offline = !client.online
+
 	return (
-		<div className="card flex flex-col gap-3 p-4">
-			<div className="flex items-start gap-3">
-				<div className="grid h-11 w-11 shrink-0 place-items-center rounded-xl bg-surface-2 text-primary dark:text-primary-strong">
+		<div
+			className={cn(
+				"group flex flex-col rounded-xl border transition",
+				selected
+					? "border-primary/45 bg-surface-2 ring-1 ring-primary/25"
+					: "border-transparent hover:border-border hover:bg-surface-2/60"
+			)}
+			data-id={client.id}
+			style={{ animation: `var(--animate-row-in)`, animationDelay: `${Math.min(index, 12) * 22}ms` }}
+		>
+			<div
+				className="flex items-center gap-3.5 px-3.5 py-3"
+				onClick={onSelect}
+				onDoubleClick={() => client.online && onControl()}
+			>
+				<StatusDot className="shrink-0" state={dotState(client)} />
+
+				<div className="grid h-10 w-10 shrink-0 place-items-center rounded-xl bg-surface-3 text-muted">
 					<OsIcon className="h-5 w-5" os={client.os} />
 				</div>
+
 				<div className="min-w-0 flex-1">
 					<div className="truncate font-semibold text-text" title={client.name}>
 						{client.name}
 					</div>
-					<div className="text-xs text-subtle">{osLabel(client.os)}</div>
+					<div
+						className={cn(
+							"truncate font-mono text-[0.76rem]",
+							!client.enrolled ? "text-primary dark:text-primary-strong" : "text-subtle"
+						)}
+					>
+						{meta}
+					</div>
 				</div>
-				{client.online ? <Badge tone="success">online</Badge> : <Badge>offline</Badge>}
-			</div>
 
-			<div className="min-h-[1.25rem] text-xs text-muted">
-				{client.online && status ? (
-					<span>
-						{status.host.hostname} · up {Math.floor(status.uptime_secs / 60)}m · {status.displays}{" "}
-						{status.displays === 1 ? "display" : "displays"}
-					</span>
-				) : !client.enrolled ? (
-					<span className="text-warning">awaiting enrollment — run the deploy script</span>
-				) : (
-					<span>last seen {relativeTime(client.last_seen)}</span>
-				)}
-			</div>
-
-			<div className="flex items-center gap-1.5">
-				<Button
-					className="flex-1"
-					disabled={!client.online}
-					icon={<MonitorUp className="h-4 w-4" />}
-					onClick={onControl}
-					size="sm"
-					variant="primary"
-				>
-					Control
-				</Button>
-				<Button
-					disabled={!client.online || rdpBusy}
-					icon={<ScreenShare className="h-4 w-4" />}
-					loading={rdpBusy}
-					onClick={onRdp}
-					size="icon-sm"
-					title="Connect via RDP"
-					variant="outline"
-				/>
-				<Button
-					disabled={!client.online || sshBusy}
-					icon={<Terminal className="h-4 w-4" />}
-					loading={sshBusy}
-					onClick={onSsh}
-					size="icon-sm"
-					title="Connect via SSH"
-					variant="outline"
-				/>
-				<Button
-					disabled={!client.online}
-					icon={<SlidersHorizontal className="h-4 w-4" />}
-					onClick={onDetail}
-					size="icon-sm"
-					title="Details"
-					variant="outline"
-				/>
-				<Button
-					icon={<Rocket className="h-4 w-4" />}
-					loading={deployBusy}
-					onClick={onDeploy}
-					size="icon-sm"
-					title="Deploy script"
-					variant="ghost"
-				/>
-				<Button
-					icon={<Trash2 className="h-4 w-4" />}
-					loading={removeBusy}
-					onClick={onRemove}
-					size="icon-sm"
-					title="Remove"
-					variant="ghost"
-				/>
-			</div>
-		</div>
-	)
-}
-
-function CreateModal({
-	open,
-	onClose,
-	onCreated
-}: {
-	open: boolean
-	onClose: () => void
-	onCreated: (d: DeployState) => void
-}) {
-	const createAction = useAsyncAction()
-	const [name, setName] = useState("")
-	const [os, setOs] = useState<ClientOs>("linux")
-
-	const submit = async () => {
-		if (!name.trim()) return
-		await createAction.run("Couldn't create machine", async () => {
-			const res = await api.createClient(name.trim(), os)
-			onCreated({ name: res.client.name, os: res.client.os, script: res.deploy_script })
-			setName("")
-			setOs("linux")
-		})
-	}
-
-	return (
-		<Modal
-			footer={
-				<>
-					<Button onClick={onClose} variant="ghost">
-						Cancel
-					</Button>
+				<div className="flex shrink-0 items-center gap-1.5">
 					<Button
-						icon={<Rocket className="h-4 w-4" />}
-						loading={createAction.busy}
-						onClick={submit}
+						disabled={offline}
+						icon={<MonitorUp className="h-4 w-4" />}
+						onClick={onControl}
+						size="sm"
 						variant="primary"
 					>
-						Create & get script
+						Control
 					</Button>
-				</>
-			}
-			onClose={onClose}
-			open={open}
-			size="sm"
-			title="Add a machine"
-		>
-			<div className="flex flex-col gap-4">
-				<Field hint="A friendly name to recognise this machine." label="Name">
-					<Input
-						autoFocus
-						onChange={(e) => setName(e.target.value)}
-						onKeyDown={(e) => e.key === "Enter" && submit()}
-						placeholder="e.g. Office iMac"
-						value={name}
-					/>
-				</Field>
-				<Field hint="Picks the right deploy script for the target." label="Operating system">
-					<Combobox<ClientOs> onChange={setOs} options={OS_OPTIONS} value={os} />
-				</Field>
+					<Button
+						disabled={offline || busy[`ssh:${client.id}`]}
+						icon={<Terminal className="h-4 w-4" />}
+						loading={busy[`ssh:${client.id}`]}
+						onClick={() => actions.ssh(client)}
+						size="sm"
+						title="Connect via SSH (s)"
+						variant="outline"
+					>
+						SSH
+					</Button>
+					<Button
+						disabled={offline || busy[`rdp:${client.id}`]}
+						icon={<ScreenShare className="h-4 w-4" />}
+						loading={busy[`rdp:${client.id}`]}
+						onClick={() => actions.rdp(client)}
+						size="sm"
+						title="Connect via RDP (r)"
+						variant="outline"
+					>
+						RDP
+					</Button>
+					<div
+						className={cn(
+							"ml-0.5 flex items-center gap-1 transition",
+							selected ? "opacity-100" : "opacity-60 group-hover:opacity-100"
+						)}
+					>
+						<Button
+							className={cn(panel === "exec" && "bg-surface-3 text-text")}
+							disabled={offline}
+							icon={<SquareChevronRight className="h-4 w-4" />}
+							onClick={toggleExec}
+							size="icon-sm"
+							title="Run a command"
+							variant="ghost"
+						/>
+						<Button
+							className={cn(panel === "shot" && "bg-surface-3 text-text")}
+							disabled={offline}
+							icon={<Camera className="h-4 w-4" />}
+							onClick={toggleShot}
+							size="icon-sm"
+							title="Screenshot"
+							variant="ghost"
+						/>
+						<Menu
+							items={[
+								{
+									disabled: offline,
+									icon: <Info className="h-4 w-4" />,
+									key: "info",
+									label: "Info",
+									onSelect: onDetail
+								},
+								{
+									icon: <Rocket className="h-4 w-4" />,
+									key: "deploy",
+									label: client.enrolled ? "Re-deploy…" : "Get deploy command",
+									onSelect: () => actions.deploy(client)
+								},
+								{
+									danger: true,
+									icon: <Trash2 className="h-4 w-4" />,
+									key: "remove",
+									label: "Delete",
+									onSelect: () => actions.remove(client)
+								}
+							]}
+						/>
+					</div>
+				</div>
 			</div>
-		</Modal>
+
+			{panel === "exec" && (
+				<div className="border-border border-t px-3.5 pt-3 pb-3.5">
+					<div className="flex gap-2">
+						<Input
+							autoFocus
+							className="flex-1 font-mono"
+							onChange={(e) => setCmd(e.target.value)}
+							onKeyDown={(e) => {
+								if (e.key === "Enter") run()
+								if (e.key === "Escape") setPanel(null)
+							}}
+							placeholder="e.g. uname -a"
+							value={cmd}
+						/>
+						<Button
+							icon={<Play className="h-4 w-4" />}
+							loading={execAction.busy}
+							onClick={run}
+							size="md"
+							variant="primary"
+						>
+							Run
+						</Button>
+					</div>
+					{exec && (
+						<div className="mt-2 rounded-xl border border-border bg-surface-2 p-3 text-xs">
+							<div className="mb-1.5 font-mono text-subtle">
+								exit {exec.code ?? "—"} · {exec.duration_ms}ms
+							</div>
+							{exec.stdout && (
+								<pre className="select-text overflow-auto whitespace-pre-wrap font-mono text-text">
+									{exec.stdout}
+								</pre>
+							)}
+							{exec.stderr && (
+								<pre className="select-text overflow-auto whitespace-pre-wrap font-mono text-danger">
+									{exec.stderr}
+								</pre>
+							)}
+						</div>
+					)}
+				</div>
+			)}
+
+			{panel === "shot" && (
+				<div className="border-border border-t px-3.5 pt-3 pb-3.5">
+					<div className="mb-2 flex items-center justify-between">
+						<div className="eyebrow">Screenshot</div>
+						<div className="flex items-center gap-1.5">
+							<Button
+								icon={<Camera className="h-3.5 w-3.5" />}
+								loading={shotAction.busy}
+								onClick={capture}
+								size="sm"
+								variant="ghost"
+							>
+								Recapture
+							</Button>
+							<Button
+								icon={<X className="h-3.5 w-3.5" />}
+								onClick={() => setPanel(null)}
+								size="icon-sm"
+								title="Close"
+								variant="ghost"
+							/>
+						</div>
+					</div>
+					{shotAction.busy && !shot ? (
+						<div className="grid h-40 place-items-center rounded-xl border border-border bg-surface-2">
+							<Spinner className="h-5 w-5" />
+						</div>
+					) : shot ? (
+						<img alt="remote screen" className="w-full rounded-xl border border-border" src={shot} />
+					) : (
+						<p className="text-xs text-subtle">No capture yet.</p>
+					)}
+				</div>
+			)}
+		</div>
 	)
 }

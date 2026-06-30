@@ -23,14 +23,43 @@ $ErrorActionPreference = "Stop"
 # The release workflow rewrites this to the exact repo + tag it publishes from.
 $ReleaseBase = "https://github.com/LibreTether/libretether/releases/latest/download"
 
-# Verify a downloaded file against its published <url>.sha256 sidecar. A custom
-# -AgentUrl may have no sidecar; in that case we warn and continue.
+# GET a URL with a few retries on transient failures (5xx, timeout, connection),
+# but NOT on a genuine 404 — that rethrows immediately so the caller can tell "the
+# server hiccuped" from "this asset doesn't exist". Windows PowerShell 5.1 has no
+# -MaximumRetryCount, hence the manual loop.
+function Invoke-WebWithRetry {
+	param([string]$Uri, [string]$OutFile)
+	for ($attempt = 1; $attempt -le 3; $attempt++) {
+		try {
+			if ($OutFile) { return Invoke-WebRequest -Uri $Uri -OutFile $OutFile -UseBasicParsing }
+			return Invoke-WebRequest -Uri $Uri -UseBasicParsing
+		} catch {
+			$status = if ($_.Exception.Response) { [int]$_.Exception.Response.StatusCode } else { 0 }
+			if ($status -eq 404 -or $attempt -ge 3) { throw }
+			Start-Sleep -Seconds 2
+		}
+	}
+}
+
+# Verify a downloaded file against its published <url>.sha256 sidecar. A transient
+# fetch failure is retried (above) so a network blip isn't mistaken for an absent
+# checksum. The official release always ships a sidecar, so a 404 (or a persistent
+# failure) there is a hard failure (-Required — fail closed rather than install an
+# unverified agent). A custom -AgentUrl may legitimately have none; for that
+# (-Required:$false) we warn and continue.
 function Test-Checksum {
-	param([string]$Url, [string]$File)
+	param([string]$Url, [string]$File, [bool]$Required)
 	try {
-		$expected = ((Invoke-WebRequest -Uri "$Url.sha256" -UseBasicParsing).Content).Trim()
+		$expected = (Invoke-WebWithRetry -Uri "$Url.sha256").Content.Trim()
 	} catch {
-		Write-Host "==> No published checksum for $Url — skipping integrity check."
+		$expected = $null
+	}
+	if ([string]::IsNullOrWhiteSpace($expected)) {
+		if ($Required) {
+			Remove-Item $File -ErrorAction SilentlyContinue
+			throw "Couldn't fetch a checksum for $Url — refusing to install an unverified agent."
+		}
+		Write-Host "==> No published checksum for $Url (custom URL) — skipping integrity check."
 		return
 	}
 	$actual = (Get-FileHash -Algorithm SHA256 -Path $File).Hash
@@ -91,10 +120,13 @@ New-Item -ItemType Directory -Force -Path $BinDir | Out-Null
 if ($env:LIBRETETHER_AGENT_BIN) {
 	Copy-Item $env:LIBRETETHER_AGENT_BIN $Bin -Force
 } else {
+	# A custom URL may lack a checksum sidecar; the official release always has one,
+	# so require it there (fail closed) and only warn-and-skip for a custom URL.
+	$custom = [bool]($AgentUrl -or $env:LIBRETETHER_AGENT_URL)
 	$Url = if ($AgentUrl) { $AgentUrl } elseif ($env:LIBRETETHER_AGENT_URL) { $env:LIBRETETHER_AGENT_URL } else { "$ReleaseBase/libretether-agent-windows-x86_64.exe" }
 	Write-Host "==> Downloading agent from $Url"
-	Invoke-WebRequest -Uri $Url -OutFile $Bin
-	Test-Checksum -Url $Url -File $Bin
+	Invoke-WebWithRetry -Uri $Url -OutFile $Bin | Out-Null
+	Test-Checksum -Url $Url -File $Bin -Required (-not $custom)
 }
 
 # Run an agent subcommand and fail loudly. The agent is a GUI-subsystem binary

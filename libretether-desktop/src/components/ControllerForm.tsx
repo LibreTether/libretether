@@ -124,6 +124,7 @@ export function ControllerForm({
 							label="Auth key"
 						>
 							<Input
+								className="font-mono"
 								onChange={(e) => setAuthKey(e.target.value)}
 								placeholder="tskey-auth-…"
 								type="password"
@@ -141,6 +142,7 @@ export function ControllerForm({
 							label="Advertise address"
 						>
 							<Input
+								className="font-mono"
 								onChange={(e) => setAdvertise(e.target.value)}
 								placeholder="e.g. 192.168.1.20:47600 or my-host.example.com:47600"
 								value={advertise}
@@ -154,6 +156,7 @@ export function ControllerForm({
 					<>
 						<Field hint="host:port of your libretether-relay (its public IP/DNS)." label="Relay address">
 							<Input
+								className="font-mono"
 								onChange={(e) => setRelayAddr(e.target.value)}
 								placeholder="e.g. relay.example.com:47600"
 								value={relayAddr}
@@ -163,13 +166,23 @@ export function ControllerForm({
 							hint="From `libretether-relay info` — authenticates this controller as the owner."
 							label="Owner secret"
 						>
-							<Input onChange={(e) => setRelayOwner(e.target.value)} type="password" value={relayOwner} />
+							<Input
+								className="font-mono"
+								onChange={(e) => setRelayOwner(e.target.value)}
+								type="password"
+								value={relayOwner}
+							/>
 						</Field>
 						<Field
 							hint="From `libretether-relay info` — embedded in this controller's deploy scripts."
 							label="Agent secret"
 						>
-							<Input onChange={(e) => setRelayAgent(e.target.value)} type="password" value={relayAgent} />
+							<Input
+								className="font-mono"
+								onChange={(e) => setRelayAgent(e.target.value)}
+								type="password"
+								value={relayAgent}
+							/>
 						</Field>
 					</>
 				)}

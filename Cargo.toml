@@ -8,6 +8,13 @@ members = [
 	"libretether-relay",
 ]
 
+# Single source of truth for every crate's version — each member sets
+# `version.workspace = true`. The `release` task in Runfile.json bumps this in
+# lockstep with the desktop package.json / tauri.conf.json, so the agent (which
+# reports `CARGO_PKG_VERSION`) stops reporting a stale, hand-set 0.1.0.
+[workspace.package]
+version = "0.17.0"
+
 # Applied workspace-wide (the relay/agent binaries and the desktop bundle all
 # ship from `--release`), matching the profile that previously lived on the
 # desktop crate when it was the workspace root.

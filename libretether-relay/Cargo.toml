@@ -1,6 +1,6 @@
 [package]
 name = "libretether-relay"
-version = "0.1.0"
+version.workspace = true
 description = "LibreTether relay — routes between a controller and its agents through a public cloud host"
 edition = "2021"
 license = "AGPL-3.0-only"

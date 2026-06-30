@@ -4,11 +4,13 @@ import { cn } from "../lib/cn"
 export function PageHeader({
 	title,
 	subtitle,
+	eyebrow,
 	actions,
 	className
 }: {
 	title: ReactNode
 	subtitle?: ReactNode
+	eyebrow?: ReactNode
 	actions?: ReactNode
 	className?: string
 }) {
@@ -20,7 +22,8 @@ export function PageHeader({
 			)}
 		>
 			<div className="min-w-0">
-				<h1 className="truncate text-lg font-bold tracking-tight text-text">{title}</h1>
+				{eyebrow && <div className="eyebrow mb-1">{eyebrow}</div>}
+				<h1 className="truncate font-display text-xl font-bold tracking-tight text-text">{title}</h1>
 				{subtitle && <p className="mt-0.5 truncate text-sm text-muted">{subtitle}</p>}
 			</div>
 			{actions && <div className="no-drag flex items-center gap-2">{actions}</div>}

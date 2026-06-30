@@ -210,18 +210,26 @@ export function ControlOverlay({ client, onClose }: { client: ClientDto; onClose
 
 	return (
 		<div className="fixed inset-0 z-[60] flex flex-col bg-black/95" style={{ animation: "var(--animate-fade-in)" }}>
-			<div className="no-drag flex items-center gap-3 border-b border-white/10 px-4 py-2.5 text-white">
+			<div className="no-drag flex items-center gap-3 border-b border-white/10 bg-black px-4 py-2.5 text-white">
+				<span className="signal-live h-2.5 w-2.5 shrink-0 rounded-full bg-success" />
 				<MousePointer2 className="h-4 w-4 text-primary-strong" />
-				<span className="font-semibold">{client.name}</span>
-				<span className="text-xs text-white/50">
+				<span className="font-display font-semibold">{client.name}</span>
+				<span className="font-mono text-xs text-white/45">
 					{meta ? `${meta.width}×${meta.height}` : "connecting…"}
 					{fps > 0 && ` · ${fps} fps`}
 				</span>
-				<span className="ml-auto flex items-center gap-1.5 text-xs text-white/50">
-					<Keyboard className="h-3.5 w-3.5" /> type to control · Esc×2 to exit
+				<span className="ml-auto flex items-center gap-2 text-xs text-white/45">
+					<Keyboard className="h-3.5 w-3.5" />
+					<span>type to control</span>
+					<span className="text-white/25">·</span>
+					<span className="inline-flex items-center gap-1">
+						<kbd className="kbd h-5 min-w-5 border-white/20 bg-white/10 text-white/70">Esc</kbd>
+						<kbd className="kbd h-5 min-w-5 border-white/20 bg-white/10 text-white/70">Esc</kbd>
+						to exit
+					</span>
 				</span>
 				<button
-					className="ml-2 flex items-center gap-1.5 rounded-lg bg-danger/90 px-3 py-1.5 text-xs font-semibold text-white transition hover:bg-danger"
+					className="ml-1 flex items-center gap-1.5 rounded-lg bg-danger/90 px-3 py-1.5 text-xs font-semibold text-white transition hover:bg-danger"
 					onClick={onClose}
 					type="button"
 				>

@@ -16,8 +16,9 @@ interface Match<T extends string> {
 	ranges: Set<number>
 }
 
-/** Fuzzy subsequence match with light scoring; `null` when the query can't match. */
-function fuzzy(query: string, label: string): { score: number; ranges: Set<number> } | null {
+/** Fuzzy subsequence match with light scoring; `null` when the query can't match.
+ *  Exported so the command palette shares the exact same matching behaviour. */
+export function fuzzy(query: string, label: string): { score: number; ranges: Set<number> } | null {
 	const q = query.toLowerCase()
 	const t = label.toLowerCase()
 	if (!q) return { ranges: new Set(), score: 0 }

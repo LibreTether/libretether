@@ -1,6 +1,6 @@
 [package]
 name = "libretether-agent"
-version = "0.1.0"
+version.workspace = true
 description = "LibreTether headless agent — keeps a machine reachable for remote control"
 edition = "2021"
 license = "AGPL-3.0-only"

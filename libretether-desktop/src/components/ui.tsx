@@ -8,16 +8,15 @@ export function Spinner({ className }: { className?: string }) {
 }
 
 // ----------------------------------------------------------------- Button
-type Variant = "primary" | "solid" | "soft" | "ghost" | "danger" | "success" | "outline"
+type Variant = "primary" | "soft" | "ghost" | "danger" | "success" | "outline"
 type Size = "sm" | "md" | "lg" | "icon" | "icon-sm"
 
 const VARIANTS: Record<Variant, string> = {
 	danger: "bg-danger text-white hover:brightness-110",
 	ghost: "text-muted hover:bg-surface-3 hover:text-text",
 	outline: "border border-border-strong bg-surface text-text hover:bg-surface-2",
-	primary: "gradient-brand text-white shadow-lg shadow-primary/25 hover:brightness-110 active:brightness-95",
-	soft: "bg-primary-soft text-primary hover:bg-primary-soft/70 dark:text-primary-strong",
-	solid: "bg-primary text-primary-fg hover:bg-primary-strong",
+	primary: "bg-primary text-primary-fg shadow-sm shadow-black/20 hover:bg-primary-strong",
+	soft: "bg-primary-soft text-primary hover:brightness-105 dark:text-primary-strong",
 	success: "bg-success text-white hover:brightness-110"
 }
 
@@ -56,6 +55,25 @@ export const Button = forwardRef<HTMLButtonElement, ButtonProps>(function Button
 	)
 })
 
+// ----------------------------------------------------------------- Kbd
+/** A keycap for shortcut hints. Children are short labels like "K", "⌘", "Esc". */
+export function Kbd({ children, className }: { children: ReactNode; className?: string }) {
+	return <kbd className={cn("kbd", className)}>{children}</kbd>
+}
+
+// ----------------------------------------------------------------- StatusDot
+/** The fleet's pulse. Online dots breathe — the heartbeat of a held connection;
+ *  pending is the actionable "awaiting enrollment" amber; offline is a quiet ring. */
+export function StatusDot({ state, className }: { state: "online" | "offline" | "pending"; className?: string }) {
+	if (state === "online") {
+		return <span className={cn("signal-live h-2.5 w-2.5 rounded-full bg-success", className)} />
+	}
+	if (state === "pending") {
+		return <span className={cn("h-2.5 w-2.5 rounded-full bg-primary", className)} />
+	}
+	return <span className={cn("h-2.5 w-2.5 rounded-full border-2 border-subtle/60", className)} />
+}
+
 // ----------------------------------------------------------------- Badge
 export function Badge({
 	children,
@@ -64,9 +82,10 @@ export function Badge({
 }: {
 	children: ReactNode
 	className?: string
-	tone?: "neutral" | "success" | "warning" | "danger" | "primary"
+	tone?: "neutral" | "success" | "warning" | "danger" | "primary" | "accent"
 }) {
 	const tones = {
+		accent: "bg-accent/12 text-accent",
 		danger: "bg-danger-soft text-danger",
 		neutral: "bg-surface-3 text-muted",
 		primary: "bg-primary-soft text-primary dark:text-primary-strong",
@@ -102,13 +121,13 @@ export function Field({
 		<label className={cn("flex flex-col gap-1.5", className)}>
 			{label && <span className="text-xs font-semibold text-muted">{label}</span>}
 			{children}
-			{hint && <span className="text-[0.7rem] text-subtle">{hint}</span>}
+			{hint && <span className="text-[0.72rem] leading-relaxed text-subtle">{hint}</span>}
 		</label>
 	)
 }
 
 const inputBase =
-	"no-drag w-full rounded-lg border border-border bg-surface-2 px-3 py-2 text-sm text-text outline-none transition placeholder:text-subtle focus:border-primary focus:ring-2 focus:ring-ring/30 disabled:opacity-50"
+	"no-drag w-full rounded-lg border border-border bg-surface-2 px-3 py-2 text-sm text-text outline-none transition placeholder:text-subtle focus:border-primary focus:ring-2 focus:ring-ring/25 disabled:opacity-50"
 
 export const Input = forwardRef<HTMLInputElement, InputHTMLAttributes<HTMLInputElement>>(function Input(
 	{ className, ...rest },
@@ -156,11 +175,11 @@ export function Modal({
 			className="fixed inset-0 z-50 flex items-center justify-center p-5"
 			style={{ animation: "var(--animate-fade-in)" }}
 		>
-			<div className="absolute inset-0 bg-black/45 backdrop-blur-sm" onClick={onClose} />
+			<div className="absolute inset-0 bg-black/55 backdrop-blur-sm" onClick={onClose} />
 			<div
 				aria-modal="true"
 				className={cn(
-					"card relative z-10 flex max-h-[88vh] w-full flex-col overflow-hidden shadow-2xl shadow-black/30",
+					"card relative z-10 flex max-h-[88vh] w-full flex-col overflow-hidden shadow-2xl shadow-black/40",
 					widths[size],
 					className
 				)}
@@ -169,10 +188,10 @@ export function Modal({
 			>
 				{title && (
 					<div className="flex items-center justify-between border-b border-border px-5 py-3.5">
-						<h2 className="text-base font-semibold text-text">{title}</h2>
+						<h2 className="font-display text-base font-semibold text-text">{title}</h2>
 						<button
 							aria-label="Close"
-							className="rounded-lg p-1.5 text-subtle transition hover:bg-surface-3 hover:text-text"
+							className="no-drag rounded-lg p-1.5 text-subtle transition hover:bg-surface-3 hover:text-text"
 							onClick={onClose}
 							type="button"
 						>
@@ -191,6 +210,83 @@ export function Modal({
 	)
 }
 
+// ----------------------------------------------------------------- Drawer
+/** A right-side slide-over. Lighter than a modal: it doesn't trap the whole
+ *  screen behind a heavy scrim, and Esc / backdrop-click dismiss it. Used for
+ *  machine details and the add-machine flow so the app leans on panels, not
+ *  stacked dialogs. */
+export function Drawer({
+	open,
+	onClose,
+	title,
+	subtitle,
+	children,
+	footer,
+	icon,
+	size = "md"
+}: {
+	open: boolean
+	onClose: () => void
+	title?: ReactNode
+	subtitle?: ReactNode
+	children: ReactNode
+	footer?: ReactNode
+	icon?: ReactNode
+	size?: "md" | "lg"
+}) {
+	useEffect(() => {
+		if (!open) return
+		const onKey = (e: KeyboardEvent) => e.key === "Escape" && onClose()
+		window.addEventListener("keydown", onKey)
+		return () => window.removeEventListener("keydown", onKey)
+	}, [open, onClose])
+
+	if (!open) return null
+
+	const widths = { lg: "max-w-2xl", md: "max-w-md" }
+
+	return (
+		<div className="fixed inset-0 z-50 flex justify-end" style={{ animation: "var(--animate-fade-in)" }}>
+			<div className="absolute inset-0 bg-black/45 backdrop-blur-[2px]" onClick={onClose} />
+			<aside
+				aria-modal="true"
+				className={cn(
+					"relative z-10 flex h-full w-full flex-col border-l border-border bg-surface shadow-2xl shadow-black/40",
+					widths[size]
+				)}
+				role="dialog"
+				style={{ animation: "var(--animate-drawer-in)" }}
+			>
+				<div className="flex items-start gap-3 border-b border-border px-5 py-4">
+					{icon && (
+						<div className="grid h-10 w-10 shrink-0 place-items-center rounded-xl bg-surface-2 text-primary dark:text-primary-strong">
+							{icon}
+						</div>
+					)}
+					<div className="min-w-0 flex-1">
+						<h2 className="truncate font-display text-base font-semibold text-text">{title}</h2>
+						{subtitle && <div className="mt-0.5 truncate text-xs text-muted">{subtitle}</div>}
+					</div>
+					<button
+						aria-label="Close"
+						className="no-drag rounded-lg p-1.5 text-subtle transition hover:bg-surface-3 hover:text-text"
+						onClick={onClose}
+						type="button"
+					>
+						<X className="h-4.5 w-4.5" />
+					</button>
+				</div>
+				<div className="min-h-0 flex-1 overflow-y-auto px-5 py-5">{children}</div>
+				{footer && (
+					<div className="flex items-center justify-end gap-2.5 border-t border-border bg-surface-2/50 px-5 py-3.5">
+						{footer}
+					</div>
+				)}
+			</aside>
+		</div>
+	)
+}
+
 // ----------------------------------------------------------------- EmptyState
 export function EmptyState({
 	icon,
@@ -205,9 +301,11 @@ export function EmptyState({
 }) {
 	return (
 		<div className="flex flex-col items-center justify-center gap-3 px-6 py-16 text-center">
-			<div className="grid h-16 w-16 place-items-center rounded-2xl bg-surface-2 text-subtle">{icon}</div>
+			<div className="grid h-16 w-16 place-items-center rounded-2xl border border-border bg-surface-2 text-subtle">
+				{icon}
+			</div>
 			<div>
-				<h3 className="text-base font-semibold text-text">{title}</h3>
+				<h3 className="font-display text-base font-semibold text-text">{title}</h3>
 				{description && <p className="mx-auto mt-1 max-w-sm text-sm text-muted">{description}</p>}
 			</div>
 			{action}
