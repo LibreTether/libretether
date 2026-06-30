@@ -28,6 +28,8 @@ mod session;
 mod ssh_server;
 #[cfg(target_os = "linux")]
 mod wayland;
+#[cfg(target_os = "windows")]
+mod wincap;
 mod x11env;
 
 use std::path::PathBuf;

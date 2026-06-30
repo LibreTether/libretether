@@ -4,26 +4,27 @@
 //! There are two backends, chosen at runtime: an X11 path (`xcap` + `enigo`) and
 //! a Wayland path that goes through the XDG desktop portals (see [`crate::wayland`]).
 //!
-//! Both backends share the same three-stage pipeline so capture, encode and
+//! All backends share the same three-stage pipeline so capture, encode and
 //! network write overlap instead of running serially:
 //!
 //! ```text
 //! capture thread ──RawFrame──▶ encoder thread ──OutFrame──▶ async writer
-//!   (xcap / pw)   single-slot   (tile delta +    bounded     (QUIC stream)
+//!  (DXGI/xcap/pw) single-slot   (tile delta +    bounded     (QUIC stream)
 //!                 newest-wins    parallel JPEG)
 //! ```
+//!
+//! The capture stage is per-platform: DXGI Desktop Duplication on Windows
+//! ([`crate::wincap`]), a PipeWire portal stream on Wayland ([`crate::pwstream`]),
+//! and an `xcap` poll loop elsewhere (X11/macOS).
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::TrySendError;
 use std::sync::Arc;
-use std::time::Duration;
 
 use libretether_protocol::frame::{read_frame_capped, MAX_CONTROL_FRAME};
 use libretether_protocol::video::{self};
 use libretether_protocol::{SessionClient, SessionConfig, SessionServer};
 use quinn::{RecvStream, SendStream};
 
-use crate::capture;
 use crate::encode::{self, OutFrame, RawFrame, SharedConfig};
 use crate::input::{self, InjectCmd};
 
@@ -145,42 +146,25 @@ async fn x11_session(cfg: SessionConfig, mut send: SendStream, mut recv: RecvStr
 	Ok(())
 }
 
-/// Capture thread: grab a full RGBA frame at the configured rate and hand it to
-/// the encoder, dropping it if the encoder is still busy (stay real-time).
+/// Windows capture: DXGI Desktop Duplication — persistent, GPU-fast, event-driven
+/// (see [`crate::wincap`]).
+#[cfg(target_os = "windows")]
 fn spawn_capture(
 	display: u32,
 	shared: Arc<SharedConfig>,
 	stop: Arc<AtomicBool>,
 	tx: std::sync::mpsc::SyncSender<RawFrame>,
 ) -> std::thread::JoinHandle<()> {
-	std::thread::spawn(move || {
-		while !stop.load(Ordering::Relaxed) {
-			let started = std::time::Instant::now();
-			let interval = Duration::from_millis(1000 / shared.max_fps());
-			match capture::capture(display) {
-				Ok(cap) => {
-					let raw = RawFrame {
-						width: cap.width,
-						height: cap.height,
-						origin_x: cap.origin_x,
-						origin_y: cap.origin_y,
-						rgba: cap.image,
-						capture_us: started.elapsed().as_micros() as u64,
-					};
-					match tx.try_send(raw) {
-						// Encoder busy — drop this frame, the next capture is fresher.
-						Ok(()) | Err(TrySendError::Full(_)) => {}
-						Err(TrySendError::Disconnected(_)) => break,
-					}
-				}
-				Err(e) => {
-					crate::net::log(&format!("capture error: {e}"));
-					std::thread::sleep(Duration::from_millis(500));
-				}
-			}
-			if let Some(rem) = interval.checked_sub(started.elapsed()) {
-				std::thread::sleep(rem);
-			}
-		}
-	})
+	crate::wincap::spawn(display, shared, stop, tx)
+}
+
+/// Capture thread (X11/macOS): the shared `xcap` poll loop.
+#[cfg(not(target_os = "windows"))]
+fn spawn_capture(
+	display: u32,
+	shared: Arc<SharedConfig>,
+	stop: Arc<AtomicBool>,
+	tx: std::sync::mpsc::SyncSender<RawFrame>,
+) -> std::thread::JoinHandle<()> {
+	std::thread::spawn(move || crate::capture::poll_loop(display, shared, stop, tx))
 }

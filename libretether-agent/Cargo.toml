@@ -45,3 +45,18 @@ rand = "0.9"
 ashpd = { version = "0.13", default-features = false, features = ["tokio", "remote_desktop", "screencast", "screenshot"] }
 pipewire = "0.10"
 libspa = "0.10"
+
+# Windows live capture goes through DXGI Desktop Duplication (persistent,
+# GPU-accelerated, only wakes on screen change) instead of xcap's per-frame GDI
+# BitBlt, which was the dominant cost on Windows. Same `windows` version/features
+# xcap pulls, so Cargo unifies on one build.
+[target.'cfg(target_os = "windows")'.dependencies.windows]
+version = "0.59"
+features = [
+	"Win32_Foundation",
+	"Win32_Graphics_Gdi",
+	"Win32_Graphics_Direct3D",
+	"Win32_Graphics_Direct3D11",
+	"Win32_Graphics_Dxgi",
+	"Win32_Graphics_Dxgi_Common",
+]

@@ -2951,6 +2951,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "whoami",
+ "windows 0.59.0",
  "xcap",
 ]
 

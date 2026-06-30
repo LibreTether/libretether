@@ -4,10 +4,16 @@
 //! `.await`.
 
 use std::io::Cursor;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{SyncSender, TrySendError};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Result};
 use image::RgbaImage;
 use xcap::Monitor;
+
+use crate::encode::{RawFrame, SharedConfig};
 
 /// A captured frame plus the geometry it came from.
 pub struct Capture {
@@ -77,6 +83,43 @@ pub fn encode_png(image: &RgbaImage) -> Result<Vec<u8>> {
 	let mut buf = Cursor::new(Vec::new());
 	image.write_to(&mut buf, image::ImageFormat::Png)?;
 	Ok(buf.into_inner())
+}
+
+/// Poll-based capture loop: grab a full RGBA frame via `xcap` at the configured
+/// rate and hand it to the encoder, dropping it when the encoder is still busy
+/// (stay real-time). Blocks until `stop` is set or the encoder hangs up.
+///
+/// This is the primary path on X11/macOS and the GDI fallback on Windows when
+/// DXGI Desktop Duplication isn't available (see [`crate::wincap`]).
+pub fn poll_loop(display: u32, shared: Arc<SharedConfig>, stop: Arc<AtomicBool>, tx: SyncSender<RawFrame>) {
+	while !stop.load(Ordering::Relaxed) {
+		let started = Instant::now();
+		let interval = Duration::from_millis(1000 / shared.max_fps());
+		match capture(display) {
+			Ok(cap) => {
+				let raw = RawFrame {
+					width: cap.width,
+					height: cap.height,
+					origin_x: cap.origin_x,
+					origin_y: cap.origin_y,
+					rgba: cap.image,
+					capture_us: started.elapsed().as_micros() as u64,
+				};
+				match tx.try_send(raw) {
+					// Encoder busy — drop this frame, the next capture is fresher.
+					Ok(()) | Err(TrySendError::Full(_)) => {}
+					Err(TrySendError::Disconnected(_)) => break,
+				}
+			}
+			Err(e) => {
+				crate::net::log(&format!("capture error: {e}"));
+				std::thread::sleep(Duration::from_millis(500));
+			}
+		}
+		if let Some(rem) = interval.checked_sub(started.elapsed()) {
+			std::thread::sleep(rem);
+		}
+	}
 }
 
 #[cfg(test)]
