@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
 use libretether_protocol::{
-	AgentStatus, ControlRequest, ControlResponse, ExecResult, PortProbe, ScreenshotResult, SshInfo,
+	AgentStatus, ControlRequest, ControlResponse, ExecResult, LogLevel, PortProbe, ScreenshotResult, SshInfo,
 	DEFAULT_EXEC_TIMEOUT_SECS, MAX_EXEC_TIMEOUT_SECS,
 };
 use tokio::process::Command;
@@ -27,6 +27,31 @@ pub fn mark_start() {
 const AGENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 pub async fn handle(req: ControlRequest) -> ControlResponse {
+	crate::net::debug(&format!("handling control request: {}", request_label(&req)));
+	let resp = dispatch(req).await;
+	if let ControlResponse::Error { message } = &resp {
+		crate::net::log_at(LogLevel::Warn, &format!("control request failed: {message}"));
+	}
+	resp
+}
+
+/// A short, secret-free label for a control request, for the audit log. `Exec`
+/// names the program and arg count but never the argument values (they can carry
+/// secrets); mirrors the controller-side exec logging.
+fn request_label(req: &ControlRequest) -> String {
+	match req {
+		ControlRequest::Ping => "ping".into(),
+		ControlRequest::Status => "status".into(),
+		ControlRequest::Exec { program, args, .. } => format!("exec {program} ({} args)", args.len()),
+		ControlRequest::Screenshot { display } => format!("screenshot (display {})", display.unwrap_or(0)),
+		ControlRequest::EnableRdp => "enable rdp".into(),
+		ControlRequest::FetchLogs { .. } => "fetch logs".into(),
+		ControlRequest::ProbePort { port } => format!("probe port {port}"),
+		ControlRequest::EnableSsh => "enable ssh".into(),
+	}
+}
+
+async fn dispatch(req: ControlRequest) -> ControlResponse {
 	match req {
 		ControlRequest::Ping => ControlResponse::Pong,
 		ControlRequest::Status => ControlResponse::Status(status()),
@@ -35,15 +60,27 @@ pub async fn handle(req: ControlRequest) -> ControlResponse {
 			args,
 			timeout_secs,
 		} => match exec(program, args, timeout_secs).await {
-			Ok(r) => ControlResponse::Exec(r),
+			Ok(r) => {
+				crate::net::debug(&format!("exec finished: exit {:?} in {} ms", r.code, r.duration_ms));
+				ControlResponse::Exec(r)
+			}
 			Err(e) => ControlResponse::Error { message: e },
 		},
 		ControlRequest::Screenshot { display } => match screenshot(display.unwrap_or(0)).await {
-			Ok(r) => ControlResponse::Screenshot(r),
+			Ok(r) => {
+				crate::net::debug(&format!(
+					"screenshot captured: {}x{} (display {})",
+					r.width, r.height, r.display
+				));
+				ControlResponse::Screenshot(r)
+			}
 			Err(e) => ControlResponse::Error { message: e },
 		},
 		ControlRequest::EnableRdp => match tokio::task::spawn_blocking(crate::rdp::enable).await {
-			Ok(Ok(info)) => ControlResponse::Rdp(info),
+			Ok(Ok(info)) => {
+				crate::net::log(&format!("RDP enabled ({} on port {})", info.backend, info.port));
+				ControlResponse::Rdp(info)
+			}
 			Ok(Err(e)) => ControlResponse::Error { message: e },
 			Err(e) => ControlResponse::Error {
 				message: format!("rdp task failed: {e}"),

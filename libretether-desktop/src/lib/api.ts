@@ -82,9 +82,6 @@ export const activeController = () => call<ActiveInfo | null>("active_controller
 // ---------------------------------------------------------------- logs
 export const getControllerLogs = () => call<LogEntry[]>("get_controller_logs")
 export const clientLogs = (id: string, maxLines?: number) => call<LogEntry[]>("client_logs", { id, maxLines })
-/** Fetch the relay server's own logs — only valid when the active controller is in
- *  relay mode. Lines come back tagged with the source "relay". */
-export const relayLogs = (maxLines?: number) => call<LogEntry[]>("relay_logs", { maxLines })
 
 // ---------------------------------------------------------------- settings
 export const getSettings = () => call<Settings>("get_settings")

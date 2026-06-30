@@ -36,6 +36,10 @@ pub async fn open(ctrl: &ActiveController, id: Uuid, link: AgentLink, remote_por
 	// listener on every connect. A tunnel whose accept loop has given up is dropped
 	// here so we rebuild it instead of returning a dead local port.
 	if let Some(port) = reuse_live(ctrl, (id, remote_port)) {
+		crate::logbook::debug(
+			"tunnel",
+			&format!("reusing tunnel 127.0.0.1:{port} → {id} agent port {remote_port}"),
+		);
 		return Ok(port);
 	}
 
@@ -43,6 +47,10 @@ pub async fn open(ctrl: &ActiveController, id: Uuid, link: AgentLink, remote_por
 		.await
 		.map_err(|e| AppError::msg(format!("binding tunnel: {e}")))?;
 	let local_port = listener.local_addr().map_err(AppError::Io)?.port();
+	crate::logbook::info(
+		"tunnel",
+		&format!("opened tunnel 127.0.0.1:{local_port} → {id} agent port {remote_port}"),
+	);
 
 	let alive = Arc::new(AtomicBool::new(true));
 	let task = tauri::async_runtime::spawn(accept_loop(listener, link, remote_port, alive.clone()));
@@ -97,6 +105,10 @@ async fn accept_loop(listener: TcpListener, link: AgentLink, remote_port: u16, a
 		match listener.accept().await {
 			Ok((tcp, _)) => {
 				consecutive_errors = 0;
+				crate::logbook::debug(
+					"tunnel",
+					&format!("accepted a local connection, forwarding to agent port {remote_port}"),
+				);
 				let link = link.clone();
 				tauri::async_runtime::spawn(async move {
 					if let Err(e) = forward(link, remote_port, tcp).await {
@@ -122,6 +134,9 @@ async fn accept_loop(listener: TcpListener, link: AgentLink, remote_port: u16, a
 pub fn close_for(ctrl: &ActiveController, id: Uuid) {
 	let mut tunnels = ctrl.tunnels.lock().unwrap();
 	let keys: Vec<_> = tunnels.keys().filter(|(cid, _)| *cid == id).copied().collect();
+	if !keys.is_empty() {
+		crate::logbook::debug("tunnel", &format!("closing {} tunnel(s) for {id}", keys.len()));
+	}
 	for key in keys {
 		if let Some(h) = tunnels.remove(&key) {
 			h.task.abort();
@@ -139,6 +154,10 @@ async fn forward(link: AgentLink, remote_port: u16, tcp: TcpStream) -> AppResult
 	// would truncate the tail of an SSH/RDP session).
 	let (tcp_read, tcp_write) = tcp.into_split();
 	pipe_bidirectional(tcp_read, tcp_write, recv, send).await;
+	crate::logbook::debug(
+		"tunnel",
+		&format!("forwarded connection to agent port {remote_port} closed"),
+	);
 	Ok(())
 }
 

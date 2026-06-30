@@ -52,6 +52,9 @@ const LOG_BUFFER_CAP: usize = 2000;
 struct LogRing {
 	lines: std::collections::VecDeque<LogLine>,
 	dropped: bool,
+	/// Count of all lines ever recorded (including evicted ones), reported as
+	/// [`LogsResult::next_seq`] so a consumer could fetch incrementally.
+	next_seq: u64,
 }
 
 impl LogRing {
@@ -62,6 +65,7 @@ impl LogRing {
 			self.dropped = true;
 		}
 		self.lines.push_back(line);
+		self.next_seq += 1;
 	}
 
 	/// The most recent `max` lines (all when `None`), oldest first. Stamps the
@@ -73,6 +77,7 @@ impl LogRing {
 			lines: self.lines.iter().skip(self.lines.len() - take).cloned().collect(),
 			dropped: self.dropped,
 			now_secs: host::now_secs(),
+			next_seq: self.next_seq,
 		}
 	}
 }
@@ -109,6 +114,13 @@ fn init_log_file(cfg_path: &Path) {
 /// where the line is a warning or an error worth filtering on in the Logs page.
 pub fn log(msg: &str) {
 	log_at(LogLevel::Info, msg);
+}
+
+/// Record a debug-level line: fine-grained, chatty per-stream/per-step detail
+/// (stream open/close, handshake sub-steps, per-second stream stats) that the
+/// Logs page can filter out. Reach for [`log`] for connection-level milestones.
+pub fn debug(msg: &str) {
+	log_at(LogLevel::Debug, msg);
 }
 
 /// Record a line at `level`: print it, mirror it to `agent.log`, and push it onto
@@ -183,6 +195,7 @@ async fn connect_once(cfg: &mut AgentConfig, cfg_path: &Path) -> Result<()> {
 		log(&format!("dialing controller at {addr}"));
 		dial(&endpoint, addr, &cfg.server_name).await?
 	};
+	debug(&format!("quic connection established to {addr}"));
 	serve(conn, cfg, cfg_path).await
 }
 
@@ -222,6 +235,7 @@ async fn serve(conn: quinn::Connection, cfg: &mut AgentConfig, cfg_path: &Path) 
 
 	// Handshake stream is opened by the controller.
 	let (mut send, mut recv) = conn.accept_bi().await.context("accept handshake stream")?;
+	debug("handshake stream accepted; verifying controller");
 	match read_frame_capped::<_, StreamOpen>(&mut recv, MAX_CONTROL_FRAME).await? {
 		StreamOpen::Handshake => {}
 		other => return Err(anyhow!("expected handshake stream, got {other:?}")),
@@ -271,6 +285,7 @@ async fn serve(conn: quinn::Connection, cfg: &mut AgentConfig, cfg_path: &Path) 
 	let controller_key = Arc::new(expected);
 	loop {
 		let (send, recv) = conn.accept_bi().await.map_err(|e| anyhow!("connection ended: {e}"))?;
+		debug("accepted a new stream from the controller");
 		tokio::spawn(handle_stream(
 			send,
 			recv,
@@ -278,6 +293,16 @@ async fn serve(conn: quinn::Connection, cfg: &mut AgentConfig, cfg_path: &Path) 
 			controller_key.clone(),
 			tokens.clone(),
 		));
+	}
+}
+
+/// A short label for a stream type, for the debug logs in [`handle_stream`].
+fn stream_label(open: &StreamOpen) -> String {
+	match open {
+		StreamOpen::Handshake => "handshake".into(),
+		StreamOpen::Control => "control".into(),
+		StreamOpen::Session => "session".into(),
+		StreamOpen::Tunnel { port } => format!("tunnel→127.0.0.1:{port}"),
 	}
 }
 
@@ -365,6 +390,7 @@ async fn handle_stream(
 		Ok(o) => o,
 		Err(_) => return,
 	};
+	debug(&format!("stream opened: {}", stream_label(&open)));
 	// Handshake streams establish trust; every other stream must present the
 	// capability token from a completed handshake. This is what stops a party
 	// that can reach the agent (e.g. through the relay with only the owner
@@ -381,11 +407,14 @@ async fn handle_stream(
 			let resp = handlers::handle(req).await;
 			let _ = write_frame(&mut send, &resp).await;
 			let _ = send.finish();
+			debug("control stream closed");
 		}
 		StreamOpen::Session => {
+			debug("session stream opened");
 			if let Err(e) = session::run(send, recv).await {
 				log(&format!("session ended: {e}"));
 			}
+			debug("session stream closed");
 		}
 		StreamOpen::Tunnel { port } => tunnel(port, send, recv).await,
 		StreamOpen::Handshake => reauth(send, recv, &identity, &controller_key, &tokens).await,
@@ -432,10 +461,13 @@ async fn reauth(
 /// handshake holds a capability token, and `handle_stream` rejects any tunnel
 /// stream without one — but note the reach is intentionally unrestricted.
 async fn tunnel(port: u16, mut q_send: SendStream, q_recv: RecvStream) {
+	debug(&format!("tunnel: connecting to 127.0.0.1:{port}"));
 	match tokio::net::TcpStream::connect(("127.0.0.1", port)).await {
 		Ok(tcp) => {
+			debug(&format!("tunnel: connected to 127.0.0.1:{port}, piping"));
 			let (tcp_read, tcp_write) = tcp.into_split();
 			pipe_bidirectional(q_recv, q_send, tcp_read, tcp_write).await;
+			debug(&format!("tunnel: 127.0.0.1:{port} closed"));
 		}
 		Err(e) => {
 			log_at(LogLevel::Warn, &format!("tunnel to 127.0.0.1:{port} failed: {e}"));

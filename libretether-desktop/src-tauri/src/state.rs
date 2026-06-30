@@ -7,6 +7,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use base64::engine::general_purpose::STANDARD as B64;
@@ -200,6 +201,13 @@ pub struct ActiveController {
 	/// relay itself (e.g. fetching its server log). `None` in direct/Tailscale mode
 	/// and while the relay session is down/reconnecting.
 	pub relay_conn: Mutex<Option<quinn::Connection>>,
+	/// Cursor for the background relay-log poller: the `next_seq` of the last batch
+	/// of relay log lines folded into the controller's logbook, so each poll fetches
+	/// only what's new. `u64::MAX` is the initial "fetched nothing yet" sentinel
+	/// (first poll fetches the relay's full retained buffer). Persists across relay
+	/// reconnects (the poller is respawned per session, but the relay's seq keeps
+	/// growing), and resets only when a fresh controller is activated.
+	pub relay_log_seq: AtomicU64,
 	/// Serializes registry persisters so their disk writes stay ordered with the
 	/// snapshots they took — without holding the `store` lock across the fsync.
 	persist_lock: Mutex<()>,
@@ -215,6 +223,7 @@ impl ActiveController {
 			sessions: Mutex::new(HashMap::new()),
 			tunnels: Mutex::new(HashMap::new()),
 			relay_conn: Mutex::new(None),
+			relay_log_seq: AtomicU64::new(u64::MAX),
 			persist_lock: Mutex::new(()),
 		}
 	}
@@ -430,6 +439,16 @@ impl AppState {
 		let store = ClientStore::load(self.profile_dir(id).join("clients.json"))?;
 		let controller = Arc::new(ActiveController::new(profile, store));
 
+		let mode = if controller.profile.kind.relay().is_some() {
+			"relay"
+		} else {
+			"direct"
+		};
+		crate::logbook::info(
+			"controller",
+			&format!("activating controller '{}' ({mode} mode)", controller.profile.name),
+		);
+
 		let state = self.clone();
 		let ctrl = controller.clone();
 		let serve_task = tauri::async_runtime::spawn(async move {
@@ -458,6 +477,10 @@ impl AppState {
 	pub fn deactivate(&self) {
 		let handle = self.0.active.lock().unwrap().take();
 		if let Some(handle) = handle {
+			crate::logbook::info(
+				"controller",
+				&format!("deactivating controller '{}'", handle.controller.profile.name),
+			);
 			handle.serve_task.abort();
 			for (_, session) in handle.controller.sessions.lock().unwrap().drain() {
 				session.task.abort();

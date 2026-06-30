@@ -99,9 +99,10 @@ async fn start() -> Result<Embedded, String> {
 
 async fn accept_loop(listener: TcpListener, config: Arc<Config>, authorized: KeyData) {
 	loop {
-		let Ok((stream, _)) = listener.accept().await else {
+		let Ok((stream, peer)) = listener.accept().await else {
 			continue;
 		};
+		crate::net::debug(&format!("embedded ssh: connection accepted from {peer}"));
 		let config = config.clone();
 		let handler = SessionHandler::new(authorized.clone());
 		tokio::spawn(async move {
@@ -109,6 +110,7 @@ async fn accept_loop(listener: TcpListener, config: Arc<Config>, authorized: Key
 				// Drive the connection to completion; errors just mean it closed.
 				let _ = session.await;
 			}
+			crate::net::debug(&format!("embedded ssh: connection from {peer} closed"));
 		});
 	}
 }
@@ -209,8 +211,10 @@ impl Handler for SessionHandler {
 		// Accept only the one ephemeral key we handed the controller; compare the key
 		// data (not the whole `PublicKey`, whose comment may differ).
 		if public_key.key_data() == &self.authorized {
+			crate::net::debug("embedded ssh: public-key auth accepted");
 			Ok(Auth::Accept)
 		} else {
+			log("embedded ssh: rejected an unauthorized public key");
 			Ok(Auth::reject())
 		}
 	}
@@ -247,6 +251,7 @@ impl Handler for SessionHandler {
 			.unwrap_or((80, 24, "xterm-256color".to_string()));
 		match self.spawn_shell(channel, cols, rows, &term, session) {
 			Ok(shell) => {
+				crate::net::debug(&format!("embedded ssh: shell started ({term}, {cols}x{rows})"));
 				self.shells.insert(channel, shell);
 				session.channel_success(channel)?;
 			}
@@ -287,6 +292,7 @@ impl Handler for SessionHandler {
 
 	async fn channel_close(&mut self, channel: ChannelId, _session: &mut Session) -> Result<(), Self::Error> {
 		if let Some(mut shell) = self.shells.remove(&channel) {
+			crate::net::debug("embedded ssh: channel closed, stopping shell");
 			let _ = shell.killer.kill();
 		}
 		Ok(())

@@ -47,13 +47,27 @@ pub async fn run(mut send: SendStream, mut recv: RecvStream) -> std::io::Result<
 			return Ok(());
 		}
 	};
+	crate::net::log(&format!(
+		"session starting: display {} q{} {}fps scale {}%{}",
+		cfg.display,
+		cfg.quality,
+		cfg.max_fps,
+		cfg.scale,
+		if cfg.auto { " (auto)" } else { "" },
+	));
 
 	#[cfg(target_os = "linux")]
 	if crate::platform::is_wayland() {
-		return crate::wayland::run_session(cfg, send, recv).await;
+		crate::net::debug("session backend: wayland (portals + pipewire)");
+		let result = crate::wayland::run_session(cfg, send, recv).await;
+		crate::net::log("session ended");
+		return result;
 	}
 
-	x11_session(cfg, send, recv).await
+	crate::net::debug("session backend: x11/xcap");
+	let result = x11_session(cfg, send, recv).await;
+	crate::net::log("session ended");
+	result
 }
 
 /// X11 backend: stateless per-frame `xcap` capture + `enigo` input injection.

@@ -27,6 +27,13 @@ static SESSION_GEN: AtomicU64 = AtomicU64::new(1);
 /// frame); metadata/errors are emitted as Tauri events.
 pub fn start(state: &AppState, ctrl: Arc<ActiveController>, id: Uuid, cfg: SessionConfig, frames: Channel) {
 	stop(&ctrl, id);
+	crate::logbook::info(
+		"session",
+		&format!(
+			"starting screen-control session for {id} (display {} q{} {}fps scale {}%)",
+			cfg.display, cfg.quality, cfg.max_fps, cfg.scale
+		),
+	);
 
 	let token = SESSION_GEN.fetch_add(1, Ordering::Relaxed);
 	let (input_tx, input_rx) = tokio::sync::mpsc::unbounded_channel::<SessionClient>();
@@ -48,6 +55,7 @@ async fn drive(
 	frames: Channel,
 ) {
 	let Some(conn) = ctrl.connection(id) else {
+		crate::logbook::warn("session", &format!("session {id}: client is offline"));
 		emit(&app, &format!("session:error:{id}"), "client is offline".to_string());
 		finish(&ctrl, id, token, &app);
 		return;
@@ -55,6 +63,7 @@ async fn drive(
 	let (mut send, mut recv) = match conn.open_authenticated(StreamOpen::Session).await {
 		Ok(pair) => pair,
 		Err(e) => {
+			crate::logbook::warn("session", &format!("session {id}: could not open stream: {e}"));
 			emit(
 				&app,
 				&format!("session:error:{id}"),
@@ -64,6 +73,7 @@ async fn drive(
 			return;
 		}
 	};
+	crate::logbook::debug("session", &format!("session {id}: stream opened, sending start"));
 	if write_frame(&mut send, &SessionClient::Start(cfg)).await.is_err() {
 		finish(&ctrl, id, token, &app);
 		return;
@@ -92,12 +102,19 @@ async fn drive(
 					break;
 				}
 			}
-			Ok(Inbound::Control(SessionServer::Meta { display, width, height })) => emit(
-				&app,
-				&format!("session:meta:{id}"),
-				serde_json::json!({ "display": display, "width": width, "height": height }),
-			),
+			Ok(Inbound::Control(SessionServer::Meta { display, width, height })) => {
+				crate::logbook::debug(
+					"session",
+					&format!("session {id}: meta {width}x{height} (display {display})"),
+				);
+				emit(
+					&app,
+					&format!("session:meta:{id}"),
+					serde_json::json!({ "display": display, "width": width, "height": height }),
+				)
+			}
 			Ok(Inbound::Control(SessionServer::Error { message })) => {
+				crate::logbook::warn("session", &format!("session {id}: agent error: {message}"));
 				emit(&app, &format!("session:error:{id}"), message);
 				break;
 			}
@@ -116,6 +133,7 @@ fn finish(ctrl: &ActiveController, id: Uuid, token: u64, app: &Option<AppHandle>
 	if sessions.get(&id).map(|h| h.token) == Some(token) {
 		sessions.remove(&id);
 		drop(sessions);
+		crate::logbook::info("session", &format!("session {id}: closed"));
 		emit(app, &format!("session:closed:{id}"), ());
 	}
 }
@@ -144,6 +162,7 @@ fn send_client(ctrl: &ActiveController, id: Uuid, msg: SessionClient) -> AppResu
 /// Stop a running session, if any.
 pub fn stop(ctrl: &ActiveController, id: Uuid) {
 	if let Some(handle) = ctrl.sessions.lock().unwrap().remove(&id) {
+		crate::logbook::debug("session", &format!("stopping session {id}"));
 		let _ = handle.input_tx.send(SessionClient::Stop);
 		handle.task.abort();
 	}

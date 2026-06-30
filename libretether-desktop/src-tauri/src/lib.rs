@@ -78,7 +78,6 @@ pub fn run() {
 			commands::save_text_file,
 			commands::get_controller_logs,
 			commands::client_logs,
-			commands::relay_logs,
 		])
 		.run(tauri::generate_context!())
 		.expect("error while running LibreTether");

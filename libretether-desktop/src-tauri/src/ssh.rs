@@ -27,6 +27,7 @@ pub fn launch(
 	username: &str,
 	identity: Option<&Path>,
 ) -> AppResult<()> {
+	crate::logbook::debug("ssh", &format!("spawning ssh client for {username}@{host}:{port}"));
 	let mut ssh: Vec<String> = vec!["ssh".into()];
 	if let Some(key) = identity {
 		ssh.push("-i".into());

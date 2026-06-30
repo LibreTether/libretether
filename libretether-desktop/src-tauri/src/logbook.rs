@@ -56,9 +56,16 @@ fn now_secs() -> u64 {
 /// Record a controller log line: mirror it to stderr (so `cargo run`/journald
 /// still show it), retain it in the ring, and emit it to the Logs page.
 pub fn record(level: LogLevel, source: &str, message: &str) {
+	record_at(now_secs(), level, source, message);
+}
+
+/// Like [`record`] but with an explicit timestamp, for lines pulled from another
+/// host (the relay, an agent) whose `ts_secs` has been re-anchored to our clock —
+/// so they retain their true age instead of all collapsing to "now" on ingest.
+pub fn record_at(ts_secs: u64, level: LogLevel, source: &str, message: &str) {
 	eprintln!("[libretether] {message}");
 	let entry = LogEntry {
-		ts_secs: now_secs(),
+		ts_secs,
 		level,
 		source: source.to_string(),
 		message: message.to_string(),
@@ -85,6 +92,13 @@ pub fn warn(source: &str, message: &str) {
 
 pub fn error(source: &str, message: &str) {
 	record(LogLevel::Error, source, message);
+}
+
+/// Record a debug-level line: fine-grained per-stream/per-step detail (stream
+/// opened/closed, handshake sub-steps, tunnel accepts) that the Logs page can
+/// filter out. Reach for [`info`] for connection-level milestones.
+pub fn debug(source: &str, message: &str) {
+	record(LogLevel::Debug, source, message);
 }
 
 /// The most recent `max` lines (all when `None`), oldest first — used to seed the

@@ -437,6 +437,10 @@ pub async fn create_client(state: State<'_, AppState>, name: String, os: ClientO
 pub async fn remove_client(state: State<'_, AppState>, id: String) -> AppResult<()> {
 	let state = state.inner().clone();
 	let (ctrl, id) = active_and_id(&state, &id)?;
+	crate::logbook::info(
+		"controller",
+		&format!("removing client {id}: stopping session and tunnels"),
+	);
 	session::stop(&ctrl, id);
 	crate::tunnel::close_for(&ctrl, id);
 	if let Some(link) = ctrl.connection(id) {
@@ -603,12 +607,14 @@ pub async fn connect_rdp(state: State<'_, AppState>, id: String) -> AppResult<()
 	let state = state.inner().clone();
 	let (ctrl, id) = active_and_id(&state, &id)?;
 	let conn = ctrl.connection(id).ok_or(AppError::Offline)?;
+	crate::logbook::info("rdp", &format!("connecting RDP to {id}: enabling RDP on the agent"));
 	let info = expect_response!(&conn, &ControlRequest::EnableRdp, ControlResponse::Rdp)?;
 	let (host, port) = client_endpoint(&ctrl, id, &conn, info.address.clone(), info.port).await?;
 	let host = safe_host(&host)?;
 	let username = safe_username(&info.username)?;
 	let password = info.password.as_deref().map(safe_password).transpose()?;
 	let pref = state.0.settings.lock().unwrap().rdp_client.clone();
+	crate::logbook::info("rdp", &format!("launching RDP viewer for {host}:{port}"));
 	crate::rdp::launch(pref.as_deref(), &host, port, &username, password.as_deref())
 }
 
@@ -620,6 +626,10 @@ pub async fn connect_ssh(state: State<'_, AppState>, id: String) -> AppResult<()
 	let state = state.inner().clone();
 	let (ctrl, id) = active_and_id(&state, &id)?;
 	let conn = ctrl.connection(id).ok_or(AppError::Offline)?;
+	crate::logbook::info(
+		"ssh",
+		&format!("connecting SSH to {id}: probing for a system SSH server"),
+	);
 	let status = expect_response!(&conn, &ControlRequest::Status, ControlResponse::Status)?;
 	let terminal = state.0.settings.lock().unwrap().terminal.clone();
 
@@ -638,16 +648,25 @@ pub async fn connect_ssh(state: State<'_, AppState>, id: String) -> AppResult<()
 		let (host, port) = client_endpoint(&ctrl, id, &conn, status.tailscale_ip.clone(), 22).await?;
 		let host = safe_host(&host)?;
 		let username = safe_username(&status.host.username)?;
+		crate::logbook::info(
+			"ssh",
+			&format!("system SSH server found; launching terminal to {host}:{port}"),
+		);
 		return crate::ssh::launch(terminal.as_deref(), &host, port, &username, None);
 	}
 
 	// No system SSH server: start the agent's built-in one and connect to it with
 	// the ephemeral key it returns. It binds loopback only, so we always tunnel to
 	// it (even in direct mode, which normally dials the client's address directly).
+	crate::logbook::info("ssh", "no system SSH server; starting the agent's embedded SSH server");
 	let info = expect_response!(&conn, &ControlRequest::EnableSsh, ControlResponse::Ssh)?;
 	let username = safe_username(&info.username)?;
 	let key_path = write_ephemeral_key(id, &info.private_key)?;
 	let local = crate::tunnel::open(&ctrl, id, conn.clone(), info.port).await?;
+	crate::logbook::info(
+		"ssh",
+		&format!("launching terminal to embedded SSH server via 127.0.0.1:{local}"),
+	);
 	crate::ssh::launch(terminal.as_deref(), "127.0.0.1", local, &username, Some(&key_path))
 }
 
@@ -700,44 +719,6 @@ pub async fn client_logs(
 			ts_secs: (l.ts_secs as i64 + offset).max(0) as u64,
 			level: l.level,
 			source: source.clone(),
-			message: l.message,
-		})
-		.collect())
-}
-
-/// Fetch the relay server's own recent log lines (relay-mode controllers only),
-/// normalised into the same [`crate::logbook::LogEntry`] shape as controller/agent
-/// logs and tagged with the source `"relay"`, so the Logs page can show them
-/// alongside the rest. Fails closed for a non-relay controller, and with a clear
-/// "still connecting" error while the relay session is down.
-#[tauri::command]
-pub async fn relay_logs(
-	state: State<'_, AppState>,
-	max_lines: Option<u32>,
-) -> AppResult<Vec<crate::logbook::LogEntry>> {
-	let ctrl = state.require_active()?;
-	if ctrl.profile.kind.relay().is_none() {
-		return Err(AppError::msg("this controller isn't using a relay"));
-	}
-	// Clone the connection out and drop the lock before awaiting — never hold a
-	// std mutex across an await point.
-	let conn = ctrl
-		.relay_conn
-		.lock()
-		.unwrap()
-		.clone()
-		.ok_or_else(|| AppError::msg("not connected to the relay yet — still connecting"))?;
-	let result = crate::server::fetch_relay_logs(&conn, max_lines).await?;
-	// Re-anchor the relay's timestamps to OUR clock, exactly as `client_logs` does
-	// for agents — the relay host may be in another timezone or have a skewed clock.
-	let offset = libretether_common::now_secs() as i64 - result.now_secs as i64;
-	Ok(result
-		.lines
-		.into_iter()
-		.map(|l| crate::logbook::LogEntry {
-			ts_secs: (l.ts_secs as i64 + offset).max(0) as u64,
-			level: l.level,
-			source: "relay".to_string(),
 			message: l.message,
 		})
 		.collect())

@@ -50,6 +50,10 @@ fn log(msg: &str) {
 	crate::logbook::info("controller", msg);
 }
 
+fn log_debug(msg: &str) {
+	crate::logbook::debug("controller", msg);
+}
+
 fn log_warn(msg: &str) {
 	crate::logbook::warn("controller", msg);
 }
@@ -94,6 +98,7 @@ pub async fn serve(state: AppState, ctrl: Arc<ActiveController>) {
 	log(&format!("[{}] listening for agents on udp/{port}", ctrl.profile.name));
 
 	while let Some(incoming) = endpoint.accept().await {
+		log_debug(&format!("connection received from {}", incoming.remote_address()));
 		let state = state.clone();
 		let ctrl = ctrl.clone();
 		tauri::async_runtime::spawn(async move {
@@ -105,11 +110,15 @@ pub async fn serve(state: AppState, ctrl: Arc<ActiveController>) {
 }
 
 async fn handle_direct(state: AppState, ctrl: Arc<ActiveController>, incoming: quinn::Incoming) -> AppResult<()> {
+	let remote = incoming.remote_address();
 	let conn = incoming
 		.accept()
 		.map_err(|e| AppError::msg(format!("accept: {e}")))?
 		.await
 		.map_err(|e| AppError::msg(format!("handshake: {e}")))?;
+	log_debug(&format!(
+		"quic connection established with {remote}; starting handshake"
+	));
 
 	let link = AgentLink::direct(conn.clone());
 	if let Some((id, generation)) = enroll_and_register(&state, &ctrl, link).await? {
@@ -180,6 +189,11 @@ async fn relay_session(
 		let _ = app.emit(EVENT_RELAY_CONNECTED, ());
 	}
 
+	// Continuously pull the relay's own server log in the background and fold it into
+	// the controller's logbook, so it's captured and persisted regardless of whether
+	// the Logs page is open. Tied to this session: the guard aborts it on any exit.
+	let _relay_log_poller = AbortOnDrop(tauri::async_runtime::spawn(relay_log_poll(ctrl.clone(), conn.clone())));
+
 	// Public keys with an enrollment handshake in flight, so a duplicate presence
 	// event (relay flap / replay) doesn't start a second concurrent handshake for
 	// the same agent and race two live-map inserts.
@@ -199,6 +213,10 @@ async fn relay_session(
 			// Liveness only — proves the relay is still servicing us.
 			RelayEvent::Heartbeat => {}
 			RelayEvent::AgentOnline { public_key } => {
+				log_debug(&format!(
+					"relay reports agent online ({}…)",
+					public_key.chars().take(8).collect::<String>()
+				));
 				// Skip if an enrollment for this agent is already running (de-dup a
 				// presence replay); the in-flight handshake will register it.
 				if !enrolling.lock().unwrap().insert(public_key.clone()) {
@@ -216,6 +234,10 @@ async fn relay_session(
 				});
 			}
 			RelayEvent::AgentOffline { public_key } => {
+				log_debug(&format!(
+					"relay reports agent offline ({}…)",
+					public_key.chars().take(8).collect::<String>()
+				));
 				let id = ctrl.store.lock().unwrap().id_for_pubkey(&public_key);
 				if let Some(id) = id {
 					// The relay is authoritative for relay-mode presence, so remove
@@ -228,19 +250,72 @@ async fn relay_session(
 	}
 }
 
-/// Fetch the relay server's own recent log lines over the live relay connection
-/// (relay mode only). Opens a fresh stream, leads with [`RelayRequest::FetchLogs`]
-/// so the relay answers it itself rather than routing it to an agent, and reads the
-/// [`LogsResult`] back. Uses the wide `read_frame` cap because a full log snapshot
-/// can exceed the 1 MiB control cap.
-pub async fn fetch_relay_logs(conn: &quinn::Connection, max_lines: Option<u32>) -> AppResult<LogsResult> {
+/// Fetch the relay server's own log lines over the live relay connection (relay
+/// mode only). Opens a fresh stream, leads with [`RelayRequest::FetchLogs`] so the
+/// relay answers it itself rather than routing it to an agent, and reads the
+/// [`LogsResult`] back. With `after_seq` set the relay returns only lines recorded
+/// since that cursor (incremental poll); `None` fetches the full retained buffer.
+/// Uses the wide `read_frame` cap because a full log snapshot can exceed the 1 MiB
+/// control cap.
+pub async fn fetch_relay_logs(conn: &quinn::Connection, after_seq: Option<u64>) -> AppResult<LogsResult> {
 	let (mut send, mut recv) = conn
 		.open_bi()
 		.await
 		.map_err(|e| AppError::msg(format!("open relay stream: {e}")))?;
-	write_frame(&mut send, &RelayRequest::FetchLogs { max_lines }).await?;
+	write_frame(&mut send, &RelayRequest::FetchLogs { after_seq }).await?;
 	let _ = send.finish();
 	Ok(read_frame::<_, LogsResult>(&mut recv).await?)
+}
+
+/// How often the controller polls the relay for new server-log lines and folds them
+/// into its own logbook (so they persist and show on the Logs page even when it's
+/// not open). Low-volume and cheap (one short stream per poll); a few seconds keeps
+/// the relay's log feeling live without being chatty.
+const RELAY_LOG_POLL_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Aborts a spawned task when dropped, so a child task tied to a scope (here, the
+/// relay-log poller bound to one relay session) can't outlive it.
+struct AbortOnDrop(tauri::async_runtime::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+	fn drop(&mut self) {
+		self.0.abort();
+	}
+}
+
+/// Poll the relay for new log lines on `conn` and fold them into the controller's
+/// logbook (source `"relay"`), so relay activity is captured continuously in the
+/// background — persisted in the ring and streamed live to the Logs page — instead
+/// of only when an operator manually fetches it. Runs until the connection drops
+/// (then the reconnect spawns a fresh poller) or the task is aborted at session end.
+async fn relay_log_poll(ctrl: Arc<ActiveController>, conn: quinn::Connection) {
+	let mut ticker = tokio::time::interval(RELAY_LOG_POLL_INTERVAL);
+	loop {
+		ticker.tick().await;
+		// `u64::MAX` is the "nothing fetched yet" sentinel → fetch the full buffer.
+		let cursor = ctrl.relay_log_seq.load(Ordering::Relaxed);
+		let after = (cursor != u64::MAX).then_some(cursor);
+		match fetch_relay_logs(&conn, after).await {
+			Ok(result) => {
+				// Re-anchor the relay's timestamps to OUR clock (it may be in another
+				// timezone or skewed), exactly as the agent-log path does.
+				let offset = libretether_common::now_secs() as i64 - result.now_secs as i64;
+				for line in &result.lines {
+					let ts = (line.ts_secs as i64 + offset).max(0) as u64;
+					crate::logbook::record_at(ts, line.level, "relay", &line.message);
+				}
+				ctrl.relay_log_seq.store(result.next_seq, Ordering::Relaxed);
+			}
+			Err(_) => {
+				// The connection is gone — stop; the outer reconnect loop will bring up
+				// a new session (and a fresh poller). A transient hiccup on a still-live
+				// connection just retries on the next tick.
+				if conn.close_reason().is_some() {
+					return;
+				}
+			}
+		}
+	}
 }
 
 // ---------------------------------------------------------------- shared
@@ -255,6 +330,7 @@ async fn enroll_and_register(
 ) -> AppResult<Option<(Uuid, u64)>> {
 	let (mut send, mut recv) = link.open_bi().await?;
 	write_frame(&mut send, &StreamOpen::Handshake).await?;
+	log_debug("handshake: opened stream, sending challenge");
 	let nonce = crypto::random_nonce_b64();
 	write_frame(
 		&mut send,
@@ -273,6 +349,10 @@ async fn enroll_and_register(
 			Ok(res) => res?,
 			Err(_) => return Ok(None),
 		};
+	log_debug(&format!(
+		"handshake: received hello from {} ({})",
+		hello.host.hostname, hello.host.os
+	));
 	if hello.protocol != PROTOCOL_VERSION {
 		reject(&mut send, "protocol version mismatch").await;
 		return Ok(None);
@@ -317,6 +397,7 @@ async fn enroll_and_register(
 			Err(_) => return Ok(None),
 		};
 	let link = link.with_token(grant.token);
+	log_debug("handshake: capability token received and bound to the link");
 
 	log(&format!(
 		"agent {client_id} connected — {} ({})",
@@ -334,6 +415,7 @@ async fn enroll_and_register(
 	);
 	state.notify_changed();
 
+	log_debug(&format!("requesting initial status from agent {client_id}"));
 	if let Ok(ControlResponse::Status(status)) = control_request(&link, &ControlRequest::Status).await {
 		if let Some(live) = ctrl.live.lock().unwrap().get_mut(&client_id) {
 			live.status = Some(status);
@@ -361,6 +443,7 @@ fn cleanup(state: &AppState, ctrl: &ActiveController, id: Uuid, generation: Opti
 			return;
 		}
 	}
+	log_debug(&format!("agent {id} went offline; tearing down its tunnels"));
 	// Drop any relay tunnels for this client: they hold the now-defunct
 	// connection's capability token, so a reconnect must rebuild them afresh.
 	crate::tunnel::close_for(ctrl, id);

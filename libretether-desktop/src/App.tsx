@@ -233,13 +233,7 @@ function Shell({ active, onExit }: { active: ActiveInfo; onExit: () => void }) {
 					/>
 				)}
 				{page === "controller" && <ConnectionPage active={active} />}
-				{page === "logs" && (
-					<LogsPage
-						clients={clients}
-						hotkeysEnabled={!controlling && !overlayOpen}
-						relayMode={active.kind.type === "relay"}
-					/>
-				)}
+				{page === "logs" && <LogsPage clients={clients} hotkeysEnabled={!controlling && !overlayOpen} />}
 			</main>
 
 			<CommandPalette commands={commands} onClose={() => setPaletteOpen(false)} open={paletteOpen} />

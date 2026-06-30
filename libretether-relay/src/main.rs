@@ -31,6 +31,12 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 mod logbook;
 
+/// First 8 characters of a public key, for log lines (the full key is long and
+/// noisy; the prefix is enough to correlate an agent across log entries).
+fn key8(public_key: &str) -> String {
+	public_key.chars().take(8).collect()
+}
+
 /// Hard ceiling on concurrent connections we'll service at once — beyond this we
 /// shed load rather than spawn unbounded tasks for a UDP-reachable public port.
 const MAX_CONNECTIONS: usize = 1024;
@@ -317,6 +323,7 @@ async fn handle(
 	secrets: &(String, String),
 	agent_limit: &Arc<Semaphore>,
 ) -> Result<()> {
+	logbook::debug(&format!("connection received from {}", incoming.remote_address()));
 	// Bound the whole pre-serve phase — the QUIC/TLS handshake AND the app-level
 	// auth — under one timeout. The connection permit is acquired at accept (before
 	// either runs), so a peer that completes the UDP path then stalls at *either*
@@ -371,6 +378,7 @@ async fn authenticate(conn: &quinn::Connection, secrets: &(String, String)) -> R
 	// Constant-time compare so the secret can't be recovered byte-by-byte via
 	// response timing.
 	if !crypto::ct_eq(&hello.secret, expected) {
+		logbook::warn(&format!("rejected {role_label}: bad secret"));
 		let _ = write_frame(
 			&mut send,
 			&RelayAck {
@@ -389,6 +397,7 @@ async fn authenticate(conn: &quinn::Connection, secrets: &(String, String)) -> R
 	write_frame(&mut send, &RelayChallenge { nonce: nonce.clone() }).await?;
 	let proof: RelayProof = read_frame_capped(&mut recv, MAX_CONTROL_FRAME).await?;
 	if !crypto::verify_b64(&hello.public_key, nonce.as_bytes(), &proof.signature) {
+		logbook::warn(&format!("rejected {role_label}: key ownership proof failed"));
 		let _ = write_frame(
 			&mut send,
 			&RelayAck {
@@ -408,10 +417,7 @@ async fn authenticate(conn: &quinn::Connection, secrets: &(String, String)) -> R
 		},
 	)
 	.await?;
-	logbook::info(&format!(
-		"{role_label} connected ({}…)",
-		&hello.public_key.chars().take(8).collect::<String>()
-	));
+	logbook::info(&format!("{role_label} connected ({}…)", key8(&hello.public_key)));
 
 	// Route on the canonical key bytes, not the raw wire string: two base64
 	// encodings of the same key must resolve to one routing entry. `verify_b64`
@@ -429,6 +435,7 @@ async fn authenticate(conn: &quinn::Connection, secrets: &(String, String)) -> R
 /// bi stream per request which we pipe to the addressed agent.
 async fn serve_controller(relay: Relay, conn: quinn::Connection, mut events: SendStream) -> Result<()> {
 	let generation = CONTROLLER_GEN.fetch_add(1, Ordering::Relaxed);
+	logbook::info(&format!("controller session started (gen {generation})"));
 	let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<RelayEvent>();
 
 	// Install our sender (and connection) and snapshot existing agents under one
@@ -452,6 +459,10 @@ async fn serve_controller(relay: Relay, conn: quinn::Connection, mut events: Sen
 		previous
 	};
 	if let Some(prev) = previous {
+		logbook::info(&format!(
+			"displacing previous controller (gen {}) for the new session",
+			prev.generation
+		));
 		prev.conn.close(0u32.into(), b"replaced by a newer controller");
 	}
 
@@ -497,8 +508,11 @@ async fn serve_controller(relay: Relay, conn: quinn::Connection, mut events: Sen
 			match req {
 				// Served by the relay itself: hand back a snapshot of its own log ring
 				// so an operator can read the relay's activity from the controller.
-				RelayRequest::FetchLogs { max_lines } => {
-					let snapshot = logbook::snapshot(max_lines.map(|m| m as usize));
+				RelayRequest::FetchLogs { after_seq } => {
+					// No log line here: the controller polls this on a background timer,
+					// so logging each fetch would spam the relay's own log (and feed back
+					// into the controller via that very poll).
+					let snapshot = logbook::snapshot_after(after_seq);
 					let _ = write_frame(&mut c_send, &snapshot).await;
 					let _ = c_send.finish();
 				}
@@ -510,12 +524,24 @@ async fn serve_controller(relay: Relay, conn: quinn::Connection, mut events: Sen
 				RelayRequest::Route { agent } => {
 					let agent_key = crypto::canonical_pubkey(&agent).unwrap_or(agent);
 					let Some(agent) = relay.agent(&agent_key) else {
+						logbook::debug(&format!(
+							"route to offline agent {}… — resetting stream",
+							key8(&agent_key)
+						));
 						let _ = c_send.reset(AGENT_UNAVAILABLE.into());
 						return;
 					};
 					match agent.open_bi().await {
-						Ok((a_send, a_recv)) => pipe(c_recv, a_send, a_recv, c_send).await,
+						Ok((a_send, a_recv)) => {
+							logbook::debug(&format!("routing a stream to agent {}…", key8(&agent_key)));
+							pipe(c_recv, a_send, a_recv, c_send).await;
+							logbook::debug(&format!("routed stream to agent {}… closed", key8(&agent_key)));
+						}
 						Err(_) => {
+							logbook::debug(&format!(
+								"agent {}… connection unusable — resetting stream",
+								key8(&agent_key)
+							));
 							let _ = c_send.reset(AGENT_UNAVAILABLE.into());
 						}
 					}
@@ -524,6 +550,7 @@ async fn serve_controller(relay: Relay, conn: quinn::Connection, mut events: Sen
 		});
 	}
 
+	logbook::info(&format!("controller session ended (gen {generation})"));
 	// Only relinquish the slot if it's still ours: a reconnecting controller may
 	// have already installed a newer sender, and clearing that would kill its
 	// event stream and bounce it into an endless reconnect loop.
@@ -554,14 +581,20 @@ async fn serve_agent(
 	let previous = relay.agents.lock().unwrap().insert(public_key.clone(), conn.clone());
 	if let Some(prev) = previous {
 		if prev.stable_id() != conn_id {
+			logbook::debug(&format!(
+				"agent {}… reconnected — closing its previous connection",
+				key8(&public_key)
+			));
 			prev.close(0u32.into(), b"replaced by a newer connection for this key");
 		}
 	}
+	logbook::info(&format!("agent {}… registered and reachable", key8(&public_key)));
 	relay.notify(RelayEvent::AgentOnline {
 		public_key: public_key.clone(),
 	});
 
 	conn.closed().await;
+	logbook::debug(&format!("agent {}… connection closed", key8(&public_key)));
 
 	// Only deregister if we're still the registered connection for this key. A
 	// reconnect can replace us with a fresh connection before our `closed()`
@@ -571,6 +604,7 @@ async fn serve_agent(
 	if agents.get(&public_key).map(|c| c.stable_id()) == Some(conn_id) {
 		agents.remove(&public_key);
 		drop(agents);
+		logbook::info(&format!("agent {}… deregistered (offline)", key8(&public_key)));
 		relay.notify(RelayEvent::AgentOffline { public_key });
 	}
 	Ok(())
@@ -933,7 +967,7 @@ mod tests {
 		// A FetchLogs stream is answered by the relay itself (not routed to an agent):
 		// it replies with a LogsResult drawn from its own log buffer.
 		let (mut rsend, mut rrecv) = ctrl_conn.open_bi().await.unwrap();
-		write_frame(&mut rsend, &RelayRequest::FetchLogs { max_lines: None })
+		write_frame(&mut rsend, &RelayRequest::FetchLogs { after_seq: None })
 			.await
 			.unwrap();
 		let _ = rsend.finish();

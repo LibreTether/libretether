@@ -261,6 +261,11 @@ pub struct LogsResult {
 	/// `controller_now - now_secs`, so an agent or relay in another timezone or with
 	/// a skewed clock still renders at the correct local time alongside other logs.
 	pub now_secs: u64,
+	/// Monotonic count of all lines the sender has *ever* recorded (not just those
+	/// retained). A consumer polling incrementally passes the previous `next_seq` back
+	/// as the next request's cursor to receive only lines recorded since; it also
+	/// detects a sender restart (when `next_seq` drops below the cursor it holds).
+	pub next_seq: u64,
 }
 
 /// How to reach the RDP server the agent just enabled.
@@ -571,6 +576,7 @@ mod tests {
 			],
 			dropped: true,
 			now_secs: 200,
+			next_seq: 2,
 		});
 		let back: ControlResponse = round_trip(&logs);
 		let ControlResponse::Logs(r) = back else {

@@ -283,7 +283,9 @@ impl Stats {
 		let ms = |total: u64| (total as f64 / n) / 1000.0;
 		let fps = n / elapsed.as_secs_f64();
 		let kib_per_sent = (self.bytes as f64 / self.sent.max(1) as f64) / 1024.0;
-		crate::net::log(&format!(
+		// Per-second telemetry: useful for tuning but far too chatty for the default
+		// Info view, so it's logged at Debug (the Logs page filters it out by default).
+		crate::net::debug(&format!(
 			"stream {fps:.0} fps ({} sent/s) | cap {:.1} down {:.1} hash {:.1} enc {:.1} net {:.1} ms/f | {:.0}/{:.0} tiles {kib_per_sent:.0} KiB/f | scale {scale}% q{quality}",
 			self.sent,
 			ms(self.capture_us),
