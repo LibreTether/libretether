@@ -6,8 +6,8 @@ use std::time::{Duration, Instant};
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
 use libretether_protocol::{
-	AgentStatus, ControlRequest, ControlResponse, ExecResult, ScreenshotResult, DEFAULT_EXEC_TIMEOUT_SECS,
-	MAX_EXEC_TIMEOUT_SECS,
+	AgentStatus, ControlRequest, ControlResponse, ExecResult, PortProbe, ScreenshotResult, SshInfo,
+	DEFAULT_EXEC_TIMEOUT_SECS, MAX_EXEC_TIMEOUT_SECS,
 };
 use tokio::process::Command;
 
@@ -49,7 +49,31 @@ pub async fn handle(req: ControlRequest) -> ControlResponse {
 				message: format!("rdp task failed: {e}"),
 			},
 		},
+		ControlRequest::FetchLogs { max_lines } => {
+			ControlResponse::Logs(crate::net::recent_logs(max_lines.map(|n| n as usize)))
+		}
+		ControlRequest::ProbePort { port } => ControlResponse::PortReachable(PortProbe {
+			reachable: probe_port(port).await,
+		}),
+		ControlRequest::EnableSsh => match crate::ssh_server::ensure().await {
+			Ok(embedded) => ControlResponse::Ssh(SshInfo {
+				port: embedded.port,
+				username: host::host_info().username,
+				private_key: embedded.private_key_openssh,
+			}),
+			Err(e) => ControlResponse::Error {
+				message: format!("starting embedded SSH server: {e}"),
+			},
+		},
 	}
+}
+
+/// Best-effort TCP reachability check for a loopback service on the agent host
+/// (e.g. the client's own SSH server). A short timeout keeps a filtered/dropped
+/// port from hanging the control request.
+async fn probe_port(port: u16) -> bool {
+	let connect = tokio::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, port));
+	matches!(tokio::time::timeout(Duration::from_secs(3), connect).await, Ok(Ok(_)))
 }
 
 fn status() -> AgentStatus {

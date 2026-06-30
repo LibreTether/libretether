@@ -130,9 +130,14 @@ Every method rides Tailscale straight to the client's private IP — no extra tu
   Remmina, GNOME Connections, or a custom command. Requirements: an RDP client on the
   **controller** (FreeRDP installed by `run setup`) and `gnome-remote-desktop` on **Linux
   clients** (installed by the deploy script). macOS has no built-in RDP server.
-- **SSH** — the **Connect via SSH** button opens your terminal running `ssh` to the client's
-  tailnet IP (as the agent's user). The client needs `sshd`; pick your terminal under
-  **Connection → Host tools** (or it auto-detects gnome-terminal/konsole/xterm/…).
+- **SSH** — the **Connect via SSH** button opens your terminal running `ssh` to the client (as
+  the agent's user). **No SSH server needed on the client:** if one is already listening it's
+  used as-is, otherwise LibreTether falls back to a **built-in SSH server the agent runs
+  in-process** — so SSH works on any machine, including a stock Windows box, with nothing to
+  install or enable. The built-in server binds loopback only, is reached through the same
+  authenticated tunnel as everything else, and accepts a single ephemeral key the controller
+  generates per connect. Pick your terminal under **Connection → Host tools** (or it
+  auto-detects gnome-terminal/konsole/xterm/…).
 
 ### Security
 
@@ -170,7 +175,8 @@ This is an early build. What works today:
 - ✅ **Live screen control** — streamed frames with mouse + keyboard takeover
 - ✅ **Wayland support** via XDG portals (X11 still supported too)
 - ✅ **RDP connect** — one-click into gnome-remote-desktop / Windows RDP, your choice of viewer
-- ✅ **SSH connect** — one-click terminal session to the client over the tailnet
+- ✅ **SSH connect** — one-click terminal session; uses the client's `sshd` if present, else a built-in server the agent runs, so no SSH server needs installing
+- ✅ **Logs** — in-app Logs page with live controller activity plus on-demand agent logs, filterable by level and searchable
 - ✅ **Relay mode** — `libretether-relay` on a cloud host routes between controller and clients (control plane + RDP/SSH tunneled), so neither end is exposed
 
 Releases publish the `libretether-agent` and `libretether-relay` binaries for every platform

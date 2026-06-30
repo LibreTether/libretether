@@ -113,6 +113,21 @@ export interface Frame {
 	data_base64: string
 }
 
+// ---------------------------------------------------------------- logs
+
+/** Mirrors the Rust `LogLevel` enum (serde snake_case). */
+export type LogLevel = "error" | "warn" | "info" | "debug" | "trace"
+
+/** A single log line shown on the Logs page. Controller lines arrive live via the
+ *  `logs:entry` event; agent lines are fetched on demand. `source` is "controller"
+ *  / "tunnel" for the app itself, or the client's name for an agent's log. */
+export interface LogEntry {
+	ts_secs: number
+	level: LogLevel
+	source: string
+	message: string
+}
+
 export type MouseButton = "left" | "right" | "middle"
 
 /** Mirrors the Rust `InputEvent` enum (serde tag "t", snake_case). */

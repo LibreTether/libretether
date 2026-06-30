@@ -2,6 +2,7 @@ import { fileURLToPath, URL } from "node:url"
 import tailwindcss from "@tailwindcss/vite"
 import react from "@vitejs/plugin-react"
 import { defineConfig } from "vite"
+import { version } from "./package.json"
 
 const host = process.env.TAURI_DEV_HOST
 
@@ -16,6 +17,11 @@ export default defineConfig(async () => ({
 
 	// Tauri expects a fixed port, fail if that port is not available
 	clearScreen: false,
+	// Surface the package version to the app (e.g. the controller-select footer)
+	// without a runtime IPC round-trip — it's baked in at build time.
+	define: {
+		__APP_VERSION__: JSON.stringify(version)
+	},
 	plugins: [react(), tailwindcss()],
 
 	resolve: {

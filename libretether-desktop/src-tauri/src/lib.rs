@@ -3,6 +3,7 @@ mod deploy;
 mod error;
 mod launch;
 mod link;
+mod logbook;
 mod rdp;
 mod registry;
 mod server;
@@ -43,6 +44,8 @@ pub fn run() {
 			// Hand the state an app handle so it can emit change events. No
 			// controller serves until the user selects one on the launch screen.
 			state.set_app(app.handle().clone());
+			// And the logbook, so controller log lines stream to the Logs page live.
+			logbook::set_app(app.handle().clone());
 			// Put the native window controls where the user's desktop wants them.
 			window::honor_button_layout(app.handle());
 			Ok(())
@@ -72,6 +75,8 @@ pub fn run() {
 			commands::connect_rdp,
 			commands::connect_ssh,
 			commands::save_text_file,
+			commands::get_controller_logs,
+			commands::client_logs,
 		])
 		.run(tauri::generate_context!())
 		.expect("error while running LibreTether");

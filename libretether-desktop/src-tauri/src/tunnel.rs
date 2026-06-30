@@ -100,18 +100,18 @@ async fn accept_loop(listener: TcpListener, link: AgentLink, remote_port: u16, a
 				let link = link.clone();
 				tauri::async_runtime::spawn(async move {
 					if let Err(e) = forward(link, remote_port, tcp).await {
-						eprintln!("[libretether] tunnel forward error: {e}");
+						crate::logbook::warn("tunnel", &format!("forward error: {e}"));
 					}
 				});
 			}
 			Err(e) => {
 				consecutive_errors += 1;
 				if consecutive_errors >= MAX_CONSECUTIVE_ACCEPT_ERRORS {
-					eprintln!("[libretether] tunnel accept gave up after repeated errors: {e}");
+					crate::logbook::error("tunnel", &format!("accept gave up after repeated errors: {e}"));
 					alive.store(false, Ordering::Relaxed);
 					return;
 				}
-				eprintln!("[libretether] tunnel accept error (retrying): {e}");
+				crate::logbook::warn("tunnel", &format!("accept error (retrying): {e}"));
 				tokio::time::sleep(ACCEPT_RETRY_DELAY).await;
 			}
 		}

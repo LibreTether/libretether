@@ -16,7 +16,8 @@ use libretether_protocol::crypto::{self, Identity};
 use libretether_protocol::frame::{read_frame_capped, write_frame, MAX_CONTROL_FRAME};
 use libretether_protocol::relay::{client_handshake, RelayRole};
 use libretether_protocol::{
-	tls, Challenge, ControlRequest, Hello, HelloAck, SessionGrant, StreamAuth, StreamOpen, PROTOCOL_VERSION,
+	tls, Challenge, ControlRequest, Hello, HelloAck, LogLevel, LogLine, LogsResult, SessionGrant, StreamAuth,
+	StreamOpen, PROTOCOL_VERSION,
 };
 use quinn::{Endpoint, RecvStream, SendStream};
 
@@ -39,6 +40,52 @@ const RECONNECT_STABLE_SECS: u64 = 30;
 
 static LOG_FILE: OnceLock<Mutex<std::fs::File>> = OnceLock::new();
 
+/// How many recent log lines the agent keeps in memory for [`ControlRequest::FetchLogs`].
+/// Older lines are evicted (and the snapshot's `dropped` flag is set) so the buffer
+/// can't grow without bound regardless of how long the agent has been running.
+const LOG_BUFFER_CAP: usize = 2000;
+
+/// In-memory ring of recent log lines, served to the controller's Logs page via
+/// `FetchLogs`. Separate from `agent.log` (which is the on-disk mirror) so the
+/// controller can read logs over the link without touching the client's disk.
+#[derive(Default)]
+struct LogRing {
+	lines: std::collections::VecDeque<LogLine>,
+	dropped: bool,
+}
+
+impl LogRing {
+	/// Append `line`, evicting the oldest and flagging `dropped` once `cap` is reached.
+	fn push(&mut self, line: LogLine, cap: usize) {
+		if self.lines.len() >= cap {
+			self.lines.pop_front();
+			self.dropped = true;
+		}
+		self.lines.push_back(line);
+	}
+
+	/// The most recent `max` lines (all when `None`), oldest first.
+	fn snapshot(&self, max: Option<usize>) -> LogsResult {
+		let take = max.unwrap_or(self.lines.len()).min(self.lines.len());
+		LogsResult {
+			lines: self.lines.iter().skip(self.lines.len() - take).cloned().collect(),
+			dropped: self.dropped,
+		}
+	}
+}
+
+fn log_ring() -> &'static Mutex<LogRing> {
+	static RING: OnceLock<Mutex<LogRing>> = OnceLock::new();
+	RING.get_or_init(|| Mutex::new(LogRing::default()))
+}
+
+/// Snapshot the most recent `max` log lines (all of them when `max` is `None`),
+/// oldest first. `dropped` is true if the ring has evicted lines at any point, so
+/// the controller can flag that the returned history is partial.
+pub fn recent_logs(max: Option<usize>) -> LogsResult {
+	log_ring().lock().unwrap().snapshot(max)
+}
+
 /// Mirror logs to `agent.log` next to the config. A Windows scheduled task (and
 /// detached service starts in general) has no console, so without this there is
 /// nowhere to see why the agent failed to connect. Truncated on each start so it
@@ -55,7 +102,15 @@ fn init_log_file(cfg_path: &Path) {
 	}
 }
 
+/// Record an info-level line. Most call sites use this; reach for [`log_at`] only
+/// where the line is a warning or an error worth filtering on in the Logs page.
 pub fn log(msg: &str) {
+	log_at(LogLevel::Info, msg);
+}
+
+/// Record a line at `level`: print it, mirror it to `agent.log`, and push it onto
+/// the in-memory ring the controller can fetch.
+pub fn log_at(level: LogLevel, msg: &str) {
 	let line = format!("[libretether-agent] {msg}");
 	eprintln!("{line}");
 	if let Some(file) = LOG_FILE.get() {
@@ -63,6 +118,14 @@ pub fn log(msg: &str) {
 			let _ = writeln!(file, "{line}");
 		}
 	}
+	log_ring().lock().unwrap().push(
+		LogLine {
+			ts_secs: host::now_secs(),
+			level,
+			message: msg.to_string(),
+		},
+		LOG_BUFFER_CAP,
+	);
 }
 
 /// Load config and run the connect/serve loop until a shutdown signal arrives.
@@ -92,7 +155,7 @@ async fn connect_loop(cfg: &mut AgentConfig, cfg_path: &Path) {
 		// resets the backoff; a fast failure keeps growing it.
 		let started = Instant::now();
 		if let Err(e) = connect_once(cfg, cfg_path).await {
-			log(&format!("connection error: {e:#}"));
+			log_at(LogLevel::Error, &format!("connection error: {e:#}"));
 		}
 		if started.elapsed() >= Duration::from_secs(RECONNECT_STABLE_SECS) {
 			backoff.reset();
@@ -190,7 +253,10 @@ async fn serve(conn: quinn::Connection, cfg: &mut AgentConfig, cfg_path: &Path) 
 		cfg.enrollment_token = None;
 		cfg.client_id = client_id;
 		if let Err(e) = cfg.save(cfg_path) {
-			log(&format!("warning: could not persist enrolled config: {e}"));
+			log_at(
+				LogLevel::Warn,
+				&format!("warning: could not persist enrolled config: {e}"),
+			);
 		}
 	}
 
@@ -331,7 +397,7 @@ async fn authed(recv: &mut RecvStream, tokens: &Mutex<HashSet<String>>) -> bool 
 	};
 	let ok = tokens.lock().unwrap().contains(&auth.token);
 	if !ok {
-		log("rejected stream: missing or invalid capability token");
+		log_at(LogLevel::Warn, "rejected stream: missing or invalid capability token");
 	}
 	ok
 }
@@ -350,7 +416,7 @@ async fn reauth(
 ) {
 	match verify_and_grant(&mut send, &mut recv, identity, None, controller_key, tokens).await {
 		Ok(client_id) => log(&format!("re-authenticated as client {}", client_id.unwrap_or_default())),
-		Err(e) => log(&format!("controller re-auth rejected: {e:#}")),
+		Err(e) => log_at(LogLevel::Warn, &format!("controller re-auth rejected: {e:#}")),
 	}
 }
 
@@ -369,7 +435,7 @@ async fn tunnel(port: u16, mut q_send: SendStream, q_recv: RecvStream) {
 			pipe_bidirectional(q_recv, q_send, tcp_read, tcp_write).await;
 		}
 		Err(e) => {
-			log(&format!("tunnel to 127.0.0.1:{port} failed: {e}"));
+			log_at(LogLevel::Warn, &format!("tunnel to 127.0.0.1:{port} failed: {e}"));
 			let _ = q_send.finish();
 		}
 	}
@@ -379,6 +445,39 @@ async fn tunnel(port: u16, mut q_send: SendStream, q_recv: RecvStream) {
 mod tests {
 	use super::*;
 	use std::net::Ipv4Addr;
+
+	fn line(ts: u64, msg: &str) -> LogLine {
+		LogLine {
+			ts_secs: ts,
+			level: LogLevel::Info,
+			message: msg.into(),
+		}
+	}
+
+	// The ring keeps the most recent `cap` lines and flags `dropped` once it has
+	// evicted anything; `snapshot(max)` returns the newest `max`, oldest first.
+	#[test]
+	fn log_ring_caps_evicts_oldest_and_snapshots_recent() {
+		let mut ring = LogRing::default();
+		for i in 0..5 {
+			ring.push(line(i, &format!("m{i}")), 3);
+		}
+		// Cap 3 → only the last three survive, and an eviction happened.
+		let all = ring.snapshot(None);
+		assert!(all.dropped);
+		assert_eq!(
+			all.lines.iter().map(|l| l.message.as_str()).collect::<Vec<_>>(),
+			["m2", "m3", "m4"],
+		);
+		// `max` returns the newest N, still oldest-first.
+		let tail = ring.snapshot(Some(2));
+		assert_eq!(
+			tail.lines.iter().map(|l| l.message.as_str()).collect::<Vec<_>>(),
+			["m3", "m4"],
+		);
+		// A fresh ring reports nothing dropped.
+		assert!(!LogRing::default().snapshot(None).dropped);
+	}
 
 	/// A connected QUIC pair over loopback using the project's real transport
 	/// config. Returns `(controller_endpoint, controller_conn, agent_endpoint,

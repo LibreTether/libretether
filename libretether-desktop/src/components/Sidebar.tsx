@@ -1,13 +1,14 @@
-import { LogOut, MonitorSmartphone, Plug, type Radio } from "lucide-react"
+import { LogOut, MonitorSmartphone, Plug, type Radio, ScrollText } from "lucide-react"
 import { cn } from "../lib/cn"
 import { CONTROLLER_TYPE_META } from "../lib/meta"
 import type { ActiveInfo } from "../lib/types"
 
-export type Page = "machines" | "controller"
+export type Page = "machines" | "controller" | "logs"
 
 const NAV: { id: Page; label: string; icon: typeof Radio }[] = [
 	{ icon: MonitorSmartphone, id: "machines", label: "Machines" },
-	{ icon: Plug, id: "controller", label: "Connection" }
+	{ icon: Plug, id: "controller", label: "Connection" },
+	{ icon: ScrollText, id: "logs", label: "Logs" }
 ]
 
 export function Sidebar({

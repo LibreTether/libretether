@@ -25,6 +25,12 @@ whoami = "1"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 xcap = "0.3"
 enigo = "0.3"
+# Embedded SSH server: russh on the `ring` backend (matching the rest of the
+# workspace — avoids pulling aws-lc-rs's cmake/C build into release cross-compiles),
+# plus portable-pty for a ConPTY (Windows) / PTY (Unix) shell behind it.
+russh = { version = "0.61", default-features = false, features = ["ring"] }
+portable-pty = "0.9"
+rand = "0.9"
 
 # Wayland support (XDG desktop portals + PipeWire) is Linux-only and always
 # built in there. `ashpd` is pure D-Bus; `pipewire`/`libspa` bind libpipewire, so

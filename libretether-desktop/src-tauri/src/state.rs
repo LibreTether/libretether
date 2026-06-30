@@ -257,7 +257,10 @@ impl ActiveController {
 		};
 		if let Some((path, raw)) = snapshot {
 			if let Err(e) = libretether_protocol::secret::write_str(path, &raw) {
-				eprintln!("[libretether] warning: failed to persist registry after {context}: {e}");
+				crate::logbook::warn(
+					"controller",
+					&format!("failed to persist registry after {context}: {e}"),
+				);
 			}
 		}
 		result
@@ -323,14 +326,17 @@ impl AppState {
 						// Don't silently swallow a corrupt profile — a controller
 						// vanishing from the list with no trace is worse than a noisy
 						// log the operator can act on (re-create / restore).
-						Err(e) => eprintln!(
-							"[libretether] skipping unreadable controller at {}: {e}",
-							path.display()
+						Err(e) => crate::logbook::warn(
+							"controller",
+							&format!("skipping unreadable controller at {}: {e}", path.display()),
 						),
 					},
 					// A directory without a readable controller.json isn't a profile.
 					Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-					Err(e) => eprintln!("[libretether] could not read controller at {}: {e}", path.display()),
+					Err(e) => crate::logbook::warn(
+						"controller",
+						&format!("could not read controller at {}: {e}", path.display()),
+					),
 				}
 			}
 		}

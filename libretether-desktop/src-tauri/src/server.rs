@@ -47,7 +47,15 @@ const RELAY_READ_TIMEOUT: Duration = Duration::from_secs(20);
 static LIVE_GEN: AtomicU64 = AtomicU64::new(1);
 
 fn log(msg: &str) {
-	eprintln!("[libretether] {msg}");
+	crate::logbook::info("controller", msg);
+}
+
+fn log_warn(msg: &str) {
+	crate::logbook::warn("controller", msg);
+}
+
+fn log_err(msg: &str) {
+	crate::logbook::error("controller", msg);
 }
 
 /// Log a relay-connection line and mirror it to the UI's connecting screen.
@@ -65,7 +73,7 @@ pub async fn serve(state: AppState, ctrl: Arc<ActiveController>) {
 	let (cert, key) = match ctrl.profile.cert_key_der() {
 		Ok(ck) => ck,
 		Err(e) => {
-			log(&format!("invalid controller certificate: {e}"));
+			log_err(&format!("invalid controller certificate: {e}"));
 			return;
 		}
 	};
@@ -79,7 +87,7 @@ pub async fn serve(state: AppState, ctrl: Arc<ActiveController>) {
 	let endpoint = match Endpoint::server(tls::server_config(cert, key), SocketAddr::from(([0, 0, 0, 0], port))) {
 		Ok(ep) => ep,
 		Err(e) => {
-			log(&format!("could not listen on udp/{port}: {e}"));
+			log_err(&format!("could not listen on udp/{port}: {e}"));
 			return;
 		}
 	};
@@ -90,7 +98,7 @@ pub async fn serve(state: AppState, ctrl: Arc<ActiveController>) {
 		let ctrl = ctrl.clone();
 		tauri::async_runtime::spawn(async move {
 			if let Err(e) = handle_direct(state, ctrl, incoming).await {
-				log(&format!("connection error: {e}"));
+				log_err(&format!("connection error: {e}"));
 			}
 		});
 	}
@@ -121,7 +129,7 @@ pub async fn serve_relay(state: AppState, ctrl: Arc<ActiveController>) {
 			address, owner_secret, ..
 		} => (address.clone(), owner_secret.clone()),
 		_ => {
-			log("relay serve started for a non-relay controller");
+			log_err("relay serve started for a non-relay controller");
 			return;
 		}
 	};
@@ -197,7 +205,7 @@ async fn relay_session(
 				let link = AgentLink::relay(conn.clone(), public_key.clone());
 				tauri::async_runtime::spawn(async move {
 					if let Err(e) = enroll_and_register(&state, &ctrl, link).await {
-						log(&format!("enroll via relay failed: {e}"));
+						log_err(&format!("enroll via relay failed: {e}"));
 					}
 					enrolling.lock().unwrap().remove(&public_key);
 				});
@@ -352,7 +360,7 @@ async fn reject(send: &mut quinn::SendStream, reason: &str) {
 	)
 	.await;
 	let _ = send.finish();
-	log(&format!("rejected agent: {reason}"));
+	log_warn(&format!("rejected agent: {reason}"));
 }
 
 /// Open a one-shot control stream to an agent, send `req`, and read the response.

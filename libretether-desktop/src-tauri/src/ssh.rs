@@ -1,21 +1,51 @@
 //! Launch a terminal running `ssh` to a client over the tailnet.
 
+use std::path::Path;
 use std::process::Command;
 
 use crate::error::{AppError, AppResult};
 
+/// The platform's null device, used as `UserKnownHostsFile` so the agent's
+/// ephemeral embedded-server host key is never recorded or checked.
+#[cfg(windows)]
+const NULL_DEVICE: &str = "NUL";
+#[cfg(not(windows))]
+const NULL_DEVICE: &str = "/dev/null";
+
 /// Open a terminal SSH session to `username@host:port`. `terminal_pref` is an
 /// optional launcher template like "gnome-terminal --" or "xterm -e"; empty =
 /// auto-detect a terminal emulator.
-pub fn launch(terminal_pref: Option<&str>, host: &str, port: u16, username: &str) -> AppResult<()> {
-	let ssh: Vec<String> = vec![
-		"ssh".into(),
-		"-o".into(),
-		"StrictHostKeyChecking=accept-new".into(),
-		"-p".into(),
-		port.to_string(),
-		format!("{username}@{host}"),
-	];
+///
+/// `identity` is set when connecting to the agent's built-in SSH server: it points
+/// at the ephemeral private key, and we then skip host-key verification (the host
+/// key is freshly generated and reached over the authenticated tunnel) and offer
+/// only that key.
+pub fn launch(
+	terminal_pref: Option<&str>,
+	host: &str,
+	port: u16,
+	username: &str,
+	identity: Option<&Path>,
+) -> AppResult<()> {
+	let mut ssh: Vec<String> = vec!["ssh".into()];
+	if let Some(key) = identity {
+		ssh.push("-i".into());
+		ssh.push(key.to_string_lossy().into_owned());
+		ssh.push("-o".into());
+		ssh.push("IdentitiesOnly=yes".into());
+		ssh.push("-o".into());
+		ssh.push("StrictHostKeyChecking=no".into());
+		ssh.push("-o".into());
+		ssh.push(format!("UserKnownHostsFile={NULL_DEVICE}"));
+		ssh.push("-o".into());
+		ssh.push("PreferredAuthentications=publickey".into());
+	} else {
+		ssh.push("-o".into());
+		ssh.push("StrictHostKeyChecking=accept-new".into());
+	}
+	ssh.push("-p".into());
+	ssh.push(port.to_string());
+	ssh.push(format!("{username}@{host}"));
 
 	#[cfg(target_os = "linux")]
 	{

@@ -104,7 +104,9 @@ function Invoke-Agent {
 	param([string[]]$AgentArgs)
 	$p = Start-Process -FilePath $Bin -ArgumentList $AgentArgs -NoNewWindow -Wait -PassThru
 	if ($p.ExitCode -ne 0) {
-		throw "agent '$($AgentArgs[0])' failed (exit $($p.ExitCode)); see $BinDir\agent.log"
+		# The agent writes its log next to its config (dirs::config_dir()), i.e.
+		# %APPDATA%\libretether-agent, NOT next to the binary.
+		throw "agent '$($AgentArgs[0])' failed (exit $($p.ExitCode)); see $env:APPDATA\libretether-agent\agent.log"
 	}
 }
 

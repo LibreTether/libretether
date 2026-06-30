@@ -24,6 +24,7 @@ mod pwstream;
 mod rdp;
 mod service;
 mod session;
+mod ssh_server;
 #[cfg(target_os = "linux")]
 mod wayland;
 mod x11env;

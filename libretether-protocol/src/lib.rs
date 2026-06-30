@@ -29,8 +29,10 @@ pub const ALPN: &[u8] = b"libretether/1";
 /// `Challenge.controller_key` + `HelloAck.controller_sig`); v3 made the version
 /// check mutual too — `Challenge.protocol` lets the agent reject a
 /// version-mismatched controller, mirroring the controller's `Hello.protocol`
-/// check, so a skew fails closed on *both* ends (no compatibility shims).
-pub const PROTOCOL_VERSION: u32 = 3;
+/// check, so a skew fails closed on *both* ends (no compatibility shims); v4
+/// added the [`ControlRequest::FetchLogs`] RPC so the controller can pull an
+/// agent's recent log buffer.
+pub const PROTOCOL_VERSION: u32 = 4;
 
 /// Default UDP port the controller listens on for incoming agents.
 pub const DEFAULT_PORT: u16 = 47600;
@@ -164,6 +166,25 @@ pub enum ControlRequest {
 	},
 	/// Turn on an RDP server on the client and return how to reach it.
 	EnableRdp,
+	/// Start (if needed) the agent's built-in SSH server and return how to reach it
+	/// — a loopback port plus an ephemeral private key. Used as a fallback so SSH
+	/// works even on a client with no system SSH server installed.
+	EnableSsh,
+	/// Return the agent's recent in-memory log lines (most recent last), capped at
+	/// `max_lines` when set. Lets the controller surface a client's agent log
+	/// without shelling into the machine.
+	FetchLogs {
+		max_lines: Option<u32>,
+	},
+	/// Check whether something is listening on `127.0.0.1:port` on the agent host.
+	/// The controller uses this to confirm a client's SSH server is actually up
+	/// before launching a terminal. Having the agent probe its own loopback makes
+	/// the check end-to-end in both direct and relay mode — a controller-side TCP
+	/// connect would, in relay mode, only reach the always-accepting local tunnel
+	/// listener and so couldn't tell a live server from a closed port.
+	ProbePort {
+		port: u16,
+	},
 }
 
 /// The matching response, written back on the same stream.
@@ -175,7 +196,61 @@ pub enum ControlResponse {
 	Exec(ExecResult),
 	Screenshot(ScreenshotResult),
 	Rdp(RdpInfo),
+	Ssh(SshInfo),
+	Logs(LogsResult),
+	PortReachable(PortProbe),
 	Error { message: String },
+}
+
+/// How to reach the agent's built-in SSH server (see [`ControlRequest::EnableSsh`]).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SshInfo {
+	/// Loopback port the agent's embedded SSH server listens on. The controller
+	/// reaches it through a tunnel (the server binds 127.0.0.1 only).
+	pub port: u16,
+	/// Username to connect as. The embedded server authenticates by key, not by OS
+	/// account, but the client's shell runs as the user the agent runs as.
+	pub username: String,
+	/// OpenSSH-format ephemeral private key the controller must use (`ssh -i`) to
+	/// authenticate. Regenerated per agent run; valid only for this server instance.
+	pub private_key: String,
+}
+
+/// Result of a [`ControlRequest::ProbePort`]: whether the loopback port had
+/// something listening. A struct (not a bare `bool`) because the internally-tagged
+/// `ControlResponse` can only carry map-like variants.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PortProbe {
+	pub reachable: bool,
+}
+
+/// Severity of a single log line, shared by the agent's log buffer and the
+/// controller's so the UI can filter both by the same levels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LogLevel {
+	Error,
+	Warn,
+	Info,
+	Debug,
+	Trace,
+}
+
+/// One buffered log line. `ts_secs` is Unix seconds when it was recorded.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LogLine {
+	pub ts_secs: u64,
+	pub level: LogLevel,
+	pub message: String,
+}
+
+/// The agent's recent log lines, oldest first. `dropped` is true when the ring
+/// buffer evicted older lines before this snapshot, so the UI can flag that the
+/// history is partial.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LogsResult {
+	pub lines: Vec<LogLine>,
+	pub dropped: bool,
 }
 
 /// How to reach the RDP server the agent just enabled.
@@ -436,6 +511,9 @@ mod tests {
 			},
 			ControlRequest::Screenshot { display: Some(1) },
 			ControlRequest::EnableRdp,
+			ControlRequest::EnableSsh,
+			ControlRequest::FetchLogs { max_lines: Some(500) },
+			ControlRequest::ProbePort { port: 22 },
 		] {
 			let json = serde_json::to_string(&req).unwrap();
 			let back: ControlRequest = serde_json::from_str(&json).unwrap();
@@ -453,6 +531,39 @@ mod tests {
 		let resp = ControlResponse::Error { message: "boom".into() };
 		let back: ControlResponse = round_trip(&resp);
 		assert!(matches!(back, ControlResponse::Error { message } if message == "boom"));
+
+		// FetchLogs / Logs carry the shared LogLine shape; the level tag and order
+		// must survive the round-trip.
+		let logs = ControlResponse::Logs(LogsResult {
+			lines: vec![
+				LogLine {
+					ts_secs: 100,
+					level: LogLevel::Info,
+					message: "starting".into(),
+				},
+				LogLine {
+					ts_secs: 101,
+					level: LogLevel::Warn,
+					message: "tunnel to 127.0.0.1:22 failed".into(),
+				},
+			],
+			dropped: true,
+		});
+		let back: ControlResponse = round_trip(&logs);
+		let ControlResponse::Logs(r) = back else {
+			panic!("expected Logs");
+		};
+		assert!(r.dropped);
+		assert_eq!(r.lines.len(), 2);
+		assert_eq!(r.lines[1].level, LogLevel::Warn);
+		assert_eq!(r.lines[1].message, "tunnel to 127.0.0.1:22 failed");
+
+		// The probe response carries a reachability flag.
+		let probe = ControlResponse::PortReachable(PortProbe { reachable: true });
+		assert!(matches!(
+			round_trip(&probe),
+			ControlResponse::PortReachable(PortProbe { reachable: true })
+		));
 	}
 
 	#[test]

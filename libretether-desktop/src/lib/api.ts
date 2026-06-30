@@ -11,6 +11,7 @@ import type {
 	ExecResult,
 	Frame,
 	InputEvent,
+	LogEntry,
 	ScreenshotResult,
 	SessionMeta,
 	Settings
@@ -55,6 +56,10 @@ export const selectController = (id: string) => invoke<ActiveInfo>("select_contr
 export const exitController = () => invoke<void>("exit_controller")
 export const activeController = () => invoke<ActiveInfo | null>("active_controller")
 
+// ---------------------------------------------------------------- logs
+export const getControllerLogs = () => invoke<LogEntry[]>("get_controller_logs")
+export const clientLogs = (id: string, maxLines?: number) => invoke<LogEntry[]>("client_logs", { id, maxLines })
+
 // ---------------------------------------------------------------- settings
 export const getSettings = () => invoke<Settings>("get_settings")
 export const setSettings = (rdpClient: string | null, terminal: string | null) =>
@@ -66,6 +71,8 @@ export const onClientsChanged = (cb: () => void): Promise<UnlistenFn> => listen(
 export const onControllerLog = (cb: (line: string) => void): Promise<UnlistenFn> =>
 	listen<string>("controller:log", (e) => cb(e.payload))
 export const onControllerConnected = (cb: () => void): Promise<UnlistenFn> => listen("controller:connected", () => cb())
+export const onLogEntry = (cb: (entry: LogEntry) => void): Promise<UnlistenFn> =>
+	listen<LogEntry>("logs:entry", (e) => cb(e.payload))
 export const onSessionFrame = (id: string, cb: (f: Frame) => void): Promise<UnlistenFn> =>
 	listen<Frame>(`session:frame:${id}`, (e) => cb(e.payload))
 export const onSessionMeta = (id: string, cb: (m: SessionMeta) => void): Promise<UnlistenFn> =>

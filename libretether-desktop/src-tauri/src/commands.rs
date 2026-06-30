@@ -515,7 +515,7 @@ pub async fn client_exec(
 	// Audit the remote command (this is an arbitrary-command surface by design):
 	// log the target and program + arg count, but not the argument values, which
 	// can carry secrets. Mirrors the connection-event logging in `server.rs`.
-	eprintln!("[libretether] exec on {id}: {program} ({} args)", args.len());
+	crate::logbook::info("controller", &format!("exec on {id}: {program} ({} args)", args.len()));
 	expect_response!(
 		&conn,
 		&ControlRequest::Exec {
@@ -612,39 +612,91 @@ pub async fn connect_rdp(state: State<'_, AppState>, id: String) -> AppResult<()
 	crate::rdp::launch(pref.as_deref(), &host, port, &username, password.as_deref())
 }
 
-/// Probe that something is listening at `host:port` (through the tunnel in relay
-/// mode) before launching a terminal — otherwise `ssh` just flashes open and
-/// closes with no explanation when the client has no SSH server.
-///
-/// A successful TCP connect is enough: requiring the SSH banner byte would
-/// false-negative on servers configured to wait for the client to speak first
-/// (`Banner none`, some bastions), turning a working SSH target into a refusal.
-async fn ssh_reachable(host: &str, port: u16) -> bool {
-	let connect = tokio::net::TcpStream::connect((host, port));
-	matches!(
-		tokio::time::timeout(std::time::Duration::from_secs(6), connect).await,
-		Ok(Ok(_))
-	)
-}
-
-/// Open a terminal SSH session to a client.
+/// Open a terminal SSH session to a client. Prefers a real SSH server on the
+/// client; if none is listening, falls back to the agent's built-in server so SSH
+/// works even on a machine with no `sshd` installed (e.g. a stock Windows box).
 #[tauri::command]
 pub async fn connect_ssh(state: State<'_, AppState>, id: String) -> AppResult<()> {
 	let state = state.inner().clone();
 	let (ctrl, id) = active_and_id(&state, &id)?;
 	let conn = ctrl.connection(id).ok_or(AppError::Offline)?;
 	let status = expect_response!(&conn, &ControlRequest::Status, ControlResponse::Status)?;
-	let (host, port) = client_endpoint(&ctrl, id, &conn, status.tailscale_ip.clone(), 22).await?;
-	let host = safe_host(&host)?;
-	let username = safe_username(&status.host.username)?;
-	if !ssh_reachable(&host, port).await {
-		return Err(AppError::msg(format!(
-			"Couldn't reach an SSH server on {}. Make sure an SSH server (e.g. openssh-server) is installed and running on the client.",
-			status.host.hostname
-		)));
-	}
 	let terminal = state.0.settings.lock().unwrap().terminal.clone();
-	crate::ssh::launch(terminal.as_deref(), &host, port, &username)
+
+	// Ask the agent whether a system SSH server is listening on its own loopback.
+	// Having the agent probe is end-to-end in both direct and relay mode — a
+	// controller-side TCP connect would, in relay mode, only reach the
+	// always-accepting local tunnel listener and couldn't tell a live server apart.
+	let probe = expect_response!(
+		&conn,
+		&ControlRequest::ProbePort { port: 22 },
+		ControlResponse::PortReachable
+	)?;
+	if probe.reachable {
+		// A real SSH server is present — reach it as before (direct IP, or a tunnel
+		// to port 22 in relay mode) and let the client's own credentials apply.
+		let (host, port) = client_endpoint(&ctrl, id, &conn, status.tailscale_ip.clone(), 22).await?;
+		let host = safe_host(&host)?;
+		let username = safe_username(&status.host.username)?;
+		return crate::ssh::launch(terminal.as_deref(), &host, port, &username, None);
+	}
+
+	// No system SSH server: start the agent's built-in one and connect to it with
+	// the ephemeral key it returns. It binds loopback only, so we always tunnel to
+	// it (even in direct mode, which normally dials the client's address directly).
+	let info = expect_response!(&conn, &ControlRequest::EnableSsh, ControlResponse::Ssh)?;
+	let username = safe_username(&info.username)?;
+	let key_path = write_ephemeral_key(id, &info.private_key)?;
+	let local = crate::tunnel::open(&ctrl, id, conn.clone(), info.port).await?;
+	crate::ssh::launch(terminal.as_deref(), "127.0.0.1", local, &username, Some(&key_path))
+}
+
+/// Persist the embedded SSH server's ephemeral private key (owner-only) so the
+/// launched `ssh` process can read it via `-i`. Keyed by client id and overwritten
+/// each connect so it doesn't accumulate; the terminal outlives this call, so the
+/// file must stay on disk afterwards.
+fn write_ephemeral_key(id: Uuid, pem: &str) -> AppResult<std::path::PathBuf> {
+	let path = std::env::temp_dir().join("libretether-ssh").join(format!("{id}.key"));
+	libretether_protocol::secret::write_str(&path, pem).map_err(AppError::Io)?;
+	Ok(path)
+}
+
+/// The controller's own recent log lines (oldest first), to seed the Logs page.
+/// Live updates arrive via the `logs:entry` event.
+#[tauri::command]
+pub async fn get_controller_logs() -> Vec<crate::logbook::LogEntry> {
+	crate::logbook::entries(None)
+}
+
+/// Fetch a connected client's recent agent-log lines, normalised into the same
+/// [`crate::logbook::LogEntry`] shape as the controller's own logs (tagged with
+/// the client's name as the source) so the Logs page can show both together.
+#[tauri::command]
+pub async fn client_logs(
+	state: State<'_, AppState>,
+	id: String,
+	max_lines: Option<u32>,
+) -> AppResult<Vec<crate::logbook::LogEntry>> {
+	let (ctrl, uuid) = active_and_id(state.inner(), &id)?;
+	let conn = ctrl.connection(uuid).ok_or(AppError::Offline)?;
+	let source = ctrl
+		.store
+		.lock()
+		.unwrap()
+		.get(uuid)
+		.map(|c| c.name.clone())
+		.unwrap_or_else(|| "agent".to_string());
+	let result = expect_response!(&conn, &ControlRequest::FetchLogs { max_lines }, ControlResponse::Logs)?;
+	Ok(result
+		.lines
+		.into_iter()
+		.map(|l| crate::logbook::LogEntry {
+			ts_secs: l.ts_secs,
+			level: l.level,
+			source: source.clone(),
+			message: l.message,
+		})
+		.collect())
 }
 
 #[tauri::command]
@@ -1092,6 +1144,15 @@ mod tests {
 				hostname: None,
 			},
 			&["installed", "running", "address", "hostname"],
+		);
+		assert_fields(
+			crate::logbook::LogEntry {
+				ts_secs: 0,
+				level: libretether_protocol::LogLevel::Info,
+				source: "controller".into(),
+				message: "hi".into(),
+			},
+			&["ts_secs", "level", "source", "message"],
 		);
 	}
 

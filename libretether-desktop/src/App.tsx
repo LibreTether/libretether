@@ -8,6 +8,7 @@ import { ToastProvider, useToast } from "./lib/toast"
 import type { ActiveInfo, ClientDto } from "./lib/types"
 import { ConnectionPage } from "./pages/ConnectionPage"
 import { ControllerSelect } from "./pages/ControllerSelect"
+import { LogsPage } from "./pages/LogsPage"
 import { MachinesPage } from "./pages/MachinesPage"
 
 function Shell({ active, onExit }: { active: ActiveInfo; onExit: () => void }) {
@@ -51,6 +52,7 @@ function Shell({ active, onExit }: { active: ActiveInfo; onExit: () => void }) {
 					<MachinesPage clients={clients} loading={loading} onControl={setControl} onReload={reload} />
 				)}
 				{page === "controller" && <ConnectionPage active={active} />}
+				{page === "logs" && <LogsPage clients={clients} />}
 			</main>
 
 			{control && <ControlOverlay client={control} onClose={() => setControl(null)} />}
