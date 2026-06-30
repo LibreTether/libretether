@@ -25,8 +25,8 @@ pub fn uninstall() -> Result<()> {
 	platform::uninstall()
 }
 
-// Used by the Linux/macOS installers; the Windows path writes the registry + spawns
-// directly, so it's dead there.
+// Used by the Linux/macOS installers; the Windows path writes the registry directly,
+// so it's dead there.
 #[cfg_attr(target_os = "windows", allow(dead_code))]
 fn run(cmd: &mut Command) -> Result<()> {
 	// Capture output (not inherit) so the underlying tool's own error — e.g. what
@@ -156,8 +156,6 @@ mod platform {
 
 #[cfg(target_os = "windows")]
 mod platform {
-	use std::process::Stdio;
-
 	use winreg::enums::{HKEY_CURRENT_USER, KEY_WRITE};
 	use winreg::RegKey;
 
@@ -187,19 +185,15 @@ mod platform {
 			.no_window()
 			.status();
 
-		// Start it now (detached, no window, no inherited handles) so the machine is
-		// reachable immediately rather than only after the next logon.
-		Command::new(exe)
-			.arg("run")
-			.arg("--config")
-			.arg(config)
-			.stdin(Stdio::null())
-			.stdout(Stdio::null())
-			.stderr(Stdio::null())
-			.no_window()
-			.spawn()
-			.context("starting the agent")?;
-		println!("Installed per-user autostart (HKCU Run) and started the agent.");
+		// Deliberately do NOT start the agent here. The installer runs `install` under
+		// `Start-Process -Wait -RedirectStandardOutput`; a long-lived child (`agent
+		// run`) would inherit that redirected output handle and keep it open forever,
+		// hanging the installer on a stream that never reaches EOF. Starting "now" is
+		// the caller's job — the installer fire-and-forgets it; a manual install can run
+		// `libretether-agent run`. Either way the Run key starts it at the next logon.
+		println!(
+			"Installed per-user autostart (HKCU Run); it starts at logon. Run `libretether-agent run` to start it now."
+		);
 		Ok(())
 	}
 

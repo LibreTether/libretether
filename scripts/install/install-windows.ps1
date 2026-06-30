@@ -209,6 +209,12 @@ if ($Code) {
 }
 Invoke-Agent @('install')
 
+# Start the agent now (fire-and-forget) so the machine is reachable before the next
+# logon. NOT via Invoke-Agent: `run` never exits, and -Wait/-Redirect on a process
+# that outlives the installer would hang the script. The agent is a GUI-subsystem
+# binary, so it gets no console window and outlives this one.
+Start-Process -FilePath $Bin -ArgumentList 'run' -WindowStyle Hidden
+
 # 4. Enable RDP (unless opted out).
 if (-not $NoRdp) { Enable-RemoteDesktop }
 
