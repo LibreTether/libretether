@@ -2,9 +2,10 @@ import { RefreshCw } from "lucide-react"
 import { useCallback, useEffect, useState } from "react"
 import * as api from "../lib/api"
 import { formatUptime } from "../lib/format"
-import type { AgentStatus, ClientDto } from "../lib/types"
+import type { ActiveInfo, AgentStatus, ClientDto } from "../lib/types"
 import { useAsyncAction } from "../lib/useAsyncAction"
 import { OsIcon, osLabel } from "./OsIcon"
+import { SecurityPanel } from "./SecurityPanel"
 import { Button, Drawer } from "./ui"
 
 function StatusGrid({ status, showTailscale }: { status: AgentStatus; showTailscale: boolean }) {
@@ -42,13 +43,14 @@ export function DetailDrawer({
 	open,
 	onClose,
 	client,
-	showTailscale
+	active
 }: {
 	open: boolean
 	onClose: () => void
 	client: ClientDto
-	showTailscale: boolean
+	active: ActiveInfo
 }) {
+	const showTailscale = active.kind.type === "tailscale"
 	const [status, setStatus] = useState<AgentStatus | null>(client.status)
 	const statusAction = useAsyncAction()
 
@@ -76,31 +78,35 @@ export function DetailDrawer({
 			subtitle={client.online ? `${osLabel(client.os)} · online` : `${osLabel(client.os)} · offline`}
 			title={client.name}
 		>
-			{!client.online ? (
-				<p className="py-10 text-center text-sm text-muted">
-					This machine is offline. Connect it to inspect it.
-				</p>
-			) : (
-				<section className="flex flex-col gap-2.5">
-					<div className="flex items-center justify-between">
-						<div className="eyebrow">Status</div>
-						<Button
-							icon={<RefreshCw className="h-3.5 w-3.5" />}
-							loading={statusAction.busy}
-							onClick={refresh}
-							size="sm"
-							variant="ghost"
-						>
-							Refresh
-						</Button>
-					</div>
-					{status ? (
-						<StatusGrid showTailscale={showTailscale} status={status} />
-					) : (
-						<p className="text-sm text-subtle">Loading…</p>
-					)}
-				</section>
-			)}
+			<div className="flex flex-col gap-6">
+				{client.online ? (
+					<section className="flex flex-col gap-2.5">
+						<div className="flex items-center justify-between">
+							<div className="eyebrow">Status</div>
+							<Button
+								icon={<RefreshCw className="h-3.5 w-3.5" />}
+								loading={statusAction.busy}
+								onClick={refresh}
+								size="sm"
+								variant="ghost"
+							>
+								Refresh
+							</Button>
+						</div>
+						{status ? (
+							<StatusGrid showTailscale={showTailscale} status={status} />
+						) : (
+							<p className="text-sm text-subtle">Loading…</p>
+						)}
+					</section>
+				) : (
+					<p className="rounded-xl border border-border border-dashed bg-surface-2 px-3.5 py-3 text-center text-sm text-muted">
+						Offline — connect this machine to read its live status.
+					</p>
+				)}
+
+				<SecurityPanel active={active} client={client} />
+			</div>
 		</Drawer>
 	)
 }

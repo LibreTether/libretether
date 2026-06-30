@@ -31,6 +31,10 @@ export interface ClientDto {
 	online: boolean
 	last_seen: number | null
 	status: AgentStatus | null
+	/** The agent's Ed25519 public key (base64), set at enrollment — its stable
+	 *  identity, and what every connection's signature is checked against. `null`
+	 *  until the machine enrolls. */
+	public_key: string | null
 }
 
 export interface CreateClientResult {
@@ -68,6 +72,12 @@ export interface ActiveInfo {
 	name: string
 	kind: ControllerKind
 	fingerprint: string
+	/** The controller's full Ed25519 public key (base64) — the `controller_key`
+	 *  every agent pins and checks the controller's signature against. */
+	public_key: string
+	/** The wire protocol version this controller speaks; controller and agents
+	 *  must match exactly. */
+	protocol_version: number
 	reachable_at: string | null
 	tailscale: TailscaleInfo | null
 }

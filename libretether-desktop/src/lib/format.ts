@@ -1,3 +1,10 @@
+/** Short, human-comparable fingerprint of a base64 Ed25519 key: its first 12
+ *  characters. Matches the backend's `ControllerProfile::fingerprint()`, so the
+ *  same key reads identically wherever it's shown. */
+export function fingerprint(publicKey: string): string {
+	return publicKey.slice(0, 12)
+}
+
 /** Human-readable duration from seconds, e.g. "3d 4h", "12m". */
 export function formatUptime(secs: number): string {
 	if (secs <= 0) return "0s"

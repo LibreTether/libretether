@@ -17,12 +17,13 @@ import {
 import { useEffect, useMemo, useRef, useState } from "react"
 import { Menu } from "../components/Menu"
 import { OsIcon, osLabel } from "../components/OsIcon"
+import { SecurityBadge } from "../components/SecurityPanel"
 import { Button, EmptyState, Input, Spinner, StatusDot } from "../components/ui"
 import * as api from "../lib/api"
 import { cn } from "../lib/cn"
 import { formatUptime, relativeTime, tokenizeCommand } from "../lib/format"
 import { useHotkeys } from "../lib/hotkeys"
-import type { ClientDto, ExecResult } from "../lib/types"
+import type { ActiveInfo, ClientDto, ControllerKind, ExecResult } from "../lib/types"
 import { useAsyncAction } from "../lib/useAsyncAction"
 import type { useMachineActions } from "../lib/useMachineActions"
 
@@ -37,6 +38,7 @@ function dotState(c: ClientDto): "online" | "offline" | "pending" {
 export function MachinesPage({
 	clients,
 	loading,
+	active,
 	onControl,
 	onWatch,
 	onDetail,
@@ -46,6 +48,7 @@ export function MachinesPage({
 }: {
 	clients: ClientDto[]
 	loading: boolean
+	active: ActiveInfo
 	onControl: (c: ClientDto) => void
 	onWatch: (c: ClientDto) => void
 	onDetail: (c: ClientDto) => void
@@ -109,7 +112,8 @@ export function MachinesPage({
 			{ combo: "w", handler: () => selected?.online && onWatch(selected) },
 			{ combo: "s", handler: () => selected?.online && actions.ssh(selected) },
 			{ combo: "r", handler: () => selected?.online && actions.rdp(selected) },
-			{ combo: "d", handler: () => selected?.online && onDetail(selected) }
+			// Details (incl. the security/identity panel) are worth opening even offline.
+			{ combo: "d", handler: () => selected && onDetail(selected) }
 		],
 		hotkeysEnabled
 	)
@@ -192,6 +196,7 @@ export function MachinesPage({
 								client={c}
 								index={i}
 								key={c.id}
+								kind={active.kind}
 								onControl={() => onControl(c)}
 								onDetail={() => onDetail(c)}
 								onSelect={() => setSelectedId(c.id)}
@@ -210,6 +215,7 @@ function MachineRow({
 	client,
 	selected,
 	index,
+	kind,
 	onSelect,
 	onControl,
 	onWatch,
@@ -219,6 +225,7 @@ function MachineRow({
 	client: ClientDto
 	selected: boolean
 	index: number
+	kind: ControllerKind
 	onSelect: () => void
 	onControl: () => void
 	onWatch: () => void
@@ -287,8 +294,11 @@ function MachineRow({
 				</div>
 
 				<div className="min-w-0 flex-1">
-					<div className="truncate font-semibold text-text" title={client.name}>
-						{client.name}
+					<div className="flex items-center gap-2">
+						<span className="truncate font-semibold text-text" title={client.name}>
+							{client.name}
+						</span>
+						<SecurityBadge client={client} kind={kind} />
 					</div>
 					<div
 						className={cn(
@@ -369,7 +379,6 @@ function MachineRow({
 						<Menu
 							items={[
 								{
-									disabled: offline,
 									icon: <Info className="h-4 w-4" />,
 									key: "info",
 									label: "Info",

@@ -46,6 +46,7 @@ const CLIENTS: ClientDto[] = [
 		name: "office-imac",
 		online: true,
 		os: "macos",
+		public_key: "Lq3mZ8t1Rv0KpN7sXyB2dWfE5hUcA9gJ6oQ4nT0bIk=",
 		status: status({
 			arch: "arm64",
 			displays: 2,
@@ -64,6 +65,7 @@ const CLIENTS: ClientDto[] = [
 		name: "build-box",
 		online: true,
 		os: "linux",
+		public_key: "9fK2pXwQ7mLcV4nB1tR8sZ0aY6eH3jD5uG7oI2kN0xM=",
 		status: status({
 			displays: 1,
 			hostname: "buildbox",
@@ -81,6 +83,7 @@ const CLIENTS: ClientDto[] = [
 		name: "win-laptop",
 		online: true,
 		os: "windows",
+		public_key: "Pz5rT8wQ2mC4vB7nX1kL9sA0dY6eH3jF5uG8oI2bN4xW=",
 		status: status({
 			displays: 3,
 			hostname: "DESKTOP-7F2K",
@@ -98,6 +101,7 @@ const CLIENTS: ClientDto[] = [
 		name: "nas",
 		online: false,
 		os: "linux",
+		public_key: "Aa1bB2cC3dD4eE5fF6gG7hH8iI9jJ0kK1lL2mM3nN4o=",
 		status: null
 	},
 	{
@@ -108,6 +112,7 @@ const CLIENTS: ClientDto[] = [
 		name: "new-mini",
 		online: false,
 		os: "linux",
+		public_key: null,
 		status: null
 	}
 ]
@@ -137,10 +142,12 @@ const CONTROLLERS: ControllerSummary[] = [
 ]
 
 const ACTIVE: ActiveInfo = {
-	fingerprint: "a1b2 c3d4 e5f6 7890",
+	fingerprint: "Ctrl0KeyZ9x8",
 	id: "c1",
 	kind: { auth_key: "tskey-auth-demo", listen_port: 47600, type: "tailscale" },
 	name: "Home lab",
+	protocol_version: 5,
+	public_key: "Ctrl0KeyZ9x8W7v6U5t4S3r2Q1p0O9n8M7l6K5j4H3g=",
 	reachable_at: "100.74.10.1:47600",
 	tailscale: { address: "100.74.10.1", hostname: "home-lab", installed: true, running: true }
 }
@@ -218,6 +225,7 @@ export function mockInvoke(cmd: string, args?: Record<string, unknown>): Promise
 					name,
 					online: false,
 					os: (args?.os as ClientDto["os"]) ?? "linux",
+					public_key: null,
 					status: null
 				},
 				deploy_script: deployScript(name)

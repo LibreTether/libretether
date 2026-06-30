@@ -1,7 +1,7 @@
-import { writeText } from "@tauri-apps/plugin-clipboard-manager"
-import { Copy, Eye, EyeOff, Fingerprint, Network, Save, ScreenShare, Server, Wifi, WifiOff } from "lucide-react"
+import { Fingerprint, Lock, Network, Save, ScreenShare, Server, ShieldCheck, Wifi, WifiOff } from "lucide-react"
 import { useEffect, useState } from "react"
 import { Combobox } from "../components/Combobox"
+import { CopyRow } from "../components/CopyRow"
 import { PageHeader } from "../components/PageHeader"
 import { Badge, Button, Field, Input } from "../components/ui"
 import * as api from "../lib/api"
@@ -10,39 +10,6 @@ import type { ActiveInfo, RdpMode } from "../lib/types"
 import { useAsyncAction } from "../lib/useAsyncAction"
 
 const PRESET_MODES: RdpMode[] = ["auto", "freerdp", "remmina", "gnome-connections"]
-
-/** A copyable value. For `secret` values the text is masked behind a reveal
- *  toggle and the copy confirmation doesn't echo the value (it would otherwise
- *  land in the toast and clipboard-history for a high-value credential). */
-function CopyRow({ value, secret = false }: { value: string; secret?: boolean }) {
-	const toast = useToast()
-	const [revealed, setRevealed] = useState(false)
-	const masked = secret && !revealed
-	const copy = () =>
-		writeText(value)
-			.then(() => toast.success("Copied", secret ? "Copied to clipboard." : value))
-			.catch((e) => toast.error("Copy failed", api.errString(e)))
-	return (
-		<div className="flex items-center gap-2 rounded-xl border border-border bg-surface-2 px-3.5 py-2.5">
-			<code className="flex-1 truncate font-mono text-[0.82rem] text-text">
-				{masked ? "•".repeat(Math.min(value.length, 24)) : value}
-			</code>
-			{secret && (
-				<Button
-					icon={revealed ? <EyeOff className="h-3.5 w-3.5" /> : <Eye className="h-3.5 w-3.5" />}
-					onClick={() => setRevealed((r) => !r)}
-					size="sm"
-					variant="ghost"
-				>
-					{revealed ? "Hide" : "Show"}
-				</Button>
-			)}
-			<Button icon={<Copy className="h-3.5 w-3.5" />} onClick={copy} size="sm" variant="ghost">
-				Copy
-			</Button>
-		</div>
-	)
-}
 
 function SectionTitle({ icon, children }: { icon: React.ReactNode; children: React.ReactNode }) {
 	return (
@@ -206,15 +173,29 @@ export function ConnectionPage({ active }: { active: ActiveInfo }) {
 						</div>
 					</section>
 
-					<section className="card flex items-center gap-4 p-5">
-						<div className="grid h-11 w-11 shrink-0 place-items-center rounded-xl bg-surface-2 text-primary dark:text-primary-strong">
-							<Fingerprint className="h-5 w-5" />
+					<section className="card flex flex-col gap-4 p-5">
+						<SectionTitle icon={<ShieldCheck className="h-5 w-5" />}>Security</SectionTitle>
+						<div className="flex flex-wrap gap-1.5">
+							<Badge className="gap-1" tone="success">
+								<Lock className="h-3 w-3" /> Encrypted (QUIC · TLS 1.3)
+							</Badge>
+							<Badge className="gap-1" tone="success">
+								<ShieldCheck className="h-3 w-3" /> Mutual Ed25519 auth
+							</Badge>
+							<Badge tone="neutral">Protocol v{active.protocol_version}</Badge>
 						</div>
-						<div className="min-w-0 flex-1">
-							<div className="eyebrow">Identity</div>
-							<div className="mt-0.5 text-sm text-muted">
-								Controller fingerprint <code className="font-mono text-text">{active.fingerprint}</code>
-							</div>
+						<p className="text-sm text-muted">
+							Every machine authenticates this controller against the key below (the{" "}
+							<code className="font-mono text-text">controller_key</code> baked into its deploy command),
+							and the controller verifies each agent's signature against the key it pinned at enrollment.
+							It's mutual, and there's no trust-on-first-use.
+						</p>
+						<Field label="Controller identity key (agents pin this)">
+							<CopyRow value={active.public_key} />
+						</Field>
+						<div className="flex items-center gap-2 text-sm text-muted">
+							<Fingerprint className="h-4 w-4 text-primary dark:text-primary-strong" />
+							Fingerprint <code className="font-mono text-text">{active.fingerprint}</code>
 						</div>
 					</section>
 				</div>

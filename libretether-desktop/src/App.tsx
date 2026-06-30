@@ -188,11 +188,10 @@ function Shell({ active, onExit }: { active: ActiveInfo; onExit: () => void }) {
 					run: () => actions.rdp(c)
 				},
 				{
-					disabled: !c.online,
 					group: c.name,
 					icon: <SlidersHorizontal className="h-4 w-4" />,
 					id: `det:${c.id}`,
-					keywords: `details status command screenshot ${kw}`,
+					keywords: `details status security identity command screenshot ${kw}`,
 					label: "Open details",
 					run: () => setDetailId(c.id)
 				},
@@ -223,6 +222,7 @@ function Shell({ active, onExit }: { active: ActiveInfo; onExit: () => void }) {
 				{page === "machines" && (
 					<MachinesPage
 						actions={actions}
+						active={active}
 						clients={clients}
 						hotkeysEnabled={!controlling && !overlayOpen}
 						loading={loading}
@@ -240,13 +240,7 @@ function Shell({ active, onExit }: { active: ActiveInfo; onExit: () => void }) {
 			<ShortcutsOverlay onClose={() => setShortcutsOpen(false)} open={shortcutsOpen} />
 			<AddMachineDrawer onClose={() => setAddOpen(false)} onCreated={reload} open={addOpen} />
 			{detail && (
-				<DetailDrawer
-					client={detail}
-					key={detail.id}
-					onClose={() => setDetailId(null)}
-					open
-					showTailscale={active.kind.type === "tailscale"}
-				/>
+				<DetailDrawer active={active} client={detail} key={detail.id} onClose={() => setDetailId(null)} open />
 			)}
 			{deploy && (
 				<Drawer

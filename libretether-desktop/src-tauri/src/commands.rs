@@ -3,7 +3,8 @@
 //! currently-active controller (and errors if none is connected).
 
 use libretether_protocol::{
-	AgentStatus, ControlRequest, ControlResponse, ExecResult, InputEvent, ScreenshotResult, SessionConfig, DEFAULT_PORT,
+	AgentStatus, ControlRequest, ControlResponse, ExecResult, InputEvent, ScreenshotResult, SessionConfig,
+	DEFAULT_PORT, PROTOCOL_VERSION,
 };
 use serde::Serialize;
 use tauri::State;
@@ -44,6 +45,11 @@ pub struct ClientDto {
 	pub online: bool,
 	pub last_seen: Option<u64>,
 	pub status: Option<AgentStatus>,
+	/// The agent's Ed25519 public key (base64), recorded at enrollment — its stable
+	/// identity, and what the controller verifies every connection's signature
+	/// against. `None` until the machine has enrolled. The UI shows it (and a short
+	/// fingerprint derived from it) on the machine's security panel.
+	pub public_key: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -71,6 +77,15 @@ pub struct ActiveInfo {
 	pub name: String,
 	pub kind: ControllerKind,
 	pub fingerprint: String,
+	/// The controller's full Ed25519 public key (base64) — the `controller_key`
+	/// every agent pins at deploy time and checks the controller's signature
+	/// against on each connection (mutual auth, no trust-on-first-use). Surfaced so
+	/// the UI can show what the agents are pinned to.
+	pub public_key: String,
+	/// The wire [`PROTOCOL_VERSION`] this controller speaks. Controller and agents
+	/// must match exactly (a skew fails the handshake closed); shown in the UI's
+	/// security read-out.
+	pub protocol_version: u32,
 	/// host:port agents dial (direct/tailscale), or the relay address.
 	pub reachable_at: Option<String>,
 	/// Present only for Tailscale controllers.
@@ -93,6 +108,7 @@ fn to_dto(client: &Client, online: bool, status: Option<AgentStatus>) -> ClientD
 		online,
 		last_seen: client.last_seen,
 		status,
+		public_key: client.public_key.clone(),
 	}
 }
 
@@ -360,6 +376,8 @@ async fn active_info(ctrl: &ActiveController) -> ActiveInfo {
 		name: p.name.clone(),
 		kind: p.kind.clone(),
 		fingerprint: p.fingerprint(),
+		public_key: p.public_key(),
+		protocol_version: PROTOCOL_VERSION,
 		reachable_at,
 		tailscale,
 	}
@@ -1109,6 +1127,7 @@ mod tests {
 			online: false,
 			last_seen: None,
 			status: None,
+			public_key: None,
 		};
 		assert_fields(
 			&client,
@@ -1121,6 +1140,7 @@ mod tests {
 				"online",
 				"last_seen",
 				"status",
+				"public_key",
 			],
 		);
 		assert_fields(
@@ -1151,10 +1171,21 @@ mod tests {
 				name: "n".into(),
 				kind,
 				fingerprint: "fp".into(),
+				public_key: "pk".into(),
+				protocol_version: PROTOCOL_VERSION,
 				reachable_at: None,
 				tailscale: None,
 			},
-			&["id", "name", "kind", "fingerprint", "reachable_at", "tailscale"],
+			&[
+				"id",
+				"name",
+				"kind",
+				"fingerprint",
+				"public_key",
+				"protocol_version",
+				"reachable_at",
+				"tailscale",
+			],
 		);
 		assert_fields(
 			SettingsDto {

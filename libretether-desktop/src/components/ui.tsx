@@ -78,11 +78,14 @@ export function StatusDot({ state, className }: { state: "online" | "offline" | 
 export function Badge({
 	children,
 	className,
-	tone = "neutral"
+	tone = "neutral",
+	title
 }: {
 	children: ReactNode
 	className?: string
 	tone?: "neutral" | "success" | "warning" | "danger" | "primary" | "accent"
+	/** Native tooltip text — handy for a compact badge whose full meaning doesn't fit. */
+	title?: string
 }) {
 	const tones = {
 		accent: "bg-accent/12 text-accent",
@@ -99,6 +102,7 @@ export function Badge({
 				tones[tone],
 				className
 			)}
+			title={title}
 		>
 			{children}
 		</span>
