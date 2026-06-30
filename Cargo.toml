@@ -16,24 +16,11 @@ members = [
 version = "0.25.0"
 
 # Applied workspace-wide (the relay/agent binaries and the desktop bundle all
-# ship from `--release`). Tuned for *release build time*, not binary size: the
-# desktop Tauri bundle has a huge dependency graph, and the old size-optimized
-# settings (fat LTO + a single codegen unit) turned its final link into the
-# dominant cost of cutting a release.
-#
-#   - lto = false        fat LTO is one mostly-serial whole-program link pass;
-#                        dropping it is by far the biggest build-time win.
-#   - codegen-units = 16 restores intra-crate parallelism (1 forced every crate
-#                        through a single, unparallelizable codegen unit).
-#   - opt-level = 2      the conventional release level; "s" only paid off while
-#                        we were chasing binary size, which we no longer are.
-#
-# Bigger binaries are an accepted trade — we optimize for how fast a release
-# builds, not how small it ships. panic = "abort" / strip stay: both are cheap
-# and trim a little link/codegen work rather than adding any.
+# ship from `--release`), matching the profile that previously lived on the
+# desktop crate when it was the workspace root.
 [profile.release]
 panic = "abort"
-codegen-units = 16
-lto = false
-opt-level = 2
+codegen-units = 1
+lto = true
+opt-level = "s"
 strip = true
