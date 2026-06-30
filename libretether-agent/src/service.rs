@@ -2,8 +2,9 @@
 //! machine stays reachable whenever it's powered on.
 //!
 //! Screen capture and input injection must run inside the user's graphical
-//! session, so on every platform we install a *per-user* service (systemd user
-//! unit / LaunchAgent / logon scheduled task), not a system-wide daemon.
+//! session, so on every platform we install a *per-user* autostart (systemd user
+//! unit / LaunchAgent / HKCU `Run` entry), not a system-wide daemon — which also
+//! means none of it needs elevation.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -24,6 +25,9 @@ pub fn uninstall() -> Result<()> {
 	platform::uninstall()
 }
 
+// Used by the Linux/macOS installers; the Windows path writes the registry + spawns
+// directly, so it's dead there.
+#[cfg_attr(target_os = "windows", allow(dead_code))]
 fn run(cmd: &mut Command) -> Result<()> {
 	// Capture output (not inherit) so the underlying tool's own error — e.g. what
 	// `schtasks`/`systemctl`/`launchctl` actually complained about — is in the error
@@ -152,34 +156,67 @@ mod platform {
 
 #[cfg(target_os = "windows")]
 mod platform {
+	use std::process::Stdio;
+
+	use winreg::enums::{HKEY_CURRENT_USER, KEY_WRITE};
+	use winreg::RegKey;
+
 	use super::*;
 
-	const TASK: &str = "LibreTetherAgent";
+	// Autostart via the per-user HKCU Run key, *not* the Task Scheduler. The installer
+	// runs non-elevated (a double-clicked .bat / `irm | iex` gets the filtered standard
+	// token), and `schtasks /Create` can't write the task store without elevation —
+	// it fails with "access denied". The Run key lives in the user's own hive: writable
+	// without elevation, and it launches the agent at logon in the interactive session,
+	// which is exactly what screen capture and input injection need.
+	const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
+	const VALUE: &str = "LibreTetherAgent";
+	// Legacy: older installs registered this scheduled task. Clean it up on (un)install.
+	const LEGACY_TASK: &str = "LibreTetherAgent";
 
 	pub fn install(exe: &Path, config: &Path) -> Result<()> {
-		// Run at logon in the interactive session so capture/input work.
-		let cmd = format!("\"{}\" run --config \"{}\"", exe.display(), config.display());
-		run(Command::new("schtasks").args([
-			"/Create", "/TN", TASK, "/SC", "ONLOGON", "/RL", "LIMITED", "/F", "/TR", &cmd,
-		]))?;
+		let command = format!("\"{}\" run --config \"{}\"", exe.display(), config.display());
+		let (run, _) = RegKey::predef(HKEY_CURRENT_USER)
+			.create_subkey(RUN_KEY)
+			.context("opening the HKCU Run key")?;
+		run.set_value(VALUE, &command).context("writing the autostart entry")?;
+
+		// A previous version may have left a scheduled task; remove it so we don't run twice.
 		let _ = Command::new("schtasks")
-			.args(["/Run", "/TN", TASK])
+			.args(["/Delete", "/TN", LEGACY_TASK, "/F"])
 			.no_window()
 			.status();
-		println!("Installed logon scheduled task: {TASK}");
+
+		// Start it now (detached, no window, no inherited handles) so the machine is
+		// reachable immediately rather than only after the next logon.
+		Command::new(exe)
+			.arg("run")
+			.arg("--config")
+			.arg(config)
+			.stdin(Stdio::null())
+			.stdout(Stdio::null())
+			.stderr(Stdio::null())
+			.no_window()
+			.spawn()
+			.context("starting the agent")?;
+		println!("Installed per-user autostart (HKCU Run) and started the agent.");
 		Ok(())
 	}
 
 	pub fn uninstall() -> Result<()> {
+		if let Ok(run) = RegKey::predef(HKEY_CURRENT_USER).open_subkey_with_flags(RUN_KEY, KEY_WRITE) {
+			let _ = run.delete_value(VALUE);
+		}
 		let _ = Command::new("schtasks")
-			.args(["/End", "/TN", TASK])
+			.args(["/Delete", "/TN", LEGACY_TASK, "/F"])
 			.no_window()
 			.status();
-		let _ = Command::new("schtasks")
-			.args(["/Delete", "/TN", TASK, "/F"])
+		// Stop a running agent (best-effort).
+		let _ = Command::new("taskkill")
+			.args(["/IM", "libretether-agent.exe", "/F"])
 			.no_window()
 			.status();
-		println!("Removed scheduled task: {TASK}");
+		println!("Removed per-user autostart (HKCU Run).");
 		Ok(())
 	}
 }

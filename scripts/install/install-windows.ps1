@@ -101,11 +101,11 @@ $BinDir = Join-Path $env:LOCALAPPDATA "LibreTether"
 $Bin = Join-Path $BinDir "libretether-agent.exe"
 Write-Host "==> LibreTether agent install for $Name"
 
-# Stop and remove any prior installation so the agent binary can be replaced.
-# Unlike Linux, Windows locks a running .exe, so downloading over it fails with
-# "being used by another process". End the logon task, kill the process, then
-# wait for the OS to release the file handle before we overwrite it.
-# (Task name mirrors TASK in libretether-agent/src/service.rs.)
+# Stop any prior installation so the agent binary can be replaced. Unlike Linux,
+# Windows locks a running .exe, so downloading over it fails with "being used by
+# another process". Kill the process, also tear down a legacy scheduled task from
+# older versions (the agent now autostarts via the HKCU Run key — see
+# libretether-agent/src/service.rs), then wait for the OS to release the handle.
 function Remove-ExistingAgent {
 	# Best-effort: a fresh machine has no task/process to remove, and schtasks
 	# writes "task not found" to stderr — which would otherwise throw under the
@@ -194,7 +194,7 @@ function Enable-RemoteDesktop {
 	}
 }
 
-# 3. Pair (portal code) or enroll (token), then register the logon task. In pair
+# 3. Pair (portal code) or enroll (token), then register per-user autostart. In pair
 #    mode the controller key + token arrive over the PAKE channel; in enroll mode the
 #    controller key (when supplied) pins the controller identity.
 if ($Code) {

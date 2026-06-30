@@ -41,7 +41,7 @@
 		],
 		"longDescription": "LibreTether is a self-hosted remote desktop controller. Enrol your machines with a one-click deployment script, reach them over your own private Tailscale mesh, check their status, run commands, take screenshots, and take over the screen with full mouse and keyboard control.",
 		"shortDescription": "Self-hosted remote desktop control over a private mesh",
-		"targets": "all"
+		"targets": ["deb", "rpm", "app", "dmg", "nsis", "msi"]
 	},
 	"identifier": "com.libretether.desktop",
 	"productName": "LibreTether",

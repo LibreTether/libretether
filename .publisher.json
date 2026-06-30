@@ -3,7 +3,6 @@
 	"input": {
 		"cache-dependency-path": "pnpm-lock.yaml",
 		"package-manager": "pnpm",
-		"post-build": "bash $(git rev-parse --show-toplevel)/scripts/fix-appimage.sh",
 		"project-path": "libretether-desktop",
 		"targets": [
 			{

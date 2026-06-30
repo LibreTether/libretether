@@ -161,7 +161,7 @@ capture and input injection must run inside the graphical session:
 |----|---------|-------|
 | Linux | systemd **user** unit (`libretether-agent.service`) | Needs the graphical session; X11 and Wayland are both supported (see below) |
 | macOS | **LaunchAgent** (`com.libretether.agent`) | Requires Screen Recording + Accessibility permissions (granted once in System Settings) |
-| Windows | logon **scheduled task** (`LibreTetherAgent`) | Runs in the interactive console session |
+| Windows | per-user **autostart** (HKCU `Run` → `LibreTetherAgent`) | Runs at logon in the interactive session; no elevation needed |
 
 ### X11 and Wayland
 

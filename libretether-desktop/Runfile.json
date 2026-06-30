@@ -5,13 +5,7 @@
 	},
 	"targets": {
 		"build": {
-			"commands": [
-				"tauri build {{ ARGS }}",
-				{
-					"if": "{{ RUN.os == 'linux' }}",
-					"then": "@fix-appimage"
-				}
-			],
+			"commands": "tauri build {{ ARGS }}",
 			"description": "Build the production controller bundle for the current OS"
 		},
 		"build:universal": {
@@ -36,10 +30,6 @@
 		"dev:web": {
 			"commands": "vite",
 			"description": "Run only the Vite dev server (UI preview; Tauri APIs unavailable)"
-		},
-		"fix-appimage": {
-			"commands": "bash ../scripts/fix-appimage.sh",
-			"description": "Repack built AppImages with a valid .DirIcon so file managers show the icon"
 		},
 		"icons": {
 			"commands": "tauri icon public/libretether.png",

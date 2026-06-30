@@ -46,6 +46,9 @@ ashpd = { version = "0.13", default-features = false, features = ["tokio", "remo
 pipewire = "0.10"
 libspa = "0.10"
 
+[target.'cfg(target_os = "windows")'.dependencies]
+winreg = "0.56.0"
+
 # Windows live capture goes through DXGI Desktop Duplication (persistent,
 # GPU-accelerated, only wakes on screen change) instead of xcap's per-frame GDI
 # BitBlt, which was the dominant cost on Windows. Same `windows` version/features
