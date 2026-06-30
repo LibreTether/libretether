@@ -11,13 +11,15 @@
 //! bidirectional QUIC stream per request (see [`ControlRequest`]). Live screen
 //! control uses a single long-lived bidirectional stream that is full-duplex:
 //! the controller writes [`SessionClient`] events while the agent writes
-//! [`SessionServer`] frames (see the `session` module types below).
+//! [`SessionServer`] control messages interleaved with binary [`video`] frames
+//! (see the session types below and the [`video`] module).
 
 pub mod crypto;
 pub mod frame;
 pub mod relay;
 pub mod secret;
 pub mod tls;
+pub mod video;
 
 use serde::{Deserialize, Serialize};
 
@@ -31,8 +33,10 @@ pub const ALPN: &[u8] = b"libretether/1";
 /// version-mismatched controller, mirroring the controller's `Hello.protocol`
 /// check, so a skew fails closed on *both* ends (no compatibility shims); v4
 /// added the [`ControlRequest::FetchLogs`] RPC so the controller can pull an
-/// agent's recent log buffer.
-pub const PROTOCOL_VERSION: u32 = 4;
+/// agent's recent log buffer; v5 replaced the JSON+base64 live-session `Frame`
+/// with binary, tile-delta [`video`] frames and added `SessionConfig.scale` +
+/// the [`SessionClient::Configure`] live-quality control.
+pub const PROTOCOL_VERSION: u32 = 5;
 
 /// Default UDP port the controller listens on for incoming agents.
 pub const DEFAULT_PORT: u16 = 47600;
@@ -251,6 +255,11 @@ pub struct LogLine {
 pub struct LogsResult {
 	pub lines: Vec<LogLine>,
 	pub dropped: bool,
+	/// The agent's wall clock (Unix seconds) when it took this snapshot. The
+	/// controller re-anchors every line's `ts_secs` to its own clock using
+	/// `controller_now - agent_now_secs`, so a client in another timezone or with a
+	/// skewed clock still renders at the correct local time alongside other logs.
+	pub agent_now_secs: u64,
 }
 
 /// How to reach the RDP server the agent just enabled.
@@ -306,14 +315,38 @@ pub struct ScreenshotResult {
 
 // ---------------------------------------------------------------- live session
 
-/// Quality/format knobs for a live screen-control session.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Quality/format knobs for a live screen-control session. Can be set at
+/// [`SessionClient::Start`] and changed live with [`SessionClient::Configure`].
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct SessionConfig {
 	pub display: u32,
 	/// JPEG quality, 1–100.
 	pub quality: u8,
 	/// Upper bound on frames per second the agent should emit.
 	pub max_fps: u8,
+	/// Resolution scale as a percentage, 10–100. The agent downscales each
+	/// capture by this factor before encoding, trading sharpness for a smaller,
+	/// cheaper-to-encode frame. 100 = native resolution.
+	pub scale: u8,
+	/// Adaptive mode. When set, the agent treats `scale` as a ceiling and lowers
+	/// the effective scale automatically when it can't keep up (slow encode or a
+	/// congested link), restoring it as conditions clear — "reduce quality to keep
+	/// it smooth" without the controller babysitting it.
+	pub auto: bool,
+}
+
+impl SessionConfig {
+	/// Clamp every knob into its valid range. Applied on the agent before use so a
+	/// malformed or hostile config can't drive a divide-by-zero or a wild allocation.
+	pub fn sanitized(self) -> Self {
+		Self {
+			display: self.display,
+			quality: self.quality.clamp(1, 100),
+			max_fps: self.max_fps.clamp(1, 60),
+			scale: self.scale.clamp(10, 100),
+			auto: self.auto,
+		}
+	}
 }
 
 impl Default for SessionConfig {
@@ -321,7 +354,9 @@ impl Default for SessionConfig {
 		Self {
 			display: 0,
 			quality: 70,
-			max_fps: 20,
+			max_fps: 30,
+			scale: 100,
+			auto: false,
 		}
 	}
 }
@@ -337,43 +372,29 @@ impl Default for SessionConfig {
 pub enum SessionClient {
 	Start(SessionConfig),
 	Input(InputEvent),
-	/// Ask for a fresh full frame (e.g. after the UI resized).
+	/// Change quality/fps/scale on a running session. The agent applies it on the
+	/// next frame and emits a fresh keyframe so the new settings take effect cleanly.
+	Configure(SessionConfig),
+	/// Ask for a fresh full keyframe (e.g. after the UI resized).
 	Refresh,
 	Stop,
 }
 
-/// Agent → controller, multiplexed on the session stream.
+/// Agent → controller control messages on the session stream. The high-rate
+/// video frames travel as binary [`video`] frames alongside these, not as JSON
+/// (see [`video::read_inbound`]).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "t", rename_all = "snake_case")]
 pub enum SessionServer {
-	/// Sent once at start and whenever the captured geometry changes.
+	/// Sent once at start and whenever the captured (source) geometry changes.
 	Meta {
 		display: u32,
 		width: u32,
 		height: u32,
 	},
-	Frame(Frame),
 	Error {
 		message: String,
 	},
-}
-
-/// A single captured frame. Coordinates and sizes are in source pixels.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Frame {
-	pub seq: u64,
-	pub width: u32,
-	pub height: u32,
-	pub encoding: FrameEncoding,
-	/// Frame payload (JPEG/PNG bytes), base64-encoded.
-	pub data_base64: String,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum FrameEncoding {
-	Jpeg,
-	Png,
 }
 
 /// Pointer buttons the controller can drive.
@@ -548,6 +569,7 @@ mod tests {
 				},
 			],
 			dropped: true,
+			agent_now_secs: 200,
 		});
 		let back: ControlResponse = round_trip(&logs);
 		let ControlResponse::Logs(r) = back else {

@@ -64,12 +64,15 @@ impl LogRing {
 		self.lines.push_back(line);
 	}
 
-	/// The most recent `max` lines (all when `None`), oldest first.
+	/// The most recent `max` lines (all when `None`), oldest first. Stamps the
+	/// agent's current clock so the controller can re-anchor the line timestamps to
+	/// its own (the agent may be in another timezone or have a skewed clock).
 	fn snapshot(&self, max: Option<usize>) -> LogsResult {
 		let take = max.unwrap_or(self.lines.len()).min(self.lines.len());
 		LogsResult {
 			lines: self.lines.iter().skip(self.lines.len() - take).cloned().collect(),
 			dropped: self.dropped,
+			agent_now_secs: host::now_secs(),
 		}
 	}
 }

@@ -2,11 +2,12 @@
 //!
 //! Linux-only (needs `libpipewire-0.3-dev` at build time). Runs the PipeWire
 //! main loop on a dedicated thread, pulls frames from the portal's node,
-//! converts them to RGBA, JPEG-encodes them, and forwards them to the session
-//! writer.
+//! converts them to RGBA, and hands them to the shared [`crate::encode`] stage
+//! (which does the tile-delta JPEG encoding off this thread).
 
 use std::os::fd::OwnedFd;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{SyncSender, TrySendError};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -16,25 +17,21 @@ use pw::properties::properties;
 use pw::spa;
 use spa::param::video::{VideoFormat, VideoInfoRaw};
 use spa::pod::Pod;
-use tokio::sync::mpsc::Sender;
 
-use crate::capture::encode_jpeg;
-use crate::session::Encoded;
+use crate::encode::{RawFrame, SharedConfig};
 
 struct UserData {
 	format: VideoInfoRaw,
-	seq: u64,
 	last_emit: Option<Instant>,
-	min_interval: Duration,
-	quality: u8,
-	tx: Sender<Encoded>,
+	shared: Arc<SharedConfig>,
+	tx: SyncSender<RawFrame>,
 }
 
 /// Spawn the capture thread. Returns immediately; the thread exits when `stop`
 /// is set or the stream errors.
-pub fn spawn(fd: OwnedFd, node_id: u32, quality: u8, max_fps: u8, stop: Arc<AtomicBool>, tx: Sender<Encoded>) {
+pub fn spawn(fd: OwnedFd, node_id: u32, shared: Arc<SharedConfig>, stop: Arc<AtomicBool>, tx: SyncSender<RawFrame>) {
 	std::thread::spawn(move || {
-		if let Err(e) = run(fd, node_id, quality, max_fps, stop, tx) {
+		if let Err(e) = run(fd, node_id, shared, stop, tx) {
 			crate::net::log(&format!("pipewire capture ended: {e}"));
 		}
 	});
@@ -43,23 +40,19 @@ pub fn spawn(fd: OwnedFd, node_id: u32, quality: u8, max_fps: u8, stop: Arc<Atom
 fn run(
 	fd: OwnedFd,
 	node_id: u32,
-	quality: u8,
-	max_fps: u8,
+	shared: Arc<SharedConfig>,
 	stop: Arc<AtomicBool>,
-	tx: Sender<Encoded>,
+	tx: SyncSender<RawFrame>,
 ) -> Result<(), pw::Error> {
 	pw::init();
 	let mainloop = pw::main_loop::MainLoopRc::new(None)?;
 	let context = pw::context::ContextRc::new(&mainloop, None)?;
 	let core = context.connect_fd_rc(fd, None)?;
 
-	let fps = max_fps.clamp(1, 60) as u64;
 	let data = UserData {
 		format: VideoInfoRaw::default(),
-		seq: 0,
 		last_emit: None,
-		min_interval: Duration::from_millis(1000 / fps),
-		quality,
+		shared,
 		tx,
 	};
 
@@ -104,35 +97,32 @@ fn run(
 			if w == 0 || h == 0 || stride == 0 {
 				return;
 			}
-			// Frame-rate cap.
+			// Frame-rate cap (read live so a `Configure` takes effect immediately).
+			let min_interval = Duration::from_millis(1000 / user_data.shared.max_fps());
 			if let Some(last) = user_data.last_emit {
-				if last.elapsed() < user_data.min_interval {
+				if last.elapsed() < min_interval {
 					return;
 				}
 			}
 			let format = user_data.format.format();
 			let Some(bytes) = data.data() else { return };
 			if let Some(rgba) = to_rgba(bytes, stride, w, h, format) {
-				if let Ok(jpeg) = encode_jpeg(&rgba, user_data.quality) {
-					user_data.seq += 1;
-					let enc = Encoded {
-						seq: user_data.seq,
-						width: w,
-						height: h,
-						// The portal delivers one capture stream and absolute pointer
-						// motion references its node, so there is no virtual-desktop
-						// origin to offset by (unlike the multi-monitor X11 path).
-						origin_x: 0,
-						origin_y: 0,
-						jpeg,
-					};
-					match user_data.tx.try_send(enc) {
-						Ok(()) => user_data.last_emit = Some(Instant::now()),
-						Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-							let _ = stream.disconnect();
-						}
-						Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {} // drop, stay realtime
+				let raw = RawFrame {
+					width: w,
+					height: h,
+					// The portal delivers one capture stream and absolute pointer motion
+					// references its node, so there is no virtual-desktop origin to offset
+					// by (unlike the multi-monitor X11 path).
+					origin_x: 0,
+					origin_y: 0,
+					rgba,
+				};
+				match user_data.tx.try_send(raw) {
+					Ok(()) => user_data.last_emit = Some(Instant::now()),
+					Err(TrySendError::Disconnected(_)) => {
+						let _ = stream.disconnect();
 					}
+					Err(TrySendError::Full(_)) => {} // encoder busy — drop, stay realtime
 				}
 			}
 		})

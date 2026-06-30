@@ -548,20 +548,20 @@ pub async fn client_screenshot(
 pub async fn start_control(
 	state: State<'_, AppState>,
 	id: String,
-	display: Option<u32>,
-	quality: Option<u8>,
-	max_fps: Option<u8>,
+	config: SessionConfig,
+	frames: tauri::ipc::Channel,
 ) -> AppResult<()> {
 	let state = state.inner().clone();
 	let (ctrl, id) = active_and_id(&state, &id)?;
-	let defaults = SessionConfig::default();
-	let cfg = SessionConfig {
-		display: display.unwrap_or(defaults.display),
-		quality: quality.unwrap_or(defaults.quality),
-		max_fps: max_fps.unwrap_or(defaults.max_fps),
-	};
-	session::start(&state, ctrl, id, cfg);
+	session::start(&state, ctrl, id, config.sanitized(), frames);
 	Ok(())
+}
+
+/// Change the live session's quality/fps/scale without restarting it.
+#[tauri::command]
+pub async fn configure_control(state: State<'_, AppState>, id: String, config: SessionConfig) -> AppResult<()> {
+	let ctrl = state.inner().require_active()?;
+	session::configure(&ctrl, parse_id(&id)?, config.sanitized())
 }
 
 #[tauri::command]
@@ -687,11 +687,17 @@ pub async fn client_logs(
 		.map(|c| c.name.clone())
 		.unwrap_or_else(|| "agent".to_string());
 	let result = expect_response!(&conn, &ControlRequest::FetchLogs { max_lines }, ControlResponse::Logs)?;
+	// Re-anchor the agent's timestamps to OUR clock. The agent stamps lines with its
+	// own wall clock, which may be a different timezone or simply skewed (common on
+	// guest VMs), so trusting the absolute value makes its lines render at the wrong
+	// local time. Shifting every line by (our_now - their_now) keeps each line's age
+	// intact but expresses it in the controller's frame, matching controller/RDP logs.
+	let offset = libretether_common::now_secs() as i64 - result.agent_now_secs as i64;
 	Ok(result
 		.lines
 		.into_iter()
 		.map(|l| crate::logbook::LogEntry {
-			ts_secs: l.ts_secs,
+			ts_secs: (l.ts_secs as i64 + offset).max(0) as u64,
 			level: l.level,
 			source: source.clone(),
 			message: l.message,
@@ -991,7 +997,7 @@ mod tests {
 	// you rename/add/remove a field here, this fails until `types.ts` is updated to
 	// match — turning a silent runtime `undefined` into a failed `cargo test`.
 
-	use libretether_protocol::{Frame, FrameEncoding, HostInfo, MouseButton};
+	use libretether_protocol::{HostInfo, MouseButton, SessionConfig};
 	use serde::Serialize;
 
 	/// Assert that `value` serializes to a JSON object with exactly `expected` keys.
@@ -1059,15 +1065,17 @@ mod tests {
 			},
 			&["display", "width", "height", "png_base64"],
 		);
+		// The controller sends this to `start_control`/`configure_control`; the
+		// frontend's SessionConfig mirror must carry exactly these keys.
 		assert_fields(
-			Frame {
-				seq: 0,
-				width: 1,
-				height: 1,
-				encoding: FrameEncoding::Jpeg,
-				data_base64: String::new(),
+			SessionConfig {
+				display: 0,
+				quality: 70,
+				max_fps: 30,
+				scale: 100,
+				auto: false,
 			},
-			&["seq", "width", "height", "encoding", "data_base64"],
+			&["display", "quality", "max_fps", "scale", "auto"],
 		);
 	}
 
@@ -1247,8 +1255,6 @@ mod tests {
 		assert_eq!(serde_json::to_value(MouseButton::Left).unwrap(), "left");
 		assert_eq!(serde_json::to_value(MouseButton::Right).unwrap(), "right");
 		assert_eq!(serde_json::to_value(MouseButton::Middle).unwrap(), "middle");
-		assert_eq!(serde_json::to_value(FrameEncoding::Jpeg).unwrap(), "jpeg");
-		assert_eq!(serde_json::to_value(FrameEncoding::Png).unwrap(), "png");
 		assert_eq!(serde_json::to_value(ClientOs::Linux).unwrap(), "linux");
 		assert_eq!(serde_json::to_value(ClientOs::Macos).unwrap(), "macos");
 		assert_eq!(serde_json::to_value(ClientOs::Windows).unwrap(), "windows");

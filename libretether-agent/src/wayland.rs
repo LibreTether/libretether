@@ -10,9 +10,12 @@ use ashpd::desktop::remote_desktop::{Axis, DeviceType, KeyState, RemoteDesktop, 
 use ashpd::desktop::screencast::{CursorMode, Screencast, SelectSourcesOptions, SourceType};
 use ashpd::desktop::{PersistMode, Session};
 use ashpd::enumflags2::BitFlags;
-use libretether_protocol::frame::{read_frame_capped, write_frame, MAX_CONTROL_FRAME};
+use libretether_protocol::frame::{read_frame_capped, MAX_CONTROL_FRAME};
+use libretether_protocol::video;
 use libretether_protocol::{InputEvent, MouseButton, SessionClient, SessionConfig, SessionServer};
 use quinn::{RecvStream, SendStream};
+
+use crate::encode::{self, OutFrame, RawFrame, SharedConfig};
 
 // Linux evdev button codes (see <linux/input-event-codes.h>).
 const BTN_LEFT: i32 = 0x110;
@@ -38,10 +41,11 @@ pub async fn run_session(cfg: SessionConfig, send: SendStream, recv: RecvStream)
 }
 
 async fn serve(cfg: SessionConfig, mut send: SendStream, recv: RecvStream) -> Result<()> {
+	let cfg = cfg.sanitized();
 	let portal = match setup_portal().await {
 		Ok(p) => p,
 		Err(e) => {
-			let _ = write_frame(
+			let _ = video::write_control(
 				&mut send,
 				&SessionServer::Error {
 					message: format!("portal setup failed: {e}"),
@@ -52,7 +56,9 @@ async fn serve(cfg: SessionConfig, mut send: SendStream, recv: RecvStream) -> Re
 		}
 	};
 
-	let _ = write_frame(
+	// The portal session's geometry is fixed, so Meta is sent once up front (the
+	// X11 path re-sends it on monitor changes; here there are none).
+	let _ = video::write_control(
 		&mut send,
 		&SessionServer::Meta {
 			display: cfg.display,
@@ -62,14 +68,20 @@ async fn serve(cfg: SessionConfig, mut send: SendStream, recv: RecvStream) -> Re
 	)
 	.await;
 
-	// Start the PipeWire capture thread.
+	// Start the PipeWire capture thread feeding the shared tile-delta encoder.
 	let fd = portal
 		.screencast
 		.open_pipe_wire_remote(&portal.session, Default::default())
 		.await?;
 	let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-	let (frame_tx, mut frame_rx) = tokio::sync::mpsc::channel::<crate::session::Encoded>(4);
-	crate::pwstream::spawn(fd, portal.node_id, cfg.quality, cfg.max_fps, stop.clone(), frame_tx);
+	let shared = SharedConfig::new(&cfg);
+	let (raw_tx, raw_rx) = std::sync::mpsc::sync_channel::<RawFrame>(1);
+	let (out_tx, mut out_rx) = tokio::sync::mpsc::channel::<OutFrame>(2);
+	crate::pwstream::spawn(fd, portal.node_id, shared.clone(), stop.clone(), raw_tx);
+	let encoder = {
+		let shared = shared.clone();
+		std::thread::spawn(move || encode::run(raw_rx, out_tx, shared))
+	};
 
 	// Read input on its own task (so a framed read is never cancelled mid-message)
 	// and inject on another. Injection must NOT share the frame-writing loop: a
@@ -78,27 +90,32 @@ async fn serve(cfg: SessionConfig, mut send: SendStream, recv: RecvStream) -> Re
 	// the session down. The frame loop below owns the session's lifetime; input
 	// failures only stop input, never the video.
 	let (input_tx, mut input_rx) = tokio::sync::mpsc::unbounded_channel::<InputEvent>();
-	let reader = tokio::spawn(async move {
-		let mut recv = recv;
-		loop {
-			// Input/control events are small — cap the read tightly (frames flow the
-			// other direction; these never need the wide cap).
-			match read_frame_capped::<_, SessionClient>(&mut recv, MAX_CONTROL_FRAME).await {
-				Ok(SessionClient::Input(ev)) => {
-					if input_tx.send(ev).is_err() {
-						break;
+	let reader = {
+		let shared = shared.clone();
+		tokio::spawn(async move {
+			let mut recv = recv;
+			loop {
+				// Input/control events are small — cap the read tightly (frames flow the
+				// other direction; these never need the wide cap).
+				match read_frame_capped::<_, SessionClient>(&mut recv, MAX_CONTROL_FRAME).await {
+					Ok(SessionClient::Input(ev)) => {
+						if input_tx.send(ev).is_err() {
+							break;
+						}
 					}
+					Ok(SessionClient::Configure(cfg)) => shared.apply(&cfg.sanitized()),
+					Ok(SessionClient::Refresh) => shared.request_keyframe(),
+					Ok(SessionClient::Start(_)) => {}
+					Ok(SessionClient::Stop) => break,
+					// Drop a single undecodable frame rather than ending input.
+					Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
+						crate::net::log(&format!("ignoring malformed session frame: {e}"));
+					}
+					Err(_) => break,
 				}
-				Ok(SessionClient::Refresh) | Ok(SessionClient::Start(_)) => {}
-				Ok(SessionClient::Stop) => break,
-				// Drop a single undecodable frame rather than ending input.
-				Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
-					crate::net::log(&format!("ignoring malformed session frame: {e}"));
-				}
-				Err(_) => break,
 			}
-		}
-	});
+		})
+	};
 
 	let portal = std::sync::Arc::new(portal);
 	let injector = {
@@ -115,18 +132,21 @@ async fn serve(cfg: SessionConfig, mut send: SendStream, recv: RecvStream) -> Re
 		})
 	};
 
-	// Frame loop: forward captured frames until capture ends or the controller
+	// Frame loop: forward encoded frames until capture ends or the controller
 	// disconnects. Input is handled independently above.
-	while let Some(enc) = frame_rx.recv().await {
-		if write_frame(&mut send, &crate::session::to_frame(&enc)).await.is_err() {
+	while let Some(out) = out_rx.recv().await {
+		if video::write_message(&mut send, &out.body).await.is_err() {
 			break;
 		}
 	}
 
 	stop.store(true, std::sync::atomic::Ordering::Relaxed);
-	// Abort the reader (drops its `input_tx`), which ends the injector loop and lets
-	// it release any still-held keys/buttons before the portal session closes. Bound
+	// Drop the encode→write receiver so the encoder's `blocking_send` unblocks, then
+	// join it. Abort the reader (drops its `input_tx`), which ends the injector loop
+	// and lets it release any still-held keys/buttons before the portal closes. Bound
 	// the wait so a wedged portal call can't hang teardown.
+	drop(out_rx);
+	let _ = encoder.join();
 	reader.abort();
 	let _ = tokio::time::timeout(std::time::Duration::from_secs(2), injector).await;
 	let _ = portal.session.close().await;

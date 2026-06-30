@@ -12,6 +12,7 @@
 
 mod capture;
 mod config;
+mod encode;
 mod handlers;
 mod host;
 mod input;

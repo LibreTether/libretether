@@ -6,8 +6,7 @@
 use std::io::Cursor;
 
 use anyhow::{anyhow, Result};
-use image::codecs::jpeg::JpegEncoder;
-use image::{ImageEncoder, RgbaImage};
+use image::RgbaImage;
 use xcap::Monitor;
 
 /// A captured frame plus the geometry it came from.
@@ -73,26 +72,6 @@ fn pick(monitors: &[Monitor], display: u32) -> Result<&Monitor> {
 		.ok_or_else(|| anyhow!("display {display} out of range (have {})", monitors.len()))
 }
 
-/// Encode an RGBA image as JPEG (RGB, no alpha).
-pub fn encode_jpeg(image: &RgbaImage, quality: u8) -> Result<Vec<u8>> {
-	// Drop the alpha channel straight into a tight RGB buffer — one allocation and
-	// one pass, instead of cloning the whole RGBA frame and converting (this runs
-	// per frame at up to 60 fps for a full-screen capture).
-	let raw = image.as_raw();
-	let mut rgb = Vec::with_capacity(raw.len() / 4 * 3);
-	for px in raw.chunks_exact(4) {
-		rgb.extend_from_slice(&px[..3]);
-	}
-	let mut buf = Vec::new();
-	JpegEncoder::new_with_quality(&mut buf, quality.clamp(1, 100)).write_image(
-		&rgb,
-		image.width(),
-		image.height(),
-		image::ExtendedColorType::Rgb8,
-	)?;
-	Ok(buf)
-}
-
 /// Encode an RGBA image as PNG.
 pub fn encode_png(image: &RgbaImage) -> Result<Vec<u8>> {
 	let mut buf = Cursor::new(Vec::new());
@@ -103,24 +82,6 @@ pub fn encode_png(image: &RgbaImage) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
 	use super::*;
-
-	#[test]
-	fn encode_jpeg_drops_alpha_and_preserves_dimensions() {
-		let img = RgbaImage::from_pixel(4, 3, image::Rgba([10, 20, 30, 128]));
-		let jpeg = encode_jpeg(&img, 80).unwrap();
-		assert!(!jpeg.is_empty());
-		let decoded = image::load_from_memory(&jpeg).unwrap();
-		assert_eq!((decoded.width(), decoded.height()), (4, 3));
-		// JPEG is RGB (no alpha channel).
-		assert_eq!(decoded.color().channel_count(), 3);
-	}
-
-	#[test]
-	fn encode_jpeg_clamps_out_of_range_quality() {
-		let img = RgbaImage::from_pixel(2, 2, image::Rgba([0, 0, 0, 255]));
-		assert!(!encode_jpeg(&img, 0).unwrap().is_empty());
-		assert!(!encode_jpeg(&img, 200).unwrap().is_empty());
-	}
 
 	#[test]
 	fn encode_png_preserves_dimensions() {

@@ -1,4 +1,4 @@
-import { invoke } from "@tauri-apps/api/core"
+import { Channel, invoke } from "@tauri-apps/api/core"
 import { listen, type UnlistenFn } from "@tauri-apps/api/event"
 import type {
 	ActiveInfo,
@@ -9,10 +9,10 @@ import type {
 	ControllerSummary,
 	CreateClientResult,
 	ExecResult,
-	Frame,
 	InputEvent,
 	LogEntry,
 	ScreenshotResult,
+	SessionConfig,
 	SessionMeta,
 	Settings
 } from "./types"
@@ -49,13 +49,20 @@ export const clientScreenshot = (id: string, display?: number) =>
 	call<ScreenshotResult>("client_screenshot", { display, id })
 
 // ---------------------------------------------------------------- session
-export interface SessionOpts {
-	display?: number
-	quality?: number
-	maxFps?: number
+/** Start a live screen-control session. Binary video frames arrive on `onFrame`
+ *  as `ArrayBuffer`s (one per encoded frame) over a Tauri channel — no base64. */
+export const startControl = (
+	id: string,
+	config: SessionConfig,
+	onFrame: (frame: ArrayBuffer) => void
+): Promise<void> => {
+	if (!HAS_TAURI) return import("./mock").then((m) => m.mockInvoke("start_control", { config, id }) as Promise<void>)
+	const frames = new Channel<ArrayBuffer>()
+	frames.onmessage = onFrame
+	return invoke<void>("start_control", { config, frames, id })
 }
-export const startControl = (id: string, opts: SessionOpts = {}) =>
-	call<void>("start_control", { display: opts.display, id, maxFps: opts.maxFps, quality: opts.quality })
+/** Change the live session's quality/fps/scale without restarting it. */
+export const configureControl = (id: string, config: SessionConfig) => call<void>("configure_control", { config, id })
 export const sendInput = (id: string, event: InputEvent) => call<void>("send_input", { event, id })
 export const stopControl = (id: string) => call<void>("stop_control", { id })
 export const connectRdp = (id: string) => call<void>("connect_rdp", { id })
@@ -89,8 +96,6 @@ export const onControllerLog = (cb: (line: string) => void): Promise<UnlistenFn>
 export const onControllerConnected = (cb: () => void): Promise<UnlistenFn> => sub("controller:connected", () => cb())
 export const onLogEntry = (cb: (entry: LogEntry) => void): Promise<UnlistenFn> =>
 	sub<LogEntry>("logs:entry", (e) => cb(e.payload))
-export const onSessionFrame = (id: string, cb: (f: Frame) => void): Promise<UnlistenFn> =>
-	sub<Frame>(`session:frame:${id}`, (e) => cb(e.payload))
 export const onSessionMeta = (id: string, cb: (m: SessionMeta) => void): Promise<UnlistenFn> =>
 	sub<SessionMeta>(`session:meta:${id}`, (e) => cb(e.payload))
 export const onSessionClosed = (id: string, cb: () => void): Promise<UnlistenFn> =>

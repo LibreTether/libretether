@@ -70,6 +70,7 @@ pub fn run() {
 			commands::client_exec,
 			commands::client_screenshot,
 			commands::start_control,
+			commands::configure_control,
 			commands::send_input,
 			commands::stop_control,
 			commands::connect_rdp,

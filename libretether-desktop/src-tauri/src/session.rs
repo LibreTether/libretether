@@ -10,8 +10,10 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use libretether_protocol::frame::{read_frame, write_frame};
+use libretether_protocol::frame::write_frame;
+use libretether_protocol::video::{self, Inbound};
 use libretether_protocol::{InputEvent, SessionClient, SessionConfig, SessionServer, StreamOpen};
+use tauri::ipc::{Channel, InvokeResponseBody};
 use tauri::{AppHandle, Emitter};
 use uuid::Uuid;
 
@@ -20,14 +22,16 @@ use crate::state::{ActiveController, AppState, SessionHandle};
 
 static SESSION_GEN: AtomicU64 = AtomicU64::new(1);
 
-/// Start (or restart) a live session for `id` on the active controller.
-pub fn start(state: &AppState, ctrl: Arc<ActiveController>, id: Uuid, cfg: SessionConfig) {
+/// Start (or restart) a live session for `id` on the active controller. Binary
+/// video frames are streamed to the webview over `frames` (an `ArrayBuffer` per
+/// frame); metadata/errors are emitted as Tauri events.
+pub fn start(state: &AppState, ctrl: Arc<ActiveController>, id: Uuid, cfg: SessionConfig, frames: Channel) {
 	stop(&ctrl, id);
 
 	let token = SESSION_GEN.fetch_add(1, Ordering::Relaxed);
 	let (input_tx, input_rx) = tokio::sync::mpsc::unbounded_channel::<SessionClient>();
 	let app = state.0.app.get().cloned();
-	let task = tauri::async_runtime::spawn(drive(ctrl.clone(), id, token, cfg, input_rx, app));
+	let task = tauri::async_runtime::spawn(drive(ctrl.clone(), id, token, cfg, input_rx, app, frames));
 	ctrl.sessions
 		.lock()
 		.unwrap()
@@ -41,6 +45,7 @@ async fn drive(
 	cfg: SessionConfig,
 	mut input_rx: tokio::sync::mpsc::UnboundedReceiver<SessionClient>,
 	app: Option<AppHandle>,
+	frames: Channel,
 ) {
 	let Some(conn) = ctrl.connection(id) else {
 		emit(&app, &format!("session:error:{id}"), "client is offline".to_string());
@@ -78,16 +83,21 @@ async fn drive(
 		}
 	});
 
-	// Reader: relay agent frames/metadata to the webview.
+	// Reader: stream agent video frames to the webview over the channel (raw bytes,
+	// no base64), and relay metadata/errors as events.
 	loop {
-		match read_frame::<_, SessionServer>(&mut recv).await {
-			Ok(SessionServer::Frame(frame)) => emit(&app, &format!("session:frame:{id}"), frame),
-			Ok(SessionServer::Meta { display, width, height }) => emit(
+		match video::read_inbound(&mut recv).await {
+			Ok(Inbound::Frame(payload)) => {
+				if frames.send(InvokeResponseBody::Raw(payload)).is_err() {
+					break;
+				}
+			}
+			Ok(Inbound::Control(SessionServer::Meta { display, width, height })) => emit(
 				&app,
 				&format!("session:meta:{id}"),
 				serde_json::json!({ "display": display, "width": width, "height": height }),
 			),
-			Ok(SessionServer::Error { message }) => {
+			Ok(Inbound::Control(SessionServer::Error { message })) => {
 				emit(&app, &format!("session:error:{id}"), message);
 				break;
 			}
@@ -112,13 +122,22 @@ fn finish(ctrl: &ActiveController, id: Uuid, token: u64, app: &Option<AppHandle>
 
 /// Push an input event into a running session.
 pub fn send_input(ctrl: &ActiveController, id: Uuid, event: InputEvent) -> AppResult<()> {
+	send_client(ctrl, id, SessionClient::Input(event))
+}
+
+/// Change quality/fps/scale on a running session, live.
+pub fn configure(ctrl: &ActiveController, id: Uuid, cfg: SessionConfig) -> AppResult<()> {
+	send_client(ctrl, id, SessionClient::Configure(cfg))
+}
+
+fn send_client(ctrl: &ActiveController, id: Uuid, msg: SessionClient) -> AppResult<()> {
 	let sessions = ctrl.sessions.lock().unwrap();
 	let handle = sessions
 		.get(&id)
 		.ok_or_else(|| AppError::msg("no active session for that client"))?;
 	handle
 		.input_tx
-		.send(SessionClient::Input(event))
+		.send(msg)
 		.map_err(|_| AppError::msg("session has closed"))
 }
 

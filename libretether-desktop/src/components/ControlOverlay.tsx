@@ -1,22 +1,37 @@
 import { Keyboard, Loader2, MousePointer2, Power } from "lucide-react"
 import { useCallback, useEffect, useRef, useState } from "react"
 import * as api from "../lib/api"
-import type { ClientDto, InputEvent, MouseButton, SessionMeta } from "../lib/types"
+import type { ClientDto, InputEvent, MouseButton, SessionConfig, SessionMeta } from "../lib/types"
+import { parseFrame } from "../lib/videoFrame"
+import { QualityControls } from "./QualityControls"
 
 const BUTTONS: Record<number, MouseButton> = { 0: "left", 1: "middle", 2: "right" }
 
+// The session opens in adaptive mode at native resolution; the controller can
+// retune it live from the QualityControls menu.
+const INITIAL_CONFIG: SessionConfig = { auto: true, display: 0, max_fps: 30, quality: 70, scale: 100 }
+
 export function ControlOverlay({ client, onClose }: { client: ClientDto; onClose: () => void }) {
-	const imgRef = useRef<HTMLImageElement>(null)
+	const canvasRef = useRef<HTMLCanvasElement>(null)
 	const surfaceRef = useRef<HTMLDivElement>(null)
 	const [meta, setMeta] = useState<SessionMeta | null>(null)
 	const [error, setError] = useState<string | null>(null)
+	const [config, setConfig] = useState<SessionConfig>(INITIAL_CONFIG)
 	// Count frames in a ref and surface a frames-per-second readout ~1 Hz, so a
-	// 20 fps stream doesn't re-render the whole overlay on every frame (the <img>
-	// is updated imperatively). `prevFramesRef` holds the last tick's total so the
-	// interval can report the delta (an fps), not an ever-growing cumulative count.
+	// high-rate stream doesn't re-render the whole overlay on every frame (the
+	// canvas is drawn imperatively). `prevFramesRef` holds the last tick's total so
+	// the interval can report the delta (an fps), not an ever-growing count.
 	const framesRef = useRef(0)
 	const prevFramesRef = useRef(0)
 	const [fps, setFps] = useState(0)
+
+	// Incoming frames are decoded/drawn strictly in arrival order: a delta frame
+	// only carries the tiles that changed, so dropping or reordering one would leave
+	// the canvas permanently stale. `queueRef` buffers raw frame buffers and
+	// `drainingRef` guards the single in-flight drainer.
+	const queueRef = useRef<ArrayBuffer[]>([])
+	const drainingRef = useRef(false)
+	const aliveRef = useRef(true)
 
 	// Coalesce pointer moves to one send per animation frame.
 	const pendingMove = useRef<{ x: number; y: number } | null>(null)
@@ -42,6 +57,45 @@ export function ControlOverlay({ client, onClose }: { client: ClientDto; onClose
 		[client.id]
 	)
 
+	// Decode a frame's changed tiles and composite them onto the canvas. A keyframe
+	// (re)sizes the canvas; tiles are decoded off the main thread via createImageBitmap.
+	const drawFrame = useCallback(async (buf: ArrayBuffer) => {
+		const canvas = canvasRef.current
+		if (!canvas) return
+		const frame = parseFrame(buf)
+		if (frame.key && (canvas.width !== frame.width || canvas.height !== frame.height)) {
+			canvas.width = frame.width
+			canvas.height = frame.height
+		}
+		const ctx = canvas.getContext("2d")
+		if (!ctx) return
+		const bitmaps = await Promise.all(
+			frame.tiles.map((t) => createImageBitmap(new Blob([t.bytes], { type: "image/jpeg" })))
+		)
+		if (!aliveRef.current) {
+			for (const b of bitmaps) b.close()
+			return
+		}
+		for (let i = 0; i < frame.tiles.length; i++) {
+			const t = frame.tiles[i]
+			ctx.drawImage(bitmaps[i], t.col * frame.tileSize, t.row * frame.tileSize)
+			bitmaps[i].close()
+		}
+	}, [])
+
+	const drain = useCallback(async () => {
+		if (drainingRef.current) return
+		drainingRef.current = true
+		try {
+			while (queueRef.current.length) {
+				const buf = queueRef.current.shift()
+				if (buf) await drawFrame(buf)
+			}
+		} finally {
+			drainingRef.current = false
+		}
+	}, [drawFrame])
+
 	// Release everything currently held, then forget it. Safe to call repeatedly.
 	const releaseAll = useCallback(() => {
 		for (const code of pressedKeys.current) send({ code, pressed: false, t: "key" })
@@ -50,34 +104,42 @@ export function ControlOverlay({ client, onClose }: { client: ClientDto; onClose
 		pressedButtons.current.clear()
 	}, [send])
 
+	// Push a live quality change to the agent (no session restart).
+	const applyConfig = useCallback(
+		(next: SessionConfig) => {
+			setConfig(next)
+			api.configureControl(client.id, next).catch(() => {})
+		},
+		[client.id]
+	)
+
 	// Subscribe to session events, then start the session.
 	useEffect(() => {
-		let alive = true
+		aliveRef.current = true
 		const unlisteners: Promise<() => void>[] = [
-			api.onSessionMeta(client.id, (m) => alive && setMeta(m)),
-			api.onSessionFrame(client.id, (f) => {
-				if (!alive || !imgRef.current) return
-				imgRef.current.src = `data:image/${f.encoding};base64,${f.data_base64}`
-				framesRef.current += 1
-			}),
-			api.onSessionError(client.id, (msg) => alive && setError(msg)),
-			api.onSessionClosed(client.id, () => alive && setError((prev) => prev ?? "The session ended."))
+			api.onSessionMeta(client.id, (m) => aliveRef.current && setMeta(m)),
+			api.onSessionError(client.id, (msg) => aliveRef.current && setError(msg)),
+			api.onSessionClosed(client.id, () => aliveRef.current && setError((prev) => prev ?? "The session ended."))
 		]
 
 		// Defer the start by a tick so React StrictMode's throwaway mount (which
 		// unmounts immediately) never actually opens a session — avoids a second
 		// portal consent dialog on the client.
 		const startTimer = setTimeout(() => {
-			if (alive)
-				api.startControl(client.id, { maxFps: 20, quality: 70 }).catch(
-					(e) => alive && setError(api.errString(e))
-				)
+			if (!aliveRef.current) return
+			api.startControl(client.id, INITIAL_CONFIG, (buf) => {
+				if (!aliveRef.current) return
+				framesRef.current += 1
+				queueRef.current.push(buf)
+				void drain()
+			}).catch((e) => aliveRef.current && setError(api.errString(e)))
 		}, 0)
 		surfaceRef.current?.focus()
 
 		return () => {
-			alive = false
+			aliveRef.current = false
 			clearTimeout(startTimer)
+			queueRef.current = []
 			// Flush any held keys/buttons *before* tearing the session down so the
 			// releases still reach the agent (the agent also releases on stop as a
 			// backstop, but this covers both backends and is immediate).
@@ -85,7 +147,7 @@ export function ControlOverlay({ client, onClose }: { client: ClientDto; onClose
 			api.stopControl(client.id).catch(() => {})
 			for (const u of unlisteners) u.then((fn) => fn())
 		}
-	}, [client.id, releaseAll])
+	}, [client.id, releaseAll, drain])
 
 	// Report fps ~1 Hz as the delta since the last tick (see above).
 	useEffect(() => {
@@ -149,7 +211,7 @@ export function ControlOverlay({ client, onClose }: { client: ClientDto; onClose
 	}, [send])
 
 	const norm = (e: React.PointerEvent | React.MouseEvent): { x: number; y: number } | null => {
-		const el = imgRef.current
+		const el = canvasRef.current
 		if (!el) return null
 		const r = el.getBoundingClientRect()
 		if (r.width === 0 || r.height === 0) return null
@@ -228,8 +290,9 @@ export function ControlOverlay({ client, onClose }: { client: ClientDto; onClose
 						to exit
 					</span>
 				</span>
+				<QualityControls onChange={applyConfig} value={config} />
 				<button
-					className="ml-1 flex items-center gap-1.5 rounded-lg bg-danger/90 px-3 py-1.5 text-xs font-semibold text-white transition hover:bg-danger"
+					className="flex items-center gap-1.5 rounded-lg bg-danger/90 px-3 py-1.5 text-xs font-semibold text-white transition hover:bg-danger"
 					onClick={onClose}
 					type="button"
 				>
@@ -261,10 +324,8 @@ export function ControlOverlay({ client, onClose }: { client: ClientDto; onClose
 					ref={surfaceRef}
 					tabIndex={0}
 				>
-					<img
-						alt="remote screen"
+					<canvas
 						className="max-h-full max-w-full select-none"
-						draggable={false}
 						onContextMenu={(e) => e.preventDefault()}
 						onPointerCancel={onPointerCancel}
 						onPointerDown={(e) => {
@@ -273,7 +334,7 @@ export function ControlOverlay({ client, onClose }: { client: ClientDto; onClose
 						}}
 						onPointerMove={onMove}
 						onPointerUp={onPointerUp}
-						ref={imgRef}
+						ref={canvasRef}
 						style={{ imageRendering: "auto" }}
 					/>
 				</div>

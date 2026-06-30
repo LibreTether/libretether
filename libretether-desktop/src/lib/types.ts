@@ -103,14 +103,18 @@ export interface SessionMeta {
 	height: number
 }
 
-export type FrameEncoding = "jpeg" | "png"
-
-export interface Frame {
-	seq: number
-	width: number
-	height: number
-	encoding: FrameEncoding
-	data_base64: string
+/** Mirrors the Rust `SessionConfig` — the live screen-control quality knobs.
+ *  Sent to `start_control` and `configure_control`. */
+export interface SessionConfig {
+	display: number
+	/** JPEG quality, 1–100. */
+	quality: number
+	/** Upper bound on frames per second. */
+	max_fps: number
+	/** Resolution scale percentage, 10–100 (100 = native). */
+	scale: number
+	/** Adaptive mode: the agent lowers `scale` automatically when it can't keep up. */
+	auto: boolean
 }
 
 // ---------------------------------------------------------------- logs

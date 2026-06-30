@@ -23,6 +23,12 @@ dirs = "6"
 base64 = "0.22"
 whoami = "1"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+# Fast, pure-Rust JPEG encoder (SIMD via std::arch — no C/cmake in the
+# cross-compile, unlike libjpeg-turbo). Used for the live-session tile encoder;
+# `image`'s encoder stays for one-shot PNG screenshots.
+jpeg-encoder = "0.6"
+# Data-parallel tile hashing + JPEG encoding across cores.
+rayon = "1"
 xcap = "0.3"
 enigo = "0.3"
 # Embedded SSH server: russh on the `ring` backend (matching the rest of the
