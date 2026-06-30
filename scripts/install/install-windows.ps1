@@ -52,6 +52,29 @@ $BinDir = Join-Path $env:LOCALAPPDATA "LibreTether"
 $Bin = Join-Path $BinDir "libretether-agent.exe"
 Write-Host "==> LibreTether agent install for $Name"
 
+# Stop and remove any prior installation so the agent binary can be replaced.
+# Unlike Linux, Windows locks a running .exe, so downloading over it fails with
+# "being used by another process". End the logon task, kill the process, then
+# wait for the OS to release the file handle before we overwrite it.
+# (Task name mirrors TASK in libretether-agent/src/service.rs.)
+function Remove-ExistingAgent {
+	# Best-effort: a fresh machine has no task/process to remove, and schtasks
+	# writes "task not found" to stderr — which would otherwise throw under the
+	# script-wide $ErrorActionPreference = "Stop". Shadow it locally instead.
+	$ErrorActionPreference = "SilentlyContinue"
+	schtasks /End /TN "LibreTetherAgent" 2>$null | Out-Null
+	schtasks /Delete /TN "LibreTetherAgent" /F 2>$null | Out-Null
+	Get-Process -Name "libretether-agent" -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+	# The handle is freed asynchronously after the process exits; wait until the
+	# exe opens for exclusive write (or give up after ~5s) before downloading over it.
+	if (Test-Path $Bin) {
+		foreach ($attempt in 1..50) {
+			try { [System.IO.File]::Open($Bin, 'Open', 'ReadWrite', 'None').Close(); break }
+			catch { Start-Sleep -Milliseconds 100 }
+		}
+	}
+}
+
 # 1. Tailscale (direct mode with a pre-auth key only).
 if ($TailscaleKey) {
 	if (-not $Controller) { throw "-TailscaleKey only applies with -Controller." }
@@ -61,7 +84,9 @@ if ($TailscaleKey) {
 	tailscale up --reset --authkey $TailscaleKey
 }
 
-# 2. Download the agent (override with $env:LIBRETETHER_AGENT_BIN / _URL or -AgentUrl).
+# 2. Remove any prior install (so the running .exe isn't locked), then download
+#    the agent (override with $env:LIBRETETHER_AGENT_BIN / _URL or -AgentUrl).
+Remove-ExistingAgent
 New-Item -ItemType Directory -Force -Path $BinDir | Out-Null
 if ($env:LIBRETETHER_AGENT_BIN) {
 	Copy-Item $env:LIBRETETHER_AGENT_BIN $Bin -Force

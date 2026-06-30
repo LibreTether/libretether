@@ -100,7 +100,13 @@ else
 	echo "!! Couldn't auto-install runtime libs — ensure libxdo (libxdo.so.3) and libxcb are present." >&2
 fi
 
-# 3. Download the agent for this architecture (override with LIBRETETHER_AGENT_BIN / _URL).
+# 3. Stop any running agent, then download the new binary. The kernel refuses to
+#    overwrite a running executable in place ("text file busy"), so a re-deploy
+#    must stop the old service first; `install` below re-enables and restarts it.
+#    (Unit name mirrors libretether-agent/src/service.rs.)
+if command -v systemctl >/dev/null 2>&1; then
+	systemctl --user stop libretether-agent.service 2>/dev/null || true
+fi
 mkdir -p "$BIN_DIR"
 if [ -n "${LIBRETETHER_AGENT_BIN:-}" ]; then
 	install -m 0755 "$LIBRETETHER_AGENT_BIN" "$BIN"

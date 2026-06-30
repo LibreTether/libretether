@@ -83,7 +83,10 @@ if [ -n "$TAILSCALE_KEY" ]; then
 	sudo tailscale up --reset --authkey "$TAILSCALE_KEY"
 fi
 
-# 2. Download the universal agent (override with LIBRETETHER_AGENT_BIN / _URL).
+# 2. Stop any running agent, then download the universal binary. Replacing a
+#    running executable in place can fail, so unload the old LaunchAgent first;
+#    `install` below reloads it. (Label mirrors libretether-agent/src/service.rs.)
+launchctl unload "$HOME/Library/LaunchAgents/com.libretether.agent.plist" 2>/dev/null || true
 mkdir -p "$BIN_DIR"
 if [ -n "${LIBRETETHER_AGENT_BIN:-}" ]; then
 	install -m 0755 "$LIBRETETHER_AGENT_BIN" "$BIN"
