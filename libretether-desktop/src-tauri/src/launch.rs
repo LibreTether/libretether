@@ -27,6 +27,61 @@ pub fn spawn(mut cmd: Command, label: &str) -> AppResult<()> {
 		.map_err(|e| AppError::msg(format!("launching {label}: {e}")))
 }
 
+/// Like [`spawn`], but capture the child's stdout+stderr and forward each line to
+/// the in-app log under `source` — so the launched viewer's diagnostics (notably
+/// FreeRDP's `WLog` output) show up on the Logs page instead of vanishing into a
+/// GUI build's missing console. The viewer stays detached: we drain its pipes and
+/// reap it on background threads, but never wait on or kill it.
+pub fn spawn_logged(mut cmd: Command, label: &str, source: &'static str) -> AppResult<()> {
+	use std::process::Stdio;
+	cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+	let mut child = cmd
+		.spawn()
+		.map_err(|e| AppError::msg(format!("launching {label}: {e}")))?;
+	if let Some(out) = child.stdout.take() {
+		std::thread::spawn(move || drain_to_log(out, source));
+	}
+	if let Some(err) = child.stderr.take() {
+		std::thread::spawn(move || drain_to_log(err, source));
+	}
+	// Reap the process when it exits so it doesn't linger as a zombie. The pipe
+	// handles are owned by the drain threads, so `wait()` just collects the pid.
+	std::thread::spawn(move || {
+		let _ = child.wait();
+	});
+	Ok(())
+}
+
+/// Read `reader` line by line, logging each non-empty line under `source` at a
+/// level inferred from a bracketed `[LEVEL]` tag (FreeRDP/WLog style: `[INFO]`,
+/// `[WARN]`, `[ERROR]`, …), defaulting to info.
+fn drain_to_log<R: std::io::Read>(reader: R, source: &'static str) {
+	use std::io::{BufRead, BufReader};
+	for line in BufReader::new(reader).lines() {
+		let Ok(line) = line else { break };
+		let line = line.trim_end();
+		if line.is_empty() {
+			continue;
+		}
+		crate::logbook::record(log_level_of(line), source, line);
+	}
+}
+
+fn log_level_of(line: &str) -> libretether_protocol::LogLevel {
+	use libretether_protocol::LogLevel;
+	if line.contains("[ERROR]") || line.contains("[FATAL]") {
+		LogLevel::Error
+	} else if line.contains("[WARN]") {
+		LogLevel::Warn
+	} else if line.contains("[TRACE]") {
+		LogLevel::Trace
+	} else if line.contains("[DEBUG]") {
+		LogLevel::Debug
+	} else {
+		LogLevel::Info
+	}
+}
+
 /// Percent-encode `s` for a URL userinfo/query component (RFC 3986): unreserved
 /// characters pass through, everything else is `%XX`-escaped. Used so a username
 /// or password embedded in an `rdp://` URL can't alter the URL's structure (a `@`,

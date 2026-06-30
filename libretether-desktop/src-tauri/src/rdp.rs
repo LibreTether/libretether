@@ -8,7 +8,7 @@ use std::process::Command;
 use crate::error::AppResult;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use crate::launch::percent_encode;
-use crate::launch::spawn;
+use crate::launch::spawn_logged;
 #[cfg(target_os = "linux")]
 use crate::{error::AppError, launch::split_template};
 
@@ -61,7 +61,7 @@ fn freerdp(host: &str, port: u16, username: &str, password: Option<&str>) -> App
 		cmd.arg(format!("/p:{pw}"));
 	}
 	cmd.args(["/cert:ignore", "/dynamic-resolution", "+clipboard"]);
-	spawn(cmd, bin)
+	spawn_logged(cmd, bin, "rdp")
 }
 
 #[cfg(target_os = "linux")]
@@ -79,7 +79,7 @@ fn remmina(host: &str, port: u16, username: &str, password: Option<&str>) -> App
 	};
 	let mut cmd = Command::new("remmina");
 	cmd.arg("-c").arg(url);
-	spawn(cmd, "remmina")
+	spawn_logged(cmd, "remmina", "rdp")
 }
 
 #[cfg(target_os = "linux")]
@@ -91,7 +91,7 @@ fn gnome_connections(host: &str, port: u16) -> AppResult<()> {
 	}
 	let mut cmd = Command::new("gnome-connections");
 	cmd.arg(format!("rdp://{host}:{port}"));
-	spawn(cmd, "gnome-connections")
+	spawn_logged(cmd, "gnome-connections", "rdp")
 }
 
 /// Run a user-provided command template, substituting placeholders per token.
@@ -112,7 +112,7 @@ fn custom(template: &str, host: &str, port: u16, username: &str, password: Optio
 	});
 	let mut cmd = Command::new(bin);
 	cmd.args(args);
-	spawn(cmd, bin)
+	spawn_logged(cmd, bin, "rdp")
 }
 
 #[cfg(target_os = "windows")]
@@ -126,7 +126,7 @@ fn launch_windows(host: &str, port: u16, username: &str, password: Option<&str>)
 	}
 	let mut cmd = Command::new("mstsc");
 	cmd.arg(format!("/v:{host}:{port}"));
-	spawn(cmd, "mstsc")
+	spawn_logged(cmd, "mstsc", "rdp")
 }
 
 #[cfg(target_os = "macos")]
@@ -139,5 +139,5 @@ fn launch_macos(host: &str, port: u16, username: &str) -> AppResult<()> {
 	);
 	let mut cmd = Command::new("open");
 	cmd.arg(url);
-	spawn(cmd, "open")
+	spawn_logged(cmd, "open", "rdp")
 }

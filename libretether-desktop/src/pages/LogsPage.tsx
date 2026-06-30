@@ -11,9 +11,10 @@ import type { ClientDto, LogEntry, LogLevel } from "../lib/types"
 
 const LEVELS: LogLevel[] = ["error", "warn", "info", "debug", "trace"]
 
-/** Sources produced by the controller itself; everything else is an agent's name.
- *  Used so a refresh of the controller buffer doesn't drop loaded agent logs. */
-const CONTROLLER_SOURCES = new Set(["controller", "tunnel"])
+/** Sources produced by the controller itself (its own buffer) — everything else is
+ *  an agent's name. Used so a refresh of the controller buffer replaces these in
+ *  place without duplicating them, while leaving on-demand agent logs untouched. */
+const CONTROLLER_SOURCES = new Set(["controller", "tunnel", "rdp"])
 
 /** Keep the view bounded — a live controller can emit indefinitely. */
 const MAX_ROWS = 3000
