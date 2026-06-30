@@ -4,145 +4,244 @@
 		<meta charset="utf-8" />
 		<meta content="width=device-width, initial-scale=1" name="viewport" />
 		<meta content="noindex" name="robots" />
+		<meta content="dark" name="color-scheme" />
 		<title>Connect this computer · LibreTether</title>
 		<style>
+			/* Design tokens mirrored from the desktop app (dark, the shipped theme):
+			   signal amber on cool slate ink. */
 			:root {
-				--bg: #0b0d12;
-				--surface: #141821;
-				--surface-2: #1c212d;
-				--border: #2a3140;
-				--text: #e8ecf4;
-				--muted: #9aa6bd;
-				--subtle: #6b7689;
-				--primary: #6ea8fe;
-				--primary-strong: #9ec3ff;
-				--danger: #ff8088;
-				--ok: #6bd6a0;
-				--mono: ui-monospace, "SFMono-Regular", "Geist Mono", Menlo, Consolas, monospace;
-				--sans: ui-sans-serif, system-ui, "Geist", "Inter", sans-serif;
+				--bg: #090c12;
+				--surface: #10141d;
+				--surface-2: #161b27;
+				--surface-3: #1f2533;
+				--border: #222a39;
+				--border-strong: #323d54;
+				--text: #e9eef7;
+				--muted: #99a4ba;
+				--subtle: #606b81;
+				--primary: #f2a93c;
+				--primary-strong: #ffc063;
+				--primary-fg: #1a1204;
+				--primary-soft: #2a1d0a;
+				--success: #34d27f;
+				--success-soft: #0f2a1d;
+				--danger: #ff5d6c;
+				--ring: #f2a93c;
+				--radius-lg: 0.625rem;
+				--radius-xl: 0.75rem;
+				--radius-2xl: 0.875rem;
+				--sans: "Geist Variable", ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+				--display: "Space Grotesk", "Geist Variable", ui-sans-serif, system-ui, sans-serif;
+				--mono: "Geist Mono Variable", ui-monospace, "JetBrains Mono", "SF Mono", "Cascadia Code", Menlo, monospace;
 			}
 			* { box-sizing: border-box; }
 			html, body { height: 100%; margin: 0; }
 			body {
 				display: grid;
 				place-items: start center;
-				padding: 6vh 20px 40px;
+				padding: 7vh 20px 48px;
 				font-family: var(--sans);
+				font-feature-settings: "cv01", "ss01";
 				-webkit-font-smoothing: antialiased;
 				color: var(--text);
-				background: radial-gradient(1200px 600px at 50% -10%, #18203044, transparent), var(--bg);
+				background:
+					radial-gradient(900px 360px at 70% -8%, color-mix(in srgb, var(--primary) 9%, transparent), transparent 70%),
+					radial-gradient(1100px 700px at 50% 120%, color-mix(in srgb, #000 16%, transparent), transparent 60%),
+					var(--bg);
+				background-attachment: fixed;
 			}
+			::selection { background: color-mix(in srgb, var(--primary) 32%, transparent); }
+
 			.card {
 				width: 100%;
-				max-width: 540px;
-				padding: 28px;
+				max-width: 460px;
+				padding: 30px;
 				background: var(--surface);
 				border: 1px solid var(--border);
-				border-radius: 20px;
-				box-shadow: 0 24px 60px -30px #000;
+				border-radius: var(--radius-2xl);
+				box-shadow: 0 30px 70px -34px #000;
+				animation: rise 0.32s cubic-bezier(0.22, 1, 0.36, 1) both;
 			}
-			.brand { display: flex; gap: 10px; align-items: center; font-size: 13px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.12em; }
-			.brand .dot { width: 9px; height: 9px; background: var(--primary); border-radius: 50%; box-shadow: 0 0 12px var(--primary); }
-			h1 { margin: 14px 0 6px; font-size: 24px; letter-spacing: -0.01em; }
-			.lede { margin: 0 0 22px; font-size: 14.5px; line-height: 1.5; color: var(--muted); }
-			label { display: block; margin: 0 0 8px; font-size: 13px; font-weight: 600; color: var(--muted); }
+			@keyframes rise { from { opacity: 0; transform: translateY(10px) scale(0.99); } to { opacity: 1; transform: none; } }
+			@media (prefers-reduced-motion: reduce) { .card { animation: none; } }
+
+			.brand { display: flex; gap: 9px; align-items: center; font-family: var(--mono); font-size: 11.5px; font-weight: 500; color: var(--muted); text-transform: uppercase; letter-spacing: 0.18em; }
+			.brand .dot { width: 8px; height: 8px; background: var(--primary); border-radius: 50%; box-shadow: 0 0 12px var(--primary); }
+			h1 { margin: 16px 0 6px; font-family: var(--display); font-size: 25px; font-weight: 700; letter-spacing: -0.01em; }
+			.lede { margin: 0 0 24px; font-size: 14.5px; line-height: 1.55; color: var(--muted); }
+
+			.field-label { display: block; margin: 0 0 9px; font-size: 13px; font-weight: 600; color: var(--muted); }
 			.code-input {
-				width: 100%; padding: 16px; font-family: var(--mono); font-size: 22px; color: var(--text); 
-				text-align: center; letter-spacing: 0.08em;outline: none;
-				background: var(--surface-2); border: 1px solid var(--border); border-radius: 14px;
+				width: 100%; padding: 16px; font-family: var(--mono); font-size: 23px; font-weight: 600; color: var(--text);
+				text-align: center; text-indent: 0.22em; letter-spacing: 0.22em; outline: none;
+				background: var(--surface-2); border: 1px solid var(--border-strong); border-radius: var(--radius-xl);
+				transition: border-color 0.15s, box-shadow 0.15s;
 			}
-			.code-input:focus { border-color: var(--primary); box-shadow: 0 0 0 3px #6ea8fe33; }
-			.hint { margin: 8px 2px 0; font-size: 12.5px; color: var(--subtle); }
-			.os-row { display: flex; gap: 8px; min-inline-size: 0; padding: 0; margin: 22px 0 8px; border: 0; }
-			.sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; white-space: nowrap; border: 0; clip: rect(0 0 0 0); }
-			.os {
-				flex: 1; padding: 12px 8px; font-size: 14px;font-weight: 600; color: var(--muted); text-align: center;cursor: pointer; 
-				background: var(--surface-2); border: 1px solid var(--border);border-radius: 12px; 
-				transition: 0.15s;
+			.code-input::placeholder { font-weight: 500; color: var(--subtle); }
+			.code-input:focus { border-color: var(--primary); box-shadow: 0 0 0 3px color-mix(in srgb, var(--ring) 25%, transparent); }
+			.hint { margin: 9px 2px 0; font-size: 12.5px; color: var(--subtle); }
+			.hint strong { color: var(--muted); }
+
+			/* Split download button: primary action + a chevron that opens the others. */
+			.actions { position: relative; display: flex; margin-top: 22px; }
+			.btn {
+				display: inline-flex; gap: 0.5rem; align-items: center; justify-content: center;
+				font-family: var(--sans); font-weight: 600; line-height: 1; color: var(--primary-fg); cursor: pointer;
+				background: var(--primary); border: none;
+				transition: filter 0.15s, transform 0.08s, opacity 0.15s;
 			}
-			.os[aria-pressed="true"] { color: var(--text); background: #1d2738; border-color: var(--primary); }
-			button.primary {
-				width: 100%; padding: 15px; margin-top: 18px; font-size: 15px;font-weight: 700; color: #08101f; cursor: pointer;
-				background: linear-gradient(180deg, #6ea8fe, #5b91e8); border: none; border-radius: 14px;
+			.btn:active:not(:disabled) { transform: translateY(0.5px) scale(0.99); }
+			.btn:disabled { cursor: not-allowed; opacity: 0.45; }
+			.btn:not(:disabled):hover { filter: brightness(1.06); }
+			.btn-download { flex: 1; padding: 15px 16px; font-size: 15px; border-radius: var(--radius-lg) 0 0 var(--radius-lg); }
+			.btn-more {
+				padding: 0 14px; font-size: 13px; 
+				border-left: 1px solid color-mix(in srgb, var(--primary-fg) 22%, transparent);border-radius: 0 var(--radius-lg) var(--radius-lg) 0;
 			}
-			button.primary:disabled { cursor: not-allowed; opacity: 0.5; }
-			button.primary:not(:disabled):hover { filter: brightness(1.06); }
-			.error { min-height: 1em; margin-top: 10px; font-size: 13px; color: var(--danger); }
-			details { padding-top: 16px; margin-top: 18px; border-top: 1px solid var(--border); }
-			summary { font-size: 13.5px; color: var(--muted); cursor: pointer; }
+			.btn-more svg { width: 16px; height: 16px; transition: transform 0.18s; }
+			.btn-more[aria-expanded="true"] svg { transform: rotate(180deg); }
+
+			.popover {
+				position: absolute; top: calc(100% + 8px); right: 0; z-index: 20; min-width: 220px; padding: 6px;
+				background: var(--surface-2); border: 1px solid var(--border-strong); border-radius: var(--radius-xl);
+				box-shadow: 0 20px 44px -22px #000; animation: pop 0.14s ease both;
+			}
+			@keyframes pop { from { opacity: 0; transform: translateY(-4px); } to { opacity: 1; transform: none; } }
+			.popover-head { padding: 6px 10px 4px; font-family: var(--mono); font-size: 10.5px; color: var(--subtle); text-transform: uppercase; letter-spacing: 0.14em; }
+			.popover-item {
+				display: flex; gap: 10px; align-items: center; width: 100%; padding: 10px 10px; font-family: var(--sans);
+				font-size: 14px; font-weight: 500; color: var(--text); text-align: left; cursor: pointer;
+				background: none; border: none; border-radius: var(--radius-lg);
+			}
+			.popover-item:hover { background: var(--surface-3); }
+
+			.error { min-height: 1.1em; margin-top: 11px; font-size: 13px; color: var(--danger); }
+
+			details { padding-top: 18px; margin-top: 20px; border-top: 1px solid var(--border); }
+			summary { font-size: 13px; color: var(--muted); cursor: pointer; }
+			summary:hover { color: var(--text); }
 			.cmd { position: relative; margin-top: 12px; }
 			pre {
-				padding: 14px 14px; 
-				margin: 0; overflow-x: auto; font-family: var(--mono); font-size: 12.5px; color: var(--primary-strong);word-break: break-all;
-				white-space: pre-wrap; background: var(--surface-2); border: 1px solid var(--border); border-radius: 12px;
+				padding: 13px 14px; margin: 0; overflow-x: auto; font-family: var(--mono); font-size: 12px; line-height: 1.5;
+				color: var(--primary-strong); word-break: break-all;white-space: pre-wrap; 
+				background: var(--surface-2); border: 1px solid var(--border); border-radius: var(--radius-lg);
 			}
-			.copy { position: absolute; top: 8px; right: 8px; padding: 5px 10px; font-size: 12px; color: var(--muted); cursor: pointer; background: var(--surface); 
-				border: 1px solid var(--border); border-radius: 8px; }
-			.steps { display: none; padding: 16px; margin: 22px 0 0; background: #11243044; border: 1px solid var(--border); border-radius: 14px; }
-			.steps.show { display: block; }
-			.steps h2 { margin: 0 0 10px; font-size: 14px; color: var(--ok); }
-			.steps ol { padding-left: 18px; margin: 0; font-size: 13.5px; line-height: 1.7; color: var(--muted); }
-			.steps code { padding: 1px 5px; font-family: var(--mono); color: var(--text); background: var(--surface-2); border-radius: 5px; }
-			.foot { margin-top: 22px; font-size: 12px; line-height: 1.5; color: var(--subtle); }
+			.copy { position: absolute; top: 8px; right: 8px; padding: 5px 10px; font-family: var(--sans); font-size: 12px; font-weight: 500; color: var(--muted); cursor: pointer; background: var(--surface); border: 1px solid var(--border); border-radius: 8px; }
+			.copy:hover { color: var(--text); }
+
+			.foot { margin-top: 22px; font-size: 12px; line-height: 1.55; color: var(--subtle); }
+
+			.sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; white-space: nowrap; border: 0; clip: rect(0 0 0 0); }
+
+			/* Success view — replaces the whole card body after download. */
+			.done { text-align: center; animation: rise 0.3s cubic-bezier(0.22, 1, 0.36, 1) both; }
+			.done .check {
+				display: grid; place-items: center; width: 64px; height: 64px; margin: 4px auto 18px;
+				color: var(--success); background: var(--success-soft);
+				border: 1px solid color-mix(in srgb, var(--success) 35%, transparent); border-radius: 50%;
+			}
+			.done .check svg { width: 32px; height: 32px; }
+			.done h2 { margin: 0 0 8px; font-family: var(--display); font-size: 27px; font-weight: 700; }
+			.done .sub { margin: 0 0 24px; font-size: 16px; line-height: 1.5; color: var(--muted); }
+			.steps { padding: 0; margin: 0; text-align: left; list-style: none; counter-reset: step; }
+			.steps li {
+				position: relative; padding: 14px 16px 14px 56px; margin-bottom: 10px; font-size: 16px; line-height: 1.45;
+				color: var(--text); background: var(--surface-2); border: 1px solid var(--border); border-radius: var(--radius-xl);
+			}
+			.steps li::before {
+				position: absolute; top: 12px; left: 14px; display: grid; place-items: center; width: 28px; height: 28px;
+				font-family: var(--mono); font-size: 14px; font-weight: 600; color: var(--primary-fg);content: counter(step);
+				counter-increment: step; 
+				background: var(--primary); border-radius: 9px;
+			}
+			.steps b { font-family: var(--mono); font-size: 0.92em; font-weight: 600; color: var(--primary-strong); }
+			.done .again { margin-top: 22px; font-size: 13.5px; color: var(--muted); }
+			.done .again button { padding: 0; font: inherit; color: var(--primary-strong); text-decoration: underline; cursor: pointer; background: none; border: none; }
 		</style>
 	</head>
 	<body>
 		<main class="card">
-			<div class="brand"><span class="dot"></span> LibreTether</div>
-			<h1>Connect this computer</h1>
-			<p class="lede">
-				Type the code the person helping you read aloud, pick this computer's system, and download the
-				one-click installer. It connects this machine to their LibreTether — securely, with nothing else to set up.
-			</p>
+			<!-- Setup view -->
+			<section id="setup">
+				<div class="brand"><span class="dot"></span> LibreTether</div>
+				<h1>Connect this computer</h1>
+				<p class="lede">
+					Type the code the person helping you read aloud, then download and run the one-click installer. It
+					connects this machine to their LibreTether — securely, with nothing else to set up.
+				</p>
 
-			<label for="code">Your code</label>
-			<input aria-describedby="code-hint" autocapitalize="off" autocomplete="off" class="code-input" id="code" inputmode="text" placeholder="ABCD-EFGH" 
-				spellcheck="false" />
-			<p class="hint" id="code-hint">Two short blocks joined by a dash, e.g. <strong>4F9K-2A7C</strong>.</p>
+				<label class="field-label" for="code">Your code</label>
+				<input
+					aria-describedby="code-hint"
+					autocapitalize="off"
+					autocomplete="off"
+					autocorrect="off"
+					class="code-input"
+					id="code"
+					inputmode="text"
+					maxlength="9"
+					placeholder="ABCD-EFGH"
+					spellcheck="false"
+				/>
+				<p class="hint" id="code-hint">The dash is added for you — just type the <strong>8 characters</strong>.</p>
 
-			<fieldset class="os-row">
-				<legend class="sr-only">Operating system</legend>
-				<button aria-pressed="false" class="os" data-os="macos" type="button">macOS</button>
-				<button aria-pressed="false" class="os" data-os="windows" type="button">Windows</button>
-				<button aria-pressed="false" class="os" data-os="linux" type="button">Linux</button>
-			</fieldset>
-
-			<button class="primary" disabled id="download" >Download installer</button>
-			<div class="error" id="error" role="alert"></div>
-
-			<div class="steps" id="steps">
-				<h2>✓ Installer downloaded</h2>
-				<ol id="steps-list"></ol>
-			</div>
-
-			<details>
-				<summary>Prefer to paste a command instead?</summary>
-				<div class="cmd">
-					<pre id="cmd">Pick your system above.</pre>
-					<button class="copy" id="copy">Copy</button>
+				<div class="actions">
+					<button class="btn btn-download" disabled id="download" type="button" >
+						Download installer for <span id="dl-os">this computer</span>
+					</button>
+					<button aria-expanded="false" aria-haspopup="true" class="btn btn-more" disabled id="more" type="button" >
+						<span class="sr-only">Other systems</span>
+						<svg aria-hidden="true" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" viewBox="0 0 24 24" ><path d="m6 9 6 6 6-6" /></svg>
+					</button>
+					<div class="popover" hidden id="popover" >
+						<div class="popover-head">A different computer?</div>
+						<div id="popover-items"></div>
+					</div>
 				</div>
-			</details>
+				<div class="error" id="error" role="alert"></div>
 
-			<p class="foot">
-				The installer downloads the LibreTether agent from its official, checksum-verified release and connects it
-				to the relay you reached this page through. Your code is verified end-to-end; the relay never sees it.
-			</p>
+				<details>
+					<summary>Prefer to paste a command instead?</summary>
+					<div class="cmd">
+						<pre id="cmd">Enter your code above.</pre>
+						<button class="copy" id="copy" type="button">Copy</button>
+					</div>
+				</details>
+
+				<p class="foot">
+					The installer downloads the LibreTether agent from its official, checksum-verified release and connects
+					it to the relay you reached this page through. Your code is verified end-to-end; the relay never sees it.
+				</p>
+			</section>
+
+			<!-- Success view (replaces setup after download) -->
+			<section class="done" hidden id="done" >
+				<div class="check">
+					<svg aria-hidden="true" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" viewBox="0 0 24 24" ><path d="M20 6 9 17l-5-5" /></svg>
+				</div>
+				<h2>Installer downloaded</h2>
+				<p class="sub" id="done-sub">Now open it on this computer to finish connecting.</p>
+				<ol class="steps" id="done-steps"></ol>
+				<p class="again">
+					Nothing happened? <button id="redownload" type="button">Download again</button> ·
+					<button id="restart" type="button">start over</button>
+				</p>
+			</section>
 		</main>
 
 		<script>
-			// The published, signed installers (checksum-verified by each script).
+			// The published, signed installers (each script checksum-verifies the agent).
 			const RELEASE_BASE = "https://github.com/LibreTether/libretether/releases/latest/download";
-			// The relay's QUIC address: this page is served by the relay, and the relay
-			// listens on the default LibreTether port at the same host.
+			// The relay's QUIC address: this page is served by the relay, which listens on
+			// the default LibreTether port at the same host.
 			const RELAY_PORT = 47600;
 
-			// A valid code is two blocks of the unambiguous pairing alphabet joined by a
-			// dash. Validating here also guarantees nothing dangerous can be templated into
-			// the generated shell command (no quotes/spaces/metacharacters possible).
-			const CODE_RE = /^[A-Za-z0-9]+-[A-Za-z0-9]+$/;
-			// A hostname is letters/digits/dots/hyphens — reject anything else before
-			// embedding it in a command.
+			// Codes are always 4 chars + dash + 4 chars (NAMEPLATE_LEN/PASSWORD_LEN in the
+			// agent). Validate exactly that — it also guarantees nothing dangerous can be
+			// templated into the generated shell command (alphanumerics + one dash only).
+			const CODE_RE = /^[A-Za-z0-9]{4}-[A-Za-z0-9]{4}$/;
 			const HOST_RE = /^[A-Za-z0-9.-]+$/;
+			const OS_LABEL = { linux: "Linux", macos: "macOS", windows: "Windows" };
 
 			function relayAddress() {
 				const host = location.hostname;
@@ -179,25 +278,18 @@
 			function stepsFor(os) {
 				if (os === "windows")
 					return [
-						"Open your <strong>Downloads</strong> folder.",
-						"Double-click <code>libretether-connect.bat</code>.",
-						"If Windows warns, click <strong>More info → Run anyway</strong>, then approve the prompts.",
+						"Open your <b>Downloads</b> folder.",
+						"Double-click <b>libretether-connect.bat</b>.",
+						"If Windows warns, choose <b>More info → Run anyway</b>.",
 					];
 				if (os === "macos")
 					return [
-						"Open your <strong>Downloads</strong> folder.",
-						"Double-click <code>libretether-connect.command</code> (it opens Terminal and runs).",
-						"If macOS blocks it, right-click the file → <strong>Open</strong>, then confirm.",
+						"Open your <b>Downloads</b> folder.",
+						"Double-click <b>libretether-connect.command</b>.",
+						"If macOS blocks it, right-click it → <b>Open</b>, then confirm.",
 					];
-				return ["Open a terminal.", "Run <code>sh ~/Downloads/libretether-connect.sh</code>."];
+				return ["Open a terminal.", "Run <b>sh ~/Downloads/libretether-connect.sh</b>."];
 			}
-
-			const codeEl = document.getElementById("code");
-			const errEl = document.getElementById("error");
-			const dlEl = document.getElementById("download");
-			const stepsEl = document.getElementById("steps");
-			const cmdEl = document.getElementById("cmd");
-			let os = detectOs();
 
 			function detectOs() {
 				const ua = (navigator.userAgent || "").toLowerCase();
@@ -206,26 +298,34 @@
 				return "linux";
 			}
 
-			function selectOs(next) {
-				os = next;
-				for (const b of document.querySelectorAll(".os"))
-					b.setAttribute("aria-pressed", String(b.dataset.os === os));
-				refresh();
-			}
+			const $ = (id) => document.getElementById(id);
+			const codeEl = $("code");
+			const errEl = $("error");
+			const dlEl = $("download");
+			const moreEl = $("more");
+			const popoverEl = $("popover");
+			const cmdEl = $("cmd");
+			const detected = detectOs();
+			let lastOs = detected;
 
-			function currentCode() {
-				return codeEl.value.trim();
+			// Insert the middle dash as the user types/pastes: keep the alphanumerics
+			// (max 8), then split 4-4. Cursor goes to the end, which is fine for a short
+			// sequentially-typed code.
+			function formatCode(raw) {
+				const a = raw.replace(/[^A-Za-z0-9]/g, "").slice(0, 8);
+				return a.length > 4 ? `${a.slice(0, 4)}-${a.slice(4)}` : a;
 			}
 
 			function refresh() {
-				const code = currentCode();
+				const code = codeEl.value;
 				const valid = CODE_RE.test(code);
 				dlEl.disabled = !valid;
-				errEl.textContent = code && !valid ? "That code doesn't look right — it should look like 4F9K-2A7C." : "";
+				moreEl.disabled = !valid;
+				if (!valid) closePopover();
+				errEl.textContent = code.length >= 9 && !valid ? "That code doesn't look right — check it with your helper." : "";
 				if (valid) {
 					try {
-						const { content } = buildInstaller(os, relayAddress(), code);
-						cmdEl.textContent = content.replace(/\r/g, "").trim();
+						cmdEl.textContent = buildInstaller(lastOs, relayAddress(), code).content.replace(/\r/g, "").trim();
 					} catch {
 						cmdEl.textContent = "";
 					}
@@ -234,9 +334,10 @@
 				}
 			}
 
-			function download() {
-				const code = currentCode();
+			function download(os) {
+				const code = codeEl.value;
 				if (!CODE_RE.test(code)) return;
+				lastOs = os;
 				let file;
 				try {
 					file = buildInstaller(os, relayAddress(), code);
@@ -244,8 +345,7 @@
 					errEl.textContent = "Couldn't build the installer for this page.";
 					return;
 				}
-				const blob = new Blob([file.content], { type: file.mime });
-				const url = URL.createObjectURL(blob);
+				const url = URL.createObjectURL(new Blob([file.content], { type: file.mime }));
 				const a = document.createElement("a");
 				a.href = url;
 				a.download = file.filename;
@@ -253,27 +353,69 @@
 				a.click();
 				a.remove();
 				setTimeout(() => URL.revokeObjectURL(url), 2000);
-				document.getElementById("steps-list").innerHTML = stepsFor(os)
-					.map((s) => `<li>${s}</li>`)
-					.join("");
-				stepsEl.classList.add("show");
+				showDone(os);
 			}
 
-			for (const b of document.querySelectorAll(".os")) b.addEventListener("click", () => selectOs(b.dataset.os));
-			codeEl.addEventListener("input", refresh);
-			codeEl.addEventListener("keydown", (e) => {
-				if (e.key === "Enter" && !dlEl.disabled) download();
+			function showDone(os) {
+				closePopover();
+				$("done-sub").textContent =
+					os === "linux"
+						? "Now run it in a terminal to finish connecting this computer."
+						: "Now open it on this computer to finish connecting.";
+				$("done-steps").innerHTML = stepsFor(os).map((s) => `<li>${s}</li>`).join("");
+				$("setup").hidden = true;
+				$("done").hidden = false;
+				window.scrollTo({ top: 0 });
+			}
+
+			// Popover with the non-detected systems.
+			function buildPopover() {
+				$("popover-items").innerHTML = ["macos", "windows", "linux"]
+					.filter((os) => os !== detected)
+					.map((os) => `<button class="popover-item" type="button" data-os="${os}">${OS_LABEL[os]}</button>`)
+					.join("");
+				for (const b of $("popover-items").querySelectorAll(".popover-item"))
+					b.addEventListener("click", () => download(b.dataset.os));
+			}
+			function openPopover() {
+				popoverEl.hidden = false;
+				moreEl.setAttribute("aria-expanded", "true");
+			}
+			function closePopover() {
+				popoverEl.hidden = true;
+				moreEl.setAttribute("aria-expanded", "false");
+			}
+
+			// Wire up.
+			$("dl-os").textContent = OS_LABEL[detected];
+			buildPopover();
+			codeEl.addEventListener("input", () => {
+				codeEl.value = formatCode(codeEl.value);
+				refresh();
 			});
-			dlEl.addEventListener("click", download);
-			document.getElementById("copy").addEventListener("click", () => {
-				navigator.clipboard?.writeText(cmdEl.textContent || "");
+			codeEl.addEventListener("keydown", (e) => {
+				if (e.key === "Enter" && !dlEl.disabled) download(detected);
+			});
+			dlEl.addEventListener("click", () => download(detected));
+			moreEl.addEventListener("click", () => (popoverEl.hidden ? openPopover() : closePopover()));
+			document.addEventListener("click", (e) => {
+				if (!popoverEl.hidden && !e.target.closest(".actions")) closePopover();
+			});
+			document.addEventListener("keydown", (e) => {
+				if (e.key === "Escape") closePopover();
+			});
+			$("copy").addEventListener("click", () => navigator.clipboard?.writeText(cmdEl.textContent || ""));
+			$("redownload").addEventListener("click", () => download(lastOs));
+			$("restart").addEventListener("click", () => {
+				$("done").hidden = true;
+				$("setup").hidden = false;
+				codeEl.focus();
 			});
 
-			// Prefill the code from ?code= or #code (so a sent link can carry it), select
-			// the detected OS, and focus the input.
+			// Prefill the code from ?code= or #code (a sent link can carry it).
 			const fromUrl = new URLSearchParams(location.search).get("code") || decodeURIComponent(location.hash.slice(1));
-			if (fromUrl && CODE_RE.test(fromUrl.trim())) codeEl.value = fromUrl.trim();
-			selectOs(os);
+			if (fromUrl) codeEl.value = formatCode(fromUrl);
+			refresh();
 			codeEl.focus();
 
 			window.buildInstaller = buildInstaller;
