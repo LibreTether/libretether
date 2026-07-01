@@ -102,15 +102,23 @@ async fn drive(
 					break;
 				}
 			}
-			Ok(Inbound::Control(SessionServer::Meta { display, width, height })) => {
+			Ok(Inbound::Control(SessionServer::Meta {
+				display,
+				width,
+				height,
+				capture,
+				encoder,
+			})) => {
 				crate::logbook::debug(
 					"session",
-					&format!("session {id}: meta {width}x{height} (display {display})"),
+					&format!(
+						"session {id}: meta {width}x{height} (display {display}, capture {capture}, encoder {encoder})"
+					),
 				);
 				emit(
 					&app,
 					&format!("session:meta:{id}"),
-					serde_json::json!({ "display": display, "width": width, "height": height }),
+					serde_json::json!({ "display": display, "width": width, "height": height, "capture": capture, "encoder": encoder }),
 				)
 			}
 			Ok(Inbound::Control(SessionServer::Error { message })) => {

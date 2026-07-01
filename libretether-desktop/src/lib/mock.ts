@@ -312,7 +312,13 @@ export function mockInvoke(cmd: string, args?: Record<string, unknown>): Promise
 export function mockListen(event: string, cb: (e: { payload: unknown }) => void): UnlistenFn {
 	// Give the live-control overlay a resolution so it leaves the "starting" state.
 	if (event.startsWith("session:meta:")) {
-		const t = setTimeout(() => cb({ payload: { display: 0, height: 1080, width: 1920 } }), 300)
+		const t = setTimeout(
+			() =>
+				cb({
+					payload: { capture: "xcap", display: 0, encoder: "OpenH264 (software)", height: 1080, width: 1920 }
+				}),
+			300
+		)
 		return () => clearTimeout(t)
 	}
 	// Fake a successful pairing shortly after the phone-install view subscribes.

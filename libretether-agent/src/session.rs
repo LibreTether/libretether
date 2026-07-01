@@ -58,13 +58,22 @@ pub async fn run(mut send: SendStream, mut recv: RecvStream) -> std::io::Result<
 
 	#[cfg(target_os = "linux")]
 	if crate::platform::is_wayland() {
-		crate::net::debug("session backend: wayland (portals + pipewire)");
+		crate::net::debug("session backend: linux/wayland (portals + pipewire)");
 		let result = crate::wayland::run_session(cfg, send, recv).await;
 		crate::net::log("session ended");
 		return result;
 	}
 
-	crate::net::debug("session backend: x11/xcap");
+	// The non-Wayland path dispatches capture per-OS: X11 via xcap on Linux, DXGI
+	// Desktop Duplication on Windows (GDI fallback logged separately by `wincap`),
+	// CoreGraphics via xcap on macOS. The label reflects that, not the shared
+	// `x11_session` driver's name.
+	#[cfg(target_os = "windows")]
+	crate::net::debug("session backend: windows/dxgi");
+	#[cfg(target_os = "macos")]
+	crate::net::debug("session backend: macos/xcap");
+	#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+	crate::net::debug("session backend: linux/x11+xcap");
 	let result = x11_session(cfg, send, recv).await;
 	crate::net::log("session ended");
 	result
@@ -132,6 +141,8 @@ async fn x11_session(cfg: SessionConfig, mut send: SendStream, mut recv: RecvStr
 					display: cfg.display,
 					width: out.source_width,
 					height: out.source_height,
+					capture: shared.capture_backend().to_string(),
+					encoder: shared.encoder_backend().to_string(),
 				},
 			)
 			.await
@@ -180,5 +191,6 @@ fn spawn_capture(
 	stop: Arc<AtomicBool>,
 	tx: std::sync::mpsc::SyncSender<RawFrame>,
 ) -> std::thread::JoinHandle<()> {
+	shared.report_capture("xcap");
 	std::thread::spawn(move || crate::capture::poll_loop(display, shared, stop, tx))
 }

@@ -67,6 +67,7 @@ fn capture_loop(display: u32, shared: Arc<SharedConfig>, stop: Arc<AtomicBool>, 
 			Ok(dxgi) => {
 				ever_succeeded = true;
 				setup_failures = 0;
+				shared.report_capture("DXGI");
 				match unsafe { run_frames(&dxgi, &shared, &stop, &tx) } {
 					Ok(Outcome::Stopped) => return,
 					// `dxgi` drops here (releasing the duplication) before we rebuild.
@@ -86,6 +87,7 @@ fn capture_loop(display: u32, shared: Arc<SharedConfig>, stop: Arc<AtomicBool>, 
 						crate::net::log(&format!(
 							"DXGI duplication unavailable ({e}); falling back to GDI capture"
 						));
+						shared.report_capture("GDI");
 						crate::capture::poll_loop(display, shared, stop, tx);
 						return;
 					}

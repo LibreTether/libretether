@@ -16,7 +16,7 @@
 
 use std::borrow::Cow;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use image::imageops::{self, FilterType};
@@ -46,6 +46,12 @@ pub struct SharedConfig {
 	max_fps: AtomicU8,
 	auto: AtomicBool,
 	force_key: AtomicBool,
+	/// The actual capture backend, reported by whichever capture thread wins (DXGI
+	/// vs GDI on Windows, xcap elsewhere, PipeWire on Wayland), and the actual video
+	/// encoder, reported by the encode thread. Set once, read by the session's Meta
+	/// send so the controller can display exactly what's running.
+	capture_backend: OnceLock<&'static str>,
+	encoder_backend: OnceLock<&'static str>,
 }
 
 impl SharedConfig {
@@ -57,7 +63,24 @@ impl SharedConfig {
 			auto: AtomicBool::new(cfg.auto),
 			// The first frame of a session is always a full keyframe.
 			force_key: AtomicBool::new(true),
+			capture_backend: OnceLock::new(),
+			encoder_backend: OnceLock::new(),
 		})
+	}
+
+	/// Record the capture/encoder backend actually in use (first writer wins).
+	pub fn report_capture(&self, name: &'static str) {
+		let _ = self.capture_backend.set(name);
+	}
+	pub fn report_encoder(&self, name: &'static str) {
+		let _ = self.encoder_backend.set(name);
+	}
+	/// The reported backends, or "unknown" before the first frame has flowed.
+	pub fn capture_backend(&self) -> &'static str {
+		self.capture_backend.get().copied().unwrap_or("unknown")
+	}
+	pub fn encoder_backend(&self) -> &'static str {
+		self.encoder_backend.get().copied().unwrap_or("unknown")
 	}
 
 	/// Apply a new (already-sanitized) config live. Always forces a keyframe so the
@@ -141,6 +164,9 @@ pub fn run(
 	let mut built = (0u32, 0u8, 0u32, 0u32); // (bitrate, fps, width, height)
 	let mut last_hash: Option<u64> = None;
 	let mut last_dims = (0u32, 0u32);
+	// The active backend, logged once (and again only if it ever changes) so the
+	// Logs page shows exactly which encoder is running.
+	let mut announced: Option<&'static str> = None;
 
 	while let Ok(raw) = rx.recv() {
 		let bitrate = shared.bitrate_kbps();
@@ -164,6 +190,12 @@ pub fn run(
 		if enc.is_none() || built != (bitrate, fps, cw, ch) {
 			match build_encoder(cw as usize, ch as usize, bitrate, fps) {
 				Ok(e) => {
+					let kind = e.kind();
+					if announced != Some(kind) {
+						crate::net::log(&format!("h264 encoder: {kind}"));
+						announced = Some(kind);
+					}
+					shared.report_encoder(kind);
 					enc = Some(e);
 					built = (bitrate, fps, cw, ch);
 					last_hash = None;
@@ -262,6 +294,10 @@ pub(crate) trait ScreenEncoder {
 	/// encoder produced no output (a frame it dropped to hold the bitrate).
 	/// `force_key` requests an IDR for this frame.
 	fn encode(&mut self, rgba: &[u8], w: usize, h: usize, force_key: bool) -> anyhow::Result<Option<(bool, Vec<u8>)>>;
+
+	/// Human-readable backend name, logged once per session so an operator can see
+	/// which encoder is actually running (software vs hardware).
+	fn kind(&self) -> &'static str;
 }
 
 /// Pick the best backend for this platform: a hardware Media Foundation encoder on
@@ -273,13 +309,12 @@ fn build_encoder(width: usize, height: usize, bitrate_kbps: u32, fps: u8) -> any
 	#[cfg(all(windows, feature = "media-foundation"))]
 	{
 		match crate::mf_encoder::MediaFoundationEncoder::new(width, height, bitrate_kbps, fps) {
-			Ok(enc) => {
-				crate::net::log("h264: hardware Media Foundation encoder");
-				return Ok(Box::new(enc));
-			}
+			// `run` announces the chosen backend via `kind()`; here we only note the
+			// notable case where hardware was compiled in but couldn't be used.
+			Ok(enc) => return Ok(Box::new(enc)),
 			Err(e) => {
 				crate::net::log(&format!(
-					"h264: Media Foundation unavailable ({e:#}); using software OpenH264"
+					"h264: Media Foundation unavailable ({e:#}); falling back to software OpenH264"
 				));
 			}
 		}
@@ -351,6 +386,10 @@ impl ScreenEncoder for OpenH264Encoder {
 			return Ok(None);
 		}
 		Ok(Some((matches!(bs.frame_type(), FrameType::IDR | FrameType::I), au)))
+	}
+
+	fn kind(&self) -> &'static str {
+		"OpenH264 (software)"
 	}
 }
 

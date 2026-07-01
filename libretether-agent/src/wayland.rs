@@ -56,25 +56,17 @@ async fn serve(cfg: SessionConfig, mut send: SendStream, recv: RecvStream) -> Re
 		}
 	};
 
-	// The portal session's geometry is fixed, so Meta is sent once up front (the
-	// X11 path re-sends it on monitor changes; here there are none).
-	let _ = video::write_control(
-		&mut send,
-		&SessionServer::Meta {
-			display: cfg.display,
-			width: portal.width,
-			height: portal.height,
-		},
-	)
-	.await;
-
-	// Start the PipeWire capture thread feeding the shared tile-delta encoder.
+	// Start the PipeWire capture thread feeding the shared encoder. Meta is sent
+	// from the frame loop on the first frame (not up front like the geometry-only
+	// version was) so it can carry the encoder backend, which isn't known until the
+	// encode thread has built it.
 	let fd = portal
 		.screencast
 		.open_pipe_wire_remote(&portal.session, Default::default())
 		.await?;
 	let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 	let shared = SharedConfig::new(&cfg);
+	shared.report_capture("PipeWire");
 	let (raw_tx, raw_rx) = std::sync::mpsc::sync_channel::<RawFrame>(1);
 	let (out_tx, mut out_rx) = tokio::sync::mpsc::channel::<OutFrame>(2);
 	crate::pwstream::spawn(fd, portal.node_id, shared.clone(), stop.clone(), raw_tx);
@@ -133,8 +125,28 @@ async fn serve(cfg: SessionConfig, mut send: SendStream, recv: RecvStream) -> Re
 	};
 
 	// Frame loop: forward encoded frames until capture ends or the controller
-	// disconnects. Input is handled independently above.
+	// disconnects. Input is handled independently above. Meta goes out on the first
+	// frame, once both the capture and encoder backends have reported themselves.
+	let mut meta_sent = false;
 	while let Some(out) = out_rx.recv().await {
+		if !meta_sent {
+			meta_sent = true;
+			if video::write_control(
+				&mut send,
+				&SessionServer::Meta {
+					display: cfg.display,
+					width: out.source_width,
+					height: out.source_height,
+					capture: shared.capture_backend().to_string(),
+					encoder: shared.encoder_backend().to_string(),
+				},
+			)
+			.await
+			.is_err()
+			{
+				break;
+			}
+		}
 		if video::write_message(&mut send, &out.body).await.is_err() {
 			break;
 		}

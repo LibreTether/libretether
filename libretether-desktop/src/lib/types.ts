@@ -130,6 +130,10 @@ export interface SessionMeta {
 	display: number
 	width: number
 	height: number
+	/** Guest capture backend, e.g. "DXGI", "GDI", "xcap", "PipeWire". */
+	capture: string
+	/** Guest video encoder, e.g. "OpenH264 (software)", "Media Foundation (hardware)". */
+	encoder: string
 }
 
 /** Mirrors the Rust `SessionConfig` — the live screen-control quality knobs.

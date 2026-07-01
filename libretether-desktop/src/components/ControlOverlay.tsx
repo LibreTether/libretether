@@ -366,6 +366,7 @@ export function ControlOverlay({
 				<span className="font-mono text-xs text-white/45">
 					{meta ? `${meta.width}×${meta.height}` : "connecting…"}
 					{fps > 0 && ` · ${fps} fps`}
+					{meta && ` · ${meta.capture} · ${meta.encoder}`}
 				</span>
 				<span className="ml-auto flex items-center gap-2 text-xs text-white/45">
 					{readOnly ? <Eye className="h-3.5 w-3.5" /> : <Keyboard className="h-3.5 w-3.5" />}

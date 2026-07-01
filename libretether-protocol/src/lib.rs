@@ -40,8 +40,9 @@ pub const ALPN: &[u8] = b"libretether/1";
 /// the [`SessionClient::Configure`] live-quality control; v6 replaced the
 /// per-tile baseline-JPEG video format with a real inter-frame H.264 stream
 /// (decoded by WebCodecs on the controller) and swapped `SessionConfig.quality`
-/// (JPEG 1–100) for `SessionConfig.bitrate_kbps`.
-pub const PROTOCOL_VERSION: u32 = 6;
+/// (JPEG 1–100) for `SessionConfig.bitrate_kbps`; v7 added the live capture/encoder
+/// backend names to `SessionServer::Meta` (shown in the controller's session header).
+pub const PROTOCOL_VERSION: u32 = 7;
 
 /// Default UDP port the controller listens on for incoming agents.
 pub const DEFAULT_PORT: u16 = 47600;
@@ -404,11 +405,17 @@ pub enum SessionClient {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "t", rename_all = "snake_case")]
 pub enum SessionServer {
-	/// Sent once at start and whenever the captured (source) geometry changes.
+	/// Sent once the first frame is captured+encoded, and again whenever the
+	/// captured (source) geometry changes. Carries the live backends so the
+	/// controller can show exactly what the guest is using.
 	Meta {
 		display: u32,
 		width: u32,
 		height: u32,
+		/// Guest capture backend, e.g. "DXGI", "GDI", "xcap", "PipeWire".
+		capture: String,
+		/// Guest video encoder, e.g. "OpenH264 (software)", "Media Foundation (hardware)".
+		encoder: String,
 	},
 	Error {
 		message: String,
@@ -627,6 +634,8 @@ mod tests {
 			display: 0,
 			width: 1920,
 			height: 1080,
+			capture: "xcap".into(),
+			encoder: "OpenH264 (software)".into(),
 		};
 		assert!(matches!(
 			round_trip::<SessionServer>(&meta),

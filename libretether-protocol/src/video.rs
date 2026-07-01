@@ -174,12 +174,16 @@ mod tests {
 				display: 1,
 				width: 1920,
 				height: 1080,
+				capture: "DXGI".into(),
+				encoder: "OpenH264 (software)".into(),
 			},
 		)
 		.await
 		.unwrap();
 		match read_inbound(&mut b).await.unwrap() {
-			Inbound::Control(SessionServer::Meta { display, width, height }) => {
+			Inbound::Control(SessionServer::Meta {
+				display, width, height, ..
+			}) => {
 				assert_eq!((display, width, height), (1, 1920, 1080));
 			}
 			_ => panic!("expected a control message"),

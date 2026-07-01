@@ -263,6 +263,10 @@ impl ScreenEncoder for MediaFoundationEncoder {
 			}
 		}
 	}
+
+	fn kind(&self) -> &'static str {
+		"Media Foundation (hardware)"
+	}
 }
 
 impl Drop for MediaFoundationEncoder {
