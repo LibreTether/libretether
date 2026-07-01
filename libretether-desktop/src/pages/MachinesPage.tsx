@@ -289,9 +289,7 @@ function MachineRow({
 			<div className="flex items-center gap-3.5 px-3.5 py-3" onClick={onSelect}>
 				<StatusDot className="shrink-0" state={dotState(client)} />
 
-				<div className="grid h-10 w-10 shrink-0 place-items-center rounded-xl bg-surface-3 text-muted">
-					<OsIcon className="h-5 w-5" os={client.os} />
-				</div>
+				<OsIcon className="h-10 w-10 shrink-0 rounded-xl" os={client.os} />
 
 				<div className="min-w-0 flex-1">
 					<div className="flex items-center gap-2">

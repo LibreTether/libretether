@@ -4,6 +4,7 @@ import type { ClientOs } from "../lib/types"
 
 export function OsIcon({ os, className }: { os: ClientOs; className?: string }) {
 	const Icon = OS_META[os]?.icon ?? Monitor
+
 	return <Icon className={className} />
 }
 

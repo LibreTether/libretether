@@ -3,8 +3,13 @@
 // controller form, the sidebar, the deploy modal and the machine list don't each
 // re-declare (and risk drifting on) the same maps.
 
-import { Apple, type LucideIcon, Monitor, Network, Server, Terminal, Wifi } from "lucide-react"
+import { type LucideIcon, Network, Server, Wifi } from "lucide-react"
+import type { ComponentType } from "react"
+import { LinuxLogo, MacosLogo, WindowsLogo } from "../components/OsLogos"
 import type { ClientOs, ControllerType } from "./types"
+
+/** An icon component that only needs a `className` (lucide glyphs and our OS tiles both qualify). */
+type IconComponent = ComponentType<{ className?: string }>
 
 export const CONTROLLER_TYPE_META: Record<ControllerType, { label: string; icon: LucideIcon; help: string }> = {
 	direct: {
@@ -24,11 +29,11 @@ export const CONTROLLER_TYPE_META: Record<ControllerType, { label: string; icon:
 	}
 }
 
-export const OS_META: Record<ClientOs, { label: string; icon: LucideIcon; runHint: string }> = {
-	linux: { icon: Terminal, label: "Linux", runHint: "Run this on the client machine you want to control:" },
-	macos: { icon: Apple, label: "macOS", runHint: "Run this on the client Mac you want to control:" },
+export const OS_META: Record<ClientOs, { label: string; icon: IconComponent; runHint: string }> = {
+	linux: { icon: LinuxLogo, label: "Linux", runHint: "Run this on the client machine you want to control:" },
+	macos: { icon: MacosLogo, label: "macOS", runHint: "Run this on the client Mac you want to control:" },
 	windows: {
-		icon: Monitor,
+		icon: WindowsLogo,
 		label: "Windows",
 		runHint: "Run this in PowerShell on the client PC you want to control:"
 	}
