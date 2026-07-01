@@ -5,7 +5,7 @@
 //! [`ActiveController`] passed in, so each controller is fully isolated.
 
 use std::collections::HashSet;
-use std::net::SocketAddr;
+use std::net::{Ipv6Addr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -18,7 +18,6 @@ use libretether_protocol::{
 	tls, Challenge, ControlRequest, ControlResponse, Hello, HelloAck, LogsResult, SessionGrant, StreamOpen,
 	DEFAULT_EXEC_TIMEOUT_SECS, MAX_EXEC_TIMEOUT_SECS, PROTOCOL_VERSION,
 };
-use quinn::Endpoint;
 use tauri::Emitter;
 use uuid::Uuid;
 
@@ -88,7 +87,12 @@ pub async fn serve(state: AppState, ctrl: Arc<ActiveController>) {
 	// controller unable to listen at all), and the wider bind is safe because every
 	// agent is authenticated end-to-end with Ed25519 — an attacker who reaches the
 	// port but can't complete the mutual handshake is rejected before any command.
-	let endpoint = match Endpoint::server(tls::server_config(cert, key), SocketAddr::from(([0, 0, 0, 0], port))) {
+	//
+	// Bind the dual-stack `[::]` wildcard (not `0.0.0.0`, which is IPv4-only) so an
+	// agent can dial the controller over IPv6 as well as IPv4 — otherwise a Direct
+	// controller reachable only at its IPv6 address is silently unreachable. See
+	// `tls::server_endpoint`.
+	let endpoint = match tls::server_endpoint(cert, key, SocketAddr::from((Ipv6Addr::UNSPECIFIED, port))) {
 		Ok(ep) => ep,
 		Err(e) => {
 			log_err(&format!("could not listen on udp/{port}: {e}"));
@@ -509,8 +513,11 @@ mod tests {
 	use super::*;
 	use crate::registry::{ClientOs, ClientStore};
 	use crate::state::ControllerProfile;
+	// Direct/Tailscale serving now binds via `tls::server_endpoint`; the loopback test
+	// harness builds bare endpoints itself, so `Endpoint` is only used under test.
 	use libretether_protocol::crypto::Identity;
 	use libretether_protocol::{AgentStatus, HostInfo, StreamAuth};
+	use quinn::Endpoint;
 	use std::net::Ipv4Addr;
 
 	fn temp_dir() -> std::path::PathBuf {

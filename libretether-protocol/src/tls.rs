@@ -68,6 +68,46 @@ pub fn server_config(cert_der: Vec<u8>, key_der: Vec<u8>) -> quinn::ServerConfig
 	cfg
 }
 
+/// Build a QUIC **server** [`Endpoint`](quinn::Endpoint) bound to `addr`.
+///
+/// When `addr` is IPv6 the socket is made dual-stack — `IPV6_V6ONLY` is cleared —
+/// so a `[::]` listener accepts IPv4-mapped clients as well as native IPv6 ones.
+/// That option defaults *on* under Windows and some BSDs, where a plain `[::]`
+/// bind would silently refuse every IPv4 agent; clearing it makes one socket serve
+/// both families uniformly across platforms. quinn's `Endpoint::server` binds a
+/// blocking `UdpSocket` with default options and gives no hook to set this, so we
+/// bind the socket ourselves and hand it to `Endpoint::new`.
+///
+/// The controller listens on `[::]` (so agents reach it over either family) and the
+/// relay's default `[::]` listen gets the same behavior; a specific v4/v6 bind is
+/// honored as-is.
+pub fn server_endpoint(cert_der: Vec<u8>, key_der: Vec<u8>, addr: SocketAddr) -> std::io::Result<quinn::Endpoint> {
+	let socket = bind_server_socket(addr)?;
+	quinn::Endpoint::new(
+		quinn::EndpointConfig::default(),
+		Some(server_config(cert_der, key_der)),
+		socket,
+		Arc::new(quinn::TokioRuntime),
+	)
+}
+
+/// Bind the UDP socket for [`server_endpoint`], clearing `IPV6_V6ONLY` on IPv6
+/// binds so `[::]` is dual-stack everywhere (see that function). Split out so the
+/// socket-option handling lives in one place. quinn sets the socket non-blocking
+/// when it wraps it, so we leave that to the runtime.
+fn bind_server_socket(addr: SocketAddr) -> std::io::Result<std::net::UdpSocket> {
+	use socket2::{Domain, Protocol, Socket, Type};
+	let domain = if addr.is_ipv6() { Domain::IPV6 } else { Domain::IPV4 };
+	let socket = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))?;
+	if addr.is_ipv6() {
+		// Accept IPv4-mapped clients on a `[::]` bind. Best-effort: a platform that
+		// refuses the toggle still binds (IPv6-only); a specific v6 bind is unaffected.
+		let _ = socket.set_only_v6(false);
+	}
+	socket.bind(&addr.into())?;
+	Ok(socket.into())
+}
+
 /// Build the agent's QUIC client config (encrypt-only; identity is checked at
 /// the application layer).
 pub fn client_config() -> quinn::ClientConfig {
@@ -162,5 +202,39 @@ mod danger {
 				SignatureScheme::RSA_PSS_SHA256,
 			]
 		}
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use std::net::{Ipv4Addr, Ipv6Addr};
+
+	/// A `[::]` server endpoint must accept a client dialing it over IPv4 (as an
+	/// IPv4-mapped peer) — this is the dual-stack guarantee `server_endpoint` adds
+	/// over a plain `Endpoint::server([::])`, which is IPv6-only under Windows/BSD.
+	/// This is exactly the path a Direct-mode agent takes when the controller now
+	/// listens on `[::]` but the agent reaches it over IPv4.
+	#[tokio::test]
+	async fn server_endpoint_on_v6_wildcard_accepts_an_ipv4_client() {
+		install_crypto_provider();
+		let (cert, key) = self_signed();
+		let server = server_endpoint(cert, key, (Ipv6Addr::UNSPECIFIED, 0).into()).expect("bind dual-stack server");
+		let port = server.local_addr().unwrap().port();
+
+		let accept = tokio::spawn(async move {
+			let incoming = server.accept().await.expect("incoming connection");
+			incoming.await.expect("handshake completes");
+		});
+
+		// Dial over IPv4 loopback — the dual-stack listener sees it as `::ffff:127.0.0.1`.
+		let target: SocketAddr = (Ipv4Addr::LOCALHOST, port).into();
+		let client = client_endpoint(target).expect("client endpoint");
+		client
+			.connect(target, "libretether.local")
+			.expect("start connect")
+			.await
+			.expect("connect over IPv4 to the [::] listener");
+		accept.await.unwrap();
 	}
 }

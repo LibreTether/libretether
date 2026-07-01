@@ -161,6 +161,20 @@ path in progress; see below.
 
 ## Planned next steps
 
+- **End-to-end encryption in relay mode.** Today the relay terminates QUIC/TLS on both hops and
+  forwards the *decrypted* stream, so a relay host is trusted for confidentiality (mutual Ed25519
+  auth and the capability token are end-to-end, but the payload is not). Wrap the session in an
+  application-layer AEAD keyed to the Ed25519 identities already pinned at enrollment — a Noise
+  handshake over the existing QUIC stream — so the relay only ever sees ciphertext, removing the
+  "trusted relay host" assumption and matching what Tailscale's WireGuard gives its DERP path.
+
+- **Peer-to-peer NAT traversal (STUN/TURN).** Attempt a direct UDP hole-punch before falling back
+  to relaying: the relay already sees each peer's public address, so it can double as the
+  signaling/STUN rendezvous, with peers upgrading to a direct QUIC path when the punch succeeds
+  and staying on the relay (as TURN) when it can't (symmetric NAT/CGNAT). Most sessions would go
+  direct — lower latency, no metered relay egress — while the relay carries only the hard-NAT
+  minority. Pairs naturally with the E2E layer above, which keeps even the fallback path private.
+
 - **Hardware video encoding on Windows (Media Foundation).** Finish the GPU H.264 path on
   Windows guests. A Media Foundation encoder backend is written and compiles, but it needs
   runtime validation on real hardware before it's switched on by default — today it sits behind

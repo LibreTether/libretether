@@ -24,7 +24,7 @@ use libretether_protocol::relay::{
 	RelayAck, RelayChallenge, RelayEvent, RelayHello, RelayProof, RelayRequest, RelayRole,
 };
 use libretether_protocol::{secret, tls, DEFAULT_PORT};
-use quinn::{Endpoint, RecvStream, SendStream};
+use quinn::{RecvStream, SendStream};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
@@ -377,7 +377,10 @@ fn print_credentials(cfg: &ServerConfig, listen: &str) {
 async fn run(cfg: ServerConfig, data_dir: PathBuf, listen_addr: String) -> Result<()> {
 	let (cert, key) = cfg.cert_key()?;
 	let addr: SocketAddr = listen_addr.parse().context("invalid listen address")?;
-	let endpoint = Endpoint::server(tls::server_config(cert, key), addr)?;
+	// Dual-stack when the listen address is `[::]` (the default), so IPv4 peers reach
+	// the relay too even under Windows/BSD where `IPV6_V6ONLY` defaults on. See
+	// `tls::server_endpoint`.
+	let endpoint = tls::server_endpoint(cert, key, addr).context("bind relay QUIC listener")?;
 	logbook::info(&format!("relay listening on udp/{addr}"));
 	// Don't echo the secrets on every `run` — they'd persist in the journal /
 	// `docker logs` for the life of the deployment. `libretether-relay info` prints
@@ -826,6 +829,9 @@ async fn pipe(c_recv: RecvStream, a_send: SendStream, a_recv: RecvStream, c_send
 mod tests {
 	use super::*;
 	use libretether_protocol::crypto::Identity;
+	// The relay now binds via `tls::server_endpoint`; the test harness still spins up
+	// bare loopback endpoints directly, so `Endpoint` is only referenced under test.
+	use quinn::Endpoint;
 	use std::net::Ipv4Addr;
 
 	/// A standalone agent-pool permit for tests that call `serve_agent` directly
