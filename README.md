@@ -59,7 +59,9 @@ log in:
 - **Tailscale** — clients join your tailnet non-interactively (free NAT traversal via Tailscale).
 - **Direct** — clients dial your controller's address (LAN, VPN, or a port-forward on *your* end).
 - **Relay** — both ends dial *out* to a small relay you run on a public host, so nothing anywhere
-  is exposed. See **[Running a relay](.github/RELAY.md)**.
+  is exposed. Sessions **automatically upgrade to a direct peer-to-peer path** (NAT hole-punch)
+  when the network allows, falling back to the relay only when it can't. See
+  **[Running a relay](.github/RELAY.md)**.
 
 The [Architecture guide](.github/ARCHITECTURE.md) covers the video pipeline, capture backends,
 and the full security model.
@@ -136,8 +138,10 @@ graphical session):
   trust-on-first-use**.
 - The link doesn't trust the network: even a man-in-the-middle, or someone holding only a relay
   secret, can't impersonate the controller and drive an agent.
-- QUIC encrypts everything (TLS 1.3). In relay mode the relay only forwards bytes, but it *can*
-  see the decrypted stream, so use a relay host you trust.
+- QUIC encrypts everything (TLS 1.3), and the controller↔agent session is **additionally wrapped
+  in an application-layer AEAD** keyed to the pinned Ed25519 identities (a signed X25519 key
+  agreement with forward secrecy). Even in relay mode the relay only ever forwards ciphertext — it
+  can't see your screen, keystrokes, command output, or tunneled RDP/SSH.
 
 Full details — mutual handshake, capability tokens, the SPAKE2 phone-pairing flow — are in the
 [Architecture guide](.github/ARCHITECTURE.md#security-model).
@@ -153,27 +157,15 @@ An early but capable build. Working today:
   and live quality controls
 - ✅ **Wayland support** via XDG portals (X11 too)
 - ✅ **RDP** and **SSH** one-click connect (SSH needs nothing installed on the client)
-- ✅ **Relay mode** + phone-friendly browser pairing
+- ✅ **Relay mode** + phone-friendly browser pairing, with **end-to-end encryption** so the relay
+  host only ever sees ciphertext, and **automatic peer-to-peer NAT hole-punching** that upgrades
+  sessions to a direct path when the network allows
 - ✅ In-app **Logs** — live controller activity plus on-demand agent logs
 
 Video encoding is currently software H.264 (OpenH264) on all platforms, with a hardware Windows
 path in progress; see below.
 
 ## Planned next steps
-
-- **End-to-end encryption in relay mode.** Today the relay terminates QUIC/TLS on both hops and
-  forwards the *decrypted* stream, so a relay host is trusted for confidentiality (mutual Ed25519
-  auth and the capability token are end-to-end, but the payload is not). Wrap the session in an
-  application-layer AEAD keyed to the Ed25519 identities already pinned at enrollment — a Noise
-  handshake over the existing QUIC stream — so the relay only ever sees ciphertext, removing the
-  "trusted relay host" assumption and matching what Tailscale's WireGuard gives its DERP path.
-
-- **Peer-to-peer NAT traversal (STUN/TURN).** Attempt a direct UDP hole-punch before falling back
-  to relaying: the relay already sees each peer's public address, so it can double as the
-  signaling/STUN rendezvous, with peers upgrading to a direct QUIC path when the punch succeeds
-  and staying on the relay (as TURN) when it can't (symmetric NAT/CGNAT). Most sessions would go
-  direct — lower latency, no metered relay egress — while the relay carries only the hard-NAT
-  minority. Pairs naturally with the E2E layer above, which keeps even the fallback path private.
 
 - **Hardware video encoding on Windows (Media Foundation).** Finish the GPU H.264 path on
   Windows guests. A Media Foundation encoder backend is written and compiles, but it needs

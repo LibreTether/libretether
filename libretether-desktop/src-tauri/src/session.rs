@@ -15,6 +15,7 @@ use libretether_protocol::video::{self, Inbound};
 use libretether_protocol::{InputEvent, SessionClient, SessionConfig, SessionServer, StreamOpen};
 use tauri::ipc::{Channel, InvokeResponseBody};
 use tauri::{AppHandle, Emitter};
+use tokio::io::AsyncWriteExt;
 use uuid::Uuid;
 
 use crate::error::{AppError, AppResult};
@@ -87,7 +88,7 @@ async fn drive(
 				break;
 			}
 			if stop {
-				let _ = send.finish();
+				let _ = send.shutdown().await;
 				break;
 			}
 		}

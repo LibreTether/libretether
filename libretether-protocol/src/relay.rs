@@ -83,6 +83,34 @@ pub enum RelayEvent {
 	Heartbeat,
 }
 
+/// Relay → agent signals, pushed on the agent's hello stream (the same stream the
+/// agent opened to register, which it otherwise leaves idle). Symmetric to the
+/// controller's [`RelayEvent`] channel.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "t", rename_all = "snake_case")]
+pub enum RelaySignal {
+	/// The controller wants to establish a direct peer-to-peer path (NAT hole-punch).
+	/// `controller_addr` is the controller's reflexive address as the relay observed
+	/// it; the agent dials it directly from its relay socket while the controller
+	/// punches its own NAT open. `rendezvous` correlates the attempt in logs — the
+	/// direct connection is still authenticated by the normal mutual handshake, so a
+	/// bogus address just fails to authenticate and is dropped (fail-closed).
+	Punch {
+		controller_addr: String,
+		rendezvous: String,
+	},
+}
+
+/// The controller's response to a [`RelayRequest::Punch`]: where to expect the agent
+/// (its reflexive address) and the rendezvous id the relay also handed the agent.
+/// `peer_addr` is `None` when the relay can't broker the punch — the agent is offline
+/// or the relay doesn't know its address — so the controller stays on the relay path.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PunchResponse {
+	pub peer_addr: Option<String>,
+	pub rendezvous: String,
+}
+
 /// First frame the controller writes on each stream it opens to the relay.
 ///
 /// Most streams are [`Self::Route`] — the relay strips this header and pipes
@@ -106,6 +134,12 @@ pub enum RelayRequest {
 	/// so the controller and the new machine can run the PAKE end-to-end (see
 	/// [`crate::pairing`]). The relay only matches by nameplate and forwards bytes.
 	OpenPairing { nameplate: String },
+	/// Ask the relay to broker a peer-to-peer hole-punch to `agent`: it hands the
+	/// agent the controller's reflexive address (over the agent's signal channel) and
+	/// replies with a [`PunchResponse`] carrying the agent's reflexive address. Both
+	/// then try to establish a direct QUIC path, upgrading off the relay when the punch
+	/// succeeds. Answered by the relay, not forwarded to an agent.
+	Punch { agent: String },
 }
 
 /// The client side of the relay handshake, shared by the agent and the
@@ -182,4 +216,77 @@ pub async fn pairing_join(
 	)
 	.await?;
 	Ok((send, recv))
+}
+
+/// The controller's side of asking the relay to broker a peer-to-peer hole-punch to
+/// `agent`: open a stream, send [`RelayRequest::Punch`], and read the [`PunchResponse`]
+/// telling it where to expect the agent. The relay answers this itself (it doesn't
+/// route it to the agent). A `peer_addr` of `None` means the relay couldn't broker it
+/// and the controller should stay on the relay path.
+pub async fn request_punch(conn: &quinn::Connection, agent: &str) -> std::io::Result<PunchResponse> {
+	let (mut send, mut recv) = conn
+		.open_bi()
+		.await
+		.map_err(|e| std::io::Error::new(std::io::ErrorKind::ConnectionRefused, format!("open punch stream: {e}")))?;
+	write_frame(
+		&mut send,
+		&RelayRequest::Punch {
+			agent: agent.to_string(),
+		},
+	)
+	.await?;
+	let _ = send.finish();
+	read_frame_capped(&mut recv, MAX_CONTROL_FRAME).await
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	fn round_trip<T: Serialize + serde::de::DeserializeOwned>(value: &T) -> T {
+		serde_json::from_str(&serde_json::to_string(value).unwrap()).unwrap()
+	}
+
+	#[test]
+	fn punch_request_and_response_round_trip() {
+		// The new Punch request tag survives, distinct from the routing variants.
+		let req = RelayRequest::Punch {
+			agent: "AGENT_KEY".into(),
+		};
+		assert_eq!(serde_json::to_value(&req).unwrap()["t"], "punch");
+		assert!(matches!(round_trip(&req), RelayRequest::Punch { agent } if agent == "AGENT_KEY"));
+
+		// A brokered response carries the peer's reflexive address and rendezvous id.
+		let ok = PunchResponse {
+			peer_addr: Some("203.0.113.4:47600".into()),
+			rendezvous: "rv-1".into(),
+		};
+		let back = round_trip(&ok);
+		assert_eq!(back.peer_addr.as_deref(), Some("203.0.113.4:47600"));
+		assert_eq!(back.rendezvous, "rv-1");
+
+		// `None` (relay can't broker) round-trips too, so the controller can tell
+		// "stay on the relay" apart from a real address.
+		assert!(round_trip(&PunchResponse {
+			peer_addr: None,
+			rendezvous: "rv-2".into(),
+		})
+		.peer_addr
+		.is_none());
+	}
+
+	#[test]
+	fn punch_signal_round_trips() {
+		let sig = RelaySignal::Punch {
+			controller_addr: "198.51.100.9:47600".into(),
+			rendezvous: "rv-3".into(),
+		};
+		assert_eq!(serde_json::to_value(&sig).unwrap()["t"], "punch");
+		let RelaySignal::Punch {
+			controller_addr,
+			rendezvous,
+		} = round_trip(&sig);
+		assert_eq!(controller_addr, "198.51.100.9:47600");
+		assert_eq!(rendezvous, "rv-3");
+	}
 }

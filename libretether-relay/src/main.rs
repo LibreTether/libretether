@@ -21,7 +21,7 @@ use libretether_common::{pipe_bidirectional, shutdown_signal};
 use libretether_protocol::crypto::{self, random_alnum};
 use libretether_protocol::frame::{read_frame_capped, write_frame, MAX_CONTROL_FRAME};
 use libretether_protocol::relay::{
-	RelayAck, RelayChallenge, RelayEvent, RelayHello, RelayProof, RelayRequest, RelayRole,
+	PunchResponse, RelayAck, RelayChallenge, RelayEvent, RelayHello, RelayProof, RelayRequest, RelayRole, RelaySignal,
 };
 use libretether_protocol::{secret, tls, DEFAULT_PORT};
 use quinn::{RecvStream, SendStream};
@@ -225,9 +225,16 @@ struct Pending {
 	created: Instant,
 }
 
+/// A registered agent: its routing connection plus a channel to push relay→agent
+/// signals (e.g. a hole-punch request) on its otherwise-idle hello stream.
+struct AgentHandle {
+	conn: quinn::Connection,
+	signals: UnboundedSender<RelaySignal>,
+}
+
 #[derive(Clone, Default)]
 struct Relay {
-	agents: Arc<Mutex<HashMap<String, quinn::Connection>>>,
+	agents: Arc<Mutex<HashMap<String, AgentHandle>>>,
 	controller: ControllerSlot,
 	/// Open pairing slots keyed by nameplate (see [`crate::Pending`]). The relay only
 	/// matches by nameplate and pipes the two streams; it never sees the PAKE password
@@ -239,7 +246,26 @@ struct Relay {
 
 impl Relay {
 	fn agent(&self, public_key: &str) -> Option<quinn::Connection> {
-		self.agents.lock().unwrap().get(public_key).cloned()
+		self.agents.lock().unwrap().get(public_key).map(|h| h.conn.clone())
+	}
+
+	/// The agent's reflexive address as the relay observed it (the source address of
+	/// its QUIC connection) — the "STUN" half of brokering a peer-to-peer punch.
+	fn agent_addr(&self, public_key: &str) -> Option<SocketAddr> {
+		self.agents
+			.lock()
+			.unwrap()
+			.get(public_key)
+			.map(|h| h.conn.remote_address())
+	}
+
+	/// Push a signal to a registered agent over its hello-stream channel. Returns
+	/// false if the agent isn't registered (or its signal task has ended).
+	fn signal_agent(&self, public_key: &str, signal: RelaySignal) -> bool {
+		match self.agents.lock().unwrap().get(public_key) {
+			Some(h) => h.signals.send(signal).is_ok(),
+			None => false,
+		}
 	}
 
 	fn notify(&self, event: RelayEvent) {
@@ -492,7 +518,7 @@ async fn handle(
 				logbook::warn("agent connection refused: at agent capacity");
 				return Ok(());
 			};
-			serve_agent(relay, conn, authed.public_key, permit).await
+			serve_agent(relay, conn, authed.public_key, authed.send, permit).await
 		}
 	}
 }
@@ -660,6 +686,11 @@ async fn serve_controller(relay: Relay, conn: quinn::Connection, mut events: Sen
 		})
 	};
 
+	// The controller's reflexive address, constant for the connection's lifetime —
+	// captured once so each per-stream task (which moves its captures) doesn't need to
+	// borrow `conn`, which the accept loop keeps using.
+	let controller_addr = conn.remote_address();
+
 	// Each stream the controller opens leads with a RelayRequest header: either route
 	// it to the named agent (the common case) or serve it ourselves (the relay's own
 	// logs).
@@ -714,6 +745,37 @@ async fn serve_controller(relay: Relay, conn: quinn::Connection, mut events: Sen
 						}
 					}
 				}
+				// Broker a peer-to-peer hole-punch: hand the agent the controller's
+				// reflexive address over its signal channel, and reply with the agent's.
+				// Both then try a direct QUIC path and upgrade off the relay if it forms.
+				// The relay only exchanges addresses — the direct connection is still
+				// authenticated end-to-end by the normal handshake.
+				RelayRequest::Punch { agent } => {
+					let agent_key = crypto::canonical_pubkey(&agent).unwrap_or(agent);
+					let rendezvous = crypto::random_nonce_b64();
+					let peer_addr = match relay.agent_addr(&agent_key) {
+						Some(agent_addr)
+							if relay.signal_agent(
+								&agent_key,
+								RelaySignal::Punch {
+									controller_addr: controller_addr.to_string(),
+									rendezvous: rendezvous.clone(),
+								},
+							) =>
+						{
+							logbook::debug(&format!(
+								"brokering a punch: controller {controller_addr} ↔ agent {}… at {agent_addr}",
+								key8(&agent_key)
+							));
+							Some(agent_addr.to_string())
+						}
+						// Agent offline, unknown, or its signal channel is gone: the
+						// controller stays on the relay path.
+						_ => None,
+					};
+					let _ = write_frame(&mut c_send, &PunchResponse { peer_addr, rendezvous }).await;
+					let _ = c_send.finish();
+				}
 				// Park this stream as a pairing slot. The relay holds its halves until a
 				// `Pairing` peer joins with the same nameplate (then pipes them) or the
 				// slot expires; it never reads the PAKE/bundle that flow over the pipe.
@@ -751,26 +813,48 @@ async fn serve_controller(relay: Relay, conn: quinn::Connection, mut events: Sen
 }
 
 /// `_permit` ties an agent-pool slot to this connection's lifetime (see
-/// CONTROLLER_RESERVED): it is released when the connection ends.
+/// CONTROLLER_RESERVED): it is released when the connection ends. `hello_send` is the
+/// agent's hello-stream send half, reused to push relay→agent signals (hole-punch
+/// requests) — the agent leaves that stream idle after registering.
 async fn serve_agent(
 	relay: Relay,
 	conn: quinn::Connection,
 	public_key: String,
+	mut hello_send: SendStream,
 	_permit: OwnedSemaphorePermit,
 ) -> Result<()> {
 	let conn_id = conn.stable_id();
+
+	// Forward relay→agent signals onto the hello stream. Symmetric to the
+	// controller's presence-event task; ends when the channel closes (agent gone).
+	let (signals, mut rx) = tokio::sync::mpsc::unbounded_channel::<RelaySignal>();
+	let signal_task = tokio::spawn(async move {
+		while let Some(sig) = rx.recv().await {
+			if write_frame(&mut hello_send, &sig).await.is_err() {
+				break;
+			}
+		}
+	});
+
 	// Register, displacing any prior connection under this key. An honest agent
 	// holds exactly one connection; force-closing a stale predecessor frees its
 	// slot/permit immediately instead of waiting for its own `closed()` to fire,
 	// and bounds a single identity to one live connection.
-	let previous = relay.agents.lock().unwrap().insert(public_key.clone(), conn.clone());
+	let previous = relay.agents.lock().unwrap().insert(
+		public_key.clone(),
+		AgentHandle {
+			conn: conn.clone(),
+			signals,
+		},
+	);
 	if let Some(prev) = previous {
-		if prev.stable_id() != conn_id {
+		if prev.conn.stable_id() != conn_id {
 			logbook::debug(&format!(
 				"agent {}… reconnected — closing its previous connection",
 				key8(&public_key)
 			));
-			prev.close(0u32.into(), b"replaced by a newer connection for this key");
+			prev.conn
+				.close(0u32.into(), b"replaced by a newer connection for this key");
 		}
 	}
 	logbook::info(&format!("agent {}… registered and reachable", key8(&public_key)));
@@ -780,13 +864,14 @@ async fn serve_agent(
 
 	conn.closed().await;
 	logbook::debug(&format!("agent {}… connection closed", key8(&public_key)));
+	signal_task.abort();
 
 	// Only deregister if we're still the registered connection for this key. A
 	// reconnect can replace us with a fresh connection before our `closed()`
 	// fires; removing then would wrongly mark a live agent offline (stale-cleanup
 	// race), and the agent would stay unreachable until its new connection drops.
 	let mut agents = relay.agents.lock().unwrap();
-	if agents.get(&public_key).map(|c| c.stable_id()) == Some(conn_id) {
+	if agents.get(&public_key).map(|h| h.conn.stable_id()) == Some(conn_id) {
 		agents.remove(&public_key);
 		drop(agents);
 		logbook::info(&format!("agent {}… deregistered (offline)", key8(&public_key)));
@@ -1060,6 +1145,19 @@ mod tests {
 		(events_send, hello_recv)
 	}
 
+	/// Open the agent's "hello" stream and hand back the relay-side send half
+	/// `serve_agent` pushes signals on, plus the agent-side recv half it reads them
+	/// from — the peer-to-peer signal channel. Mirrors [`open_events`] for the agent.
+	async fn open_agent_hello(
+		agent_conn: &quinn::Connection,
+		agent_view: &quinn::Connection,
+	) -> (quinn::SendStream, quinn::RecvStream) {
+		let (mut a_send, a_recv) = agent_conn.open_bi().await.unwrap();
+		a_send.write_all(b"\x00").await.unwrap(); // materialize so the relay accepts it
+		let (relay_send, _relay_recv) = agent_view.accept_bi().await.unwrap();
+		(relay_send, a_recv)
+	}
+
 	/// Poll `cond` until true, failing the test if it never becomes true.
 	async fn wait_until(mut cond: impl FnMut() -> bool) {
 		for _ in 0..400 {
@@ -1085,9 +1183,10 @@ mod tests {
 
 		// Register an agent.
 		let (_aep, agent_conn, agent_view) = connect(&relay_ep, addr).await;
+		let (hello_send, _sig_recv) = open_agent_hello(&agent_conn, &agent_view).await;
 		tokio::spawn({
 			let (relay, key) = (relay.clone(), agent_key.clone());
-			async move { serve_agent(relay, agent_view, key, agent_permit()).await }
+			async move { serve_agent(relay, agent_view, key, hello_send, agent_permit()).await }
 		});
 		wait_until(|| relay.agent(&agent_key).is_some()).await;
 
@@ -1282,9 +1381,10 @@ mod tests {
 		// First connection C1 registers under the key.
 		let (_e1, agent1, view1) = connect(&relay_ep, addr).await;
 		let id1 = view1.stable_id();
+		let (hs1, _s1) = open_agent_hello(&agent1, &view1).await;
 		tokio::spawn({
 			let (relay, key) = (relay.clone(), key.clone());
-			async move { serve_agent(relay, view1, key, agent_permit()).await }
+			async move { serve_agent(relay, view1, key, hs1, agent_permit()).await }
 		});
 		wait_until(|| relay.agent(&key).map(|c| c.stable_id()) == Some(id1)).await;
 
@@ -1292,9 +1392,10 @@ mod tests {
 		let (_e2, agent2, view2) = connect(&relay_ep, addr).await;
 		let id2 = view2.stable_id();
 		assert_ne!(id1, id2);
+		let (hs2, _s2) = open_agent_hello(&agent2, &view2).await;
 		tokio::spawn({
 			let (relay, key) = (relay.clone(), key.clone());
-			async move { serve_agent(relay, view2, key, agent_permit()).await }
+			async move { serve_agent(relay, view2, key, hs2, agent_permit()).await }
 		});
 		wait_until(|| relay.agent(&key).map(|c| c.stable_id()) == Some(id2)).await;
 
@@ -1327,9 +1428,10 @@ mod tests {
 		// Agent comes online → AgentOnline reaches the controller.
 		let key = "AGENT".to_string();
 		let (_aep, agent_conn, agent_view) = connect(&relay_ep, addr).await;
+		let (hello_send, _sig_recv) = open_agent_hello(&agent_conn, &agent_view).await;
 		tokio::spawn({
 			let (relay, key) = (relay.clone(), key.clone());
-			async move { serve_agent(relay, agent_view, key, agent_permit()).await }
+			async move { serve_agent(relay, agent_view, key, hello_send, agent_permit()).await }
 		});
 		let online: RelayEvent = with_timeout("online event", read_frame_capped(&mut hello_recv, MAX_CONTROL_FRAME))
 			.await
@@ -1342,6 +1444,88 @@ mod tests {
 			.await
 			.unwrap();
 		assert!(matches!(offline, RelayEvent::AgentOffline { public_key } if public_key == key));
+	}
+
+	// ------------------------------------------------------ p2p punch brokering
+
+	#[tokio::test]
+	async fn relay_brokers_a_punch_swapping_the_two_reflexive_addresses() {
+		let (relay_ep, addr) = relay_server();
+		let relay = Relay::default();
+		let agent_key = "AGENT_PUBKEY".to_string();
+
+		// Register an agent, keeping its signal channel so we can observe the punch.
+		let (_aep, agent_conn, agent_view) = connect(&relay_ep, addr).await;
+		let agent_reflexive = agent_view.remote_address();
+		let (hello_send, mut sig_recv) = open_agent_hello(&agent_conn, &agent_view).await;
+		tokio::spawn({
+			let (relay, key) = (relay.clone(), agent_key.clone());
+			async move { serve_agent(relay, agent_view, key, hello_send, agent_permit()).await }
+		});
+		wait_until(|| relay.agent(&agent_key).is_some()).await;
+
+		// Controller.
+		let (_cep, ctrl_conn, ctrl_view) = connect(&relay_ep, addr).await;
+		let ctrl_reflexive = ctrl_view.remote_address();
+		let (events_send, _er) = open_events(&ctrl_conn, &ctrl_view).await;
+		tokio::spawn({
+			let relay = relay.clone();
+			async move { serve_controller(relay, ctrl_view, events_send).await }
+		});
+		wait_until(|| relay.controller.lock().unwrap().is_some()).await;
+
+		// Controller asks the relay to broker a punch; it learns the agent's address.
+		let resp = with_timeout(
+			"punch response",
+			libretether_protocol::relay::request_punch(&ctrl_conn, &agent_key),
+		)
+		.await
+		.unwrap();
+		assert_eq!(
+			resp.peer_addr.as_deref(),
+			Some(agent_reflexive.to_string().as_str()),
+			"the controller is told the agent's reflexive address"
+		);
+
+		// The agent receives a matching signal telling it the controller's address, with
+		// the same rendezvous id — so the two coordinate the same punch.
+		let sig: RelaySignal = with_timeout("agent signal", read_frame_capped(&mut sig_recv, MAX_CONTROL_FRAME))
+			.await
+			.unwrap();
+		let RelaySignal::Punch {
+			controller_addr,
+			rendezvous,
+		} = sig;
+		assert_eq!(
+			controller_addr,
+			ctrl_reflexive.to_string(),
+			"the agent is told the controller's reflexive address"
+		);
+		assert_eq!(rendezvous, resp.rendezvous, "both sides share one rendezvous id");
+	}
+
+	#[tokio::test]
+	async fn a_punch_for_an_offline_agent_brokers_no_address() {
+		let (relay_ep, addr) = relay_server();
+		let relay = Relay::default();
+
+		let (_cep, ctrl_conn, ctrl_view) = connect(&relay_ep, addr).await;
+		let (events_send, _er) = open_events(&ctrl_conn, &ctrl_view).await;
+		tokio::spawn({
+			let relay = relay.clone();
+			async move { serve_controller(relay, ctrl_view, events_send).await }
+		});
+		wait_until(|| relay.controller.lock().unwrap().is_some()).await;
+
+		// No agent is registered: the relay can't broker a punch, so the controller is
+		// told to stay on the relay path (peer_addr None) rather than hanging.
+		let resp = with_timeout(
+			"punch response",
+			libretether_protocol::relay::request_punch(&ctrl_conn, "GHOST"),
+		)
+		.await
+		.unwrap();
+		assert!(resp.peer_addr.is_none(), "no address is brokered for an offline agent");
 	}
 
 	// ------------------------------------------------------ pairing mailbox

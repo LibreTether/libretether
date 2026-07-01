@@ -12,6 +12,7 @@ use std::time::Duration;
 
 use libretether_common::Backoff;
 use libretether_protocol::crypto;
+use libretether_protocol::e2e;
 use libretether_protocol::frame::{read_frame, read_frame_capped, write_frame, MAX_CONTROL_FRAME};
 use libretether_protocol::relay::{self, RelayEvent, RelayRequest, RelayRole};
 use libretether_protocol::{
@@ -19,6 +20,7 @@ use libretether_protocol::{
 	DEFAULT_EXEC_TIMEOUT_SECS, MAX_EXEC_TIMEOUT_SECS, PROTOCOL_VERSION,
 };
 use tauri::Emitter;
+use tokio::io::AsyncWriteExt;
 use uuid::Uuid;
 
 use crate::error::{AppError, AppResult};
@@ -40,6 +42,11 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 /// "offline" indefinitely. QUIC keep-alives catch a dead transport; this catches a
 /// relay whose routing loop has stalled while its QUIC stack still answers.
 const RELAY_READ_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// How long the controller's NAT-punching throwaway connect runs before it's dropped.
+/// Its only job is to emit a few QUIC Initials toward the agent, opening the
+/// controller's NAT so the agent's real dial lands; it never completes.
+const PUNCH_WINDOW: Duration = Duration::from_secs(3);
 
 /// Per-registration generation source, so a stale connection's teardown only
 /// evicts its own live entry and not a newer reconnection's (see `cleanup`).
@@ -173,7 +180,12 @@ async fn relay_session(
 		.await
 		.map_err(|e| AppError::msg(format!("resolving {relay_addr}: {e}")))?;
 	relay_log(state, &format!("dialing relay at {addr}"));
-	let endpoint = tls::client_endpoint(addr).map_err(|e| AppError::msg(format!("bind client: {e}")))?;
+	// A dual-role endpoint: it dials the relay (client) *and* accepts direct
+	// connections punched in by agents (server), all on one socket — so the NAT
+	// mapping the relay observes is the one a hole-punch reuses (see `attempt_upgrade`
+	// and the accept loop below).
+	let (cert, key) = ctrl.profile.cert_key_der()?;
+	let endpoint = tls::dual_endpoint(cert, key, addr).map_err(|e| AppError::msg(format!("bind endpoint: {e}")))?;
 	let conn = endpoint
 		.connect(addr, "libretether.local")
 		.map_err(|e| AppError::msg(e.to_string()))?
@@ -197,6 +209,15 @@ async fn relay_session(
 	// the controller's logbook, so it's captured and persisted regardless of whether
 	// the Logs page is open. Tied to this session: the guard aborts it on any exit.
 	let _relay_log_poller = AbortOnDrop(tauri::async_runtime::spawn(relay_log_poll(ctrl.clone(), conn.clone())));
+
+	// Accept direct peer-to-peer connections agents punch in, authenticate each with
+	// the normal handshake, and upgrade that agent's link to the direct path. Tied to
+	// this session: the guard aborts it (and drops the endpoint's accept side) on exit.
+	let _accept = AbortOnDrop(tauri::async_runtime::spawn(accept_direct_upgrades(
+		state.clone(),
+		ctrl.clone(),
+		endpoint.clone(),
+	)));
 
 	// Public keys with an enrollment handshake in flight, so a duplicate presence
 	// event (relay flap / replay) doesn't start a second concurrent handshake for
@@ -230,9 +251,15 @@ async fn relay_session(
 				let ctrl = ctrl.clone();
 				let enrolling = enrolling.clone();
 				let link = AgentLink::relay(conn.clone(), public_key.clone());
+				let relay_conn = conn.clone();
+				let endpoint = endpoint.clone();
 				tauri::async_runtime::spawn(async move {
-					if let Err(e) = enroll_and_register(&state, &ctrl, link).await {
-						log_err(&format!("enroll via relay failed: {e}"));
+					match enroll_and_register(&state, &ctrl, link).await {
+						// Registered over the relay — now try to open a faster direct
+						// peer-to-peer path (best-effort; stays on the relay if it can't).
+						Ok(Some(_)) => attempt_upgrade(&ctrl, &relay_conn, &endpoint, &public_key).await,
+						Ok(None) => {}
+						Err(e) => log_err(&format!("enroll via relay failed: {e}")),
 					}
 					enrolling.lock().unwrap().remove(&public_key);
 				});
@@ -324,24 +351,29 @@ async fn relay_log_poll(ctrl: Arc<ActiveController>, conn: quinn::Connection) {
 
 // ---------------------------------------------------------------- shared
 
-/// Run the Ed25519 handshake over `link`, enroll/identify the agent, register it
-/// in the live map and pull an initial status. Returns the client id and its
-/// registration generation on success.
-async fn enroll_and_register(
-	state: &AppState,
+/// Run the Ed25519 mutual handshake and end-to-end key agreement over `link` and
+/// enroll/identify the agent, returning `(client_id, capability_token, session_key)`
+/// on success — without touching the live map. Shared by the initial connect
+/// ([`enroll_and_register`]) and the peer-to-peer direct-path upgrade, which needs the
+/// same authenticated key exchange over a different connection.
+async fn handshake_only(
 	ctrl: &ActiveController,
-	link: AgentLink,
-) -> AppResult<Option<(Uuid, u64)>> {
+	link: &AgentLink,
+) -> AppResult<Option<(Uuid, String, e2e::SessionKey)>> {
 	let (mut send, mut recv) = link.open_bi().await?;
 	write_frame(&mut send, &StreamOpen::Handshake).await?;
 	log_debug("handshake: opened stream, sending challenge");
 	let nonce = crypto::random_nonce_b64();
+	// Our ephemeral half of the end-to-end key agreement, sent in the challenge and
+	// authenticated below by our signature over the transcript.
+	let ephemeral = e2e::EphemeralKeypair::generate();
 	write_frame(
 		&mut send,
 		&Challenge {
 			protocol: PROTOCOL_VERSION,
 			nonce: nonce.clone(),
 			controller_key: ctrl.profile.public_key(),
+			controller_eph: ephemeral.public_b64(),
 		},
 	)
 	.await?;
@@ -361,7 +393,15 @@ async fn enroll_and_register(
 		reject(&mut send, "protocol version mismatch").await;
 		return Ok(None);
 	}
-	if !crypto::verify_b64(&hello.public_key, nonce.as_bytes(), &hello.signature) {
+	let Some(agent_eph) = e2e::decode_eph(&hello.agent_eph) else {
+		reject(&mut send, "agent ephemeral key malformed").await;
+		return Ok(None);
+	};
+	// Both ends sign this transcript: it binds both ephemeral keys and both nonces,
+	// so verifying the agent's signature over it authenticates its identity *and* its
+	// ephemeral key together (a relay can't have swapped the latter).
+	let transcript = e2e::handshake_transcript(&ephemeral.public_bytes(), &agent_eph, &nonce, &hello.agent_nonce);
+	if !crypto::verify_b64(&hello.public_key, &transcript, &hello.signature) {
 		reject(&mut send, "signature verification failed").await;
 		return Ok(None);
 	}
@@ -377,9 +417,9 @@ async fn enroll_and_register(
 		return Ok(None);
 	};
 
-	// Authenticate ourselves to the agent in turn: sign its nonce with our
+	// Authenticate ourselves to the agent in turn: sign the same transcript with our
 	// identity key, which the agent checks against the key it pinned at enrollment.
-	let controller_sig = ctrl.profile.identity()?.sign_b64(hello.agent_nonce.as_bytes());
+	let controller_sig = ctrl.profile.identity()?.sign_b64(&transcript);
 	write_frame(
 		&mut send,
 		&HelloAck {
@@ -392,21 +432,42 @@ async fn enroll_and_register(
 	.await?;
 	let _ = send.finish();
 
-	// Receive the capability token the agent issues for this connection and bind
-	// it to the link, so every control/session/tunnel stream we open is stamped
-	// with it (the agent rejects streams that aren't).
+	// Complete the ECDHE and derive the end-to-end session key every later stream is
+	// sealed under. The agent's ephemeral key is bound to the signature we just
+	// verified, so this key is shared only with the authenticated agent.
+	let shared = ephemeral
+		.diffie_hellman(&agent_eph)
+		.ok_or_else(|| AppError::msg("end-to-end key agreement produced a degenerate shared secret"))?;
+	let session_key = e2e::SessionKey::derive(&shared, &transcript);
+
+	// Receive the capability token the agent issues for this connection.
 	let grant: SessionGrant =
 		match tokio::time::timeout(HANDSHAKE_TIMEOUT, read_frame_capped(&mut recv, MAX_CONTROL_FRAME)).await {
 			Ok(res) => res?,
 			Err(_) => return Ok(None),
 		};
-	let link = link.with_token(grant.token);
-	log_debug("handshake: capability token received and bound to the link");
-
-	log(&format!(
-		"agent {client_id} connected — {} ({})",
+	log_debug(&format!(
+		"handshake complete for agent {client_id} — {} ({})",
 		hello.host.hostname, hello.host.os
 	));
+	Ok(Some((client_id, grant.token, session_key)))
+}
+
+/// Run the handshake over `link`, bind the resulting capability token + end-to-end
+/// key to it, register the agent in the live map, and pull an initial status. Returns
+/// the client id and its registration generation on success.
+async fn enroll_and_register(
+	state: &AppState,
+	ctrl: &ActiveController,
+	link: AgentLink,
+) -> AppResult<Option<(Uuid, u64)>> {
+	let Some((client_id, token, session_key)) = handshake_only(ctrl, &link).await? else {
+		return Ok(None);
+	};
+	// Bind the token + session key so every control/session/tunnel stream we open is
+	// stamped and encrypted (the agent rejects streams that aren't).
+	let link = link.with_session(token, session_key);
+	log(&format!("agent {client_id} connected"));
 
 	let generation = LIVE_GEN.fetch_add(1, Ordering::Relaxed);
 	ctrl.live.lock().unwrap().insert(
@@ -427,6 +488,115 @@ async fn enroll_and_register(
 		state.notify_changed();
 	}
 	Ok(Some((client_id, generation)))
+}
+
+// ------------------------------------------------------- peer-to-peer upgrade
+
+/// Accept direct peer-to-peer connections agents punch in on the relay-mode endpoint
+/// and upgrade each agent's link to the direct path. Runs for the life of the relay
+/// session (the accept side drops when the endpoint does).
+async fn accept_direct_upgrades(state: AppState, ctrl: Arc<ActiveController>, endpoint: quinn::Endpoint) {
+	while let Some(incoming) = endpoint.accept().await {
+		log_debug(&format!(
+			"direct connection punched in from {}",
+			incoming.remote_address()
+		));
+		let state = state.clone();
+		let ctrl = ctrl.clone();
+		tauri::async_runtime::spawn(async move {
+			if let Err(e) = handle_direct_upgrade(&state, &ctrl, incoming).await {
+				log_debug(&format!("direct upgrade attempt ended: {e}"));
+			}
+		});
+	}
+}
+
+/// Authenticate one punched-in connection with the normal mutual handshake and, if
+/// it's an agent we already track over the relay, attach it as that agent's direct
+/// upgrade so new streams prefer it. A connection that doesn't authenticate — a
+/// scanner, or an agent we don't know — is dropped: the direct path is exactly as
+/// trusted as Direct mode (mutual Ed25519 auth + end-to-end AEAD), no more.
+async fn handle_direct_upgrade(
+	state: &AppState,
+	ctrl: &Arc<ActiveController>,
+	incoming: quinn::Incoming,
+) -> AppResult<()> {
+	let direct = incoming
+		.accept()
+		.map_err(|e| AppError::msg(format!("accept direct: {e}")))?
+		.await
+		.map_err(|e| AppError::msg(format!("direct quic handshake: {e}")))?;
+	let Some((client_id, token, session_key)) = handshake_only(ctrl, &AgentLink::direct(direct.clone())).await? else {
+		return Ok(()); // did not authenticate — drop it
+	};
+	// Attach to the agent's existing relay link, if it's still tracked.
+	let Some(link) = ctrl.live.lock().unwrap().get(&client_id).map(|c| c.link.clone()) else {
+		log_debug(&format!(
+			"direct path from agent {client_id} has no relay link to upgrade; dropping"
+		));
+		return Ok(());
+	};
+	link.set_upgrade(direct.clone(), token, session_key);
+	log(&format!("agent {client_id} upgraded to a direct peer-to-peer path"));
+	state.notify_changed();
+
+	// When the direct path drops, fall back to the relay — but only clear it if it's
+	// still *this* connection's upgrade (a newer punch may have replaced it).
+	let ctrl = ctrl.clone();
+	let state = state.clone();
+	tauri::async_runtime::spawn(async move {
+		direct.closed().await;
+		if let Some(link) = ctrl.live.lock().unwrap().get(&client_id).map(|c| c.link.clone()) {
+			if link.clear_upgrade_for(&direct) {
+				log(&format!("agent {client_id} direct path closed — back on the relay"));
+				state.notify_changed();
+			}
+		}
+	});
+	Ok(())
+}
+
+/// Ask the relay to broker a hole-punch to `agent`, then open our NAT toward it so the
+/// agent's direct dial can land. Best-effort: if the relay can't broker (agent offline)
+/// or the address is unusable, the agent simply stays on the relay path.
+async fn attempt_upgrade(
+	ctrl: &ActiveController,
+	relay_conn: &quinn::Connection,
+	endpoint: &quinn::Endpoint,
+	agent_key: &str,
+) {
+	// Don't re-punch an agent already on a direct path (e.g. a duplicate presence event).
+	let id = ctrl.store.lock().unwrap().id_for_pubkey(agent_key);
+	if let Some(id) = id {
+		if ctrl.live.lock().unwrap().get(&id).is_some_and(|c| c.link.is_upgraded()) {
+			return;
+		}
+	}
+	let resp = match relay::request_punch(relay_conn, agent_key).await {
+		Ok(r) => r,
+		Err(e) => {
+			log_debug(&format!("punch request failed: {e}"));
+			return;
+		}
+	};
+	let Some(peer) = resp.peer_addr else {
+		log_debug("relay could not broker a punch; staying on the relay");
+		return;
+	};
+	let Ok(addr) = peer.parse::<SocketAddr>() else {
+		log_warn(&format!("relay returned an unparseable agent address {peer:?}"));
+		return;
+	};
+	log_debug(&format!(
+		"punching NAT toward agent {}… at {addr}",
+		agent_key.chars().take(8).collect::<String>()
+	));
+	// Emit a few Initials toward the agent to open our NAT mapping; this won't complete
+	// (the agent doesn't accept on that path), so bound it and discard the result. The
+	// real connection is the one the agent dials to us, handled by the accept loop.
+	if let Ok(connecting) = endpoint.connect(addr, "libretether.local") {
+		let _ = tokio::time::timeout(PUNCH_WINDOW, connecting).await;
+	}
 }
 
 /// Drop a client's live entry and mark it last-seen. `generation` guards the
@@ -500,7 +670,7 @@ fn request_timeout(req: &ControlRequest) -> Duration {
 async fn control_request_inner(link: &AgentLink, req: &ControlRequest) -> AppResult<ControlResponse> {
 	let (mut send, mut recv) = link.open_authenticated(StreamOpen::Control).await?;
 	write_frame(&mut send, req).await?;
-	let _ = send.finish();
+	let _ = send.shutdown().await;
 	// A `Screenshot` response carries a full-screen PNG, so this read intentionally
 	// uses the wide `MAX_FRAME` cap (not the 1 MiB control cap). The exposure is one
 	// such allocation per outstanding request from an already-authenticated agent,
@@ -585,32 +755,38 @@ mod tests {
 		let agent = Identity::generate();
 		let agent_pub = agent.public_b64();
 
-		// A faithful agent: signs the challenge, verifies the controller, issues a
-		// capability token, then serves the controller's initial Status request.
+		// A faithful agent: agrees the ephemeral key, signs the transcript, verifies
+		// the controller, derives the session key, issues a capability token, then
+		// serves the controller's initial Status request over the encrypted channel.
 		let agent_task = tokio::spawn(async move {
 			let (mut a_send, mut a_recv) = client.accept_bi().await.unwrap();
 			let open: StreamOpen = read_frame_capped(&mut a_recv, MAX_CONTROL_FRAME).await.unwrap();
 			assert!(matches!(open, StreamOpen::Handshake));
 			let challenge: Challenge = read_frame_capped(&mut a_recv, MAX_CONTROL_FRAME).await.unwrap();
 			assert_eq!(challenge.controller_key, ctrl_pub, "controller presents its pinned key");
+			let controller_eph = e2e::decode_eph(&challenge.controller_eph).unwrap();
+			let eph = e2e::EphemeralKeypair::generate();
 			let agent_nonce = crypto::random_nonce_b64();
+			let transcript =
+				e2e::handshake_transcript(&controller_eph, &eph.public_bytes(), &challenge.nonce, &agent_nonce);
 			let hello = Hello {
 				protocol: PROTOCOL_VERSION,
 				enrollment_token: Some(token),
 				public_key: agent.public_b64(),
-				signature: agent.sign_b64(challenge.nonce.as_bytes()),
+				signature: agent.sign_b64(&transcript),
 				agent_nonce: agent_nonce.clone(),
+				agent_eph: eph.public_b64(),
 				host: host(),
 				agent_version: "test".into(),
 			};
 			write_frame(&mut a_send, &hello).await.unwrap();
 			let ack: HelloAck = read_frame_capped(&mut a_recv, MAX_CONTROL_FRAME).await.unwrap();
 			assert!(ack.accepted, "controller should accept: {:?}", ack.reason);
-			// The controller authenticated itself (mutual auth): signature over our
-			// nonce verifies against the key it presented.
+			// The controller authenticated itself (mutual auth): its signature over the
+			// transcript verifies against the key it presented.
 			assert!(crypto::verify_b64(
 				&challenge.controller_key,
-				agent_nonce.as_bytes(),
+				&transcript,
 				&ack.controller_sig
 			));
 			let cap = crypto::random_nonce_b64();
@@ -619,12 +795,23 @@ mod tests {
 				.unwrap();
 			let _ = a_send.finish();
 
-			// Initial Status: must arrive stamped with the capability token.
-			let (mut s_send, mut s_recv) = client.accept_bi().await.unwrap();
+			// The same end-to-end key the controller derives; the initial Status stream
+			// arrives sealed under it.
+			let shared = eph.diffie_hellman(&controller_eph).unwrap();
+			let key = e2e::SessionKey::derive(&shared, &transcript);
+
+			// Initial Status: after the plaintext StreamOpen, the salt + token + payload
+			// are all encrypted end-to-end.
+			let (s_send, s_recv) = client.accept_bi().await.unwrap();
+			let mut s_recv = s_recv;
 			let open2: StreamOpen = read_frame_capped(&mut s_recv, MAX_CONTROL_FRAME).await.unwrap();
 			assert!(matches!(open2, StreamOpen::Control));
+			let (mut s_send, mut s_recv) = e2e::open_secure_agent(s_send, s_recv, &key).await.unwrap();
 			let auth: StreamAuth = read_frame_capped(&mut s_recv, MAX_CONTROL_FRAME).await.unwrap();
-			assert_eq!(auth.token, cap, "control stream carries the issued token");
+			assert_eq!(
+				auth.token, cap,
+				"control stream carries the issued token (through the encryption)"
+			);
 			let req: ControlRequest = read_frame_capped(&mut s_recv, MAX_CONTROL_FRAME).await.unwrap();
 			assert!(matches!(req, ControlRequest::Status));
 			let status = AgentStatus {
@@ -639,7 +826,7 @@ mod tests {
 			write_frame(&mut s_send, &ControlResponse::Status(status))
 				.await
 				.unwrap();
-			let _ = s_send.finish();
+			let _ = s_send.shutdown().await;
 			client
 		});
 
@@ -674,12 +861,18 @@ mod tests {
 		let (mut a_send, mut a_recv) = client.accept_bi().await.unwrap();
 		let _open: StreamOpen = read_frame_capped(&mut a_recv, MAX_CONTROL_FRAME).await.unwrap();
 		let challenge: Challenge = read_frame_capped(&mut a_recv, MAX_CONTROL_FRAME).await.unwrap();
+		let controller_eph = e2e::decode_eph(&challenge.controller_eph).unwrap();
+		let eph = e2e::EphemeralKeypair::generate();
+		let agent_nonce = crypto::random_nonce_b64();
+		let transcript =
+			e2e::handshake_transcript(&controller_eph, &eph.public_bytes(), &challenge.nonce, &agent_nonce);
 		let mut hello = Hello {
 			protocol: PROTOCOL_VERSION,
 			enrollment_token: token,
 			public_key: agent.public_b64(),
-			signature: agent.sign_b64(challenge.nonce.as_bytes()),
-			agent_nonce: crypto::random_nonce_b64(),
+			signature: agent.sign_b64(&transcript),
+			agent_nonce,
+			agent_eph: eph.public_b64(),
 			host: host(),
 			agent_version: "test".into(),
 		};
@@ -780,5 +973,164 @@ mod tests {
 		);
 		cleanup(&state, &ctrl, id, None);
 		assert!(!ctrl.is_online(id), "relay-authoritative cleanup always evicts");
+	}
+
+	// ------------------------------------------------- peer-to-peer direct upgrade
+
+	/// The agent side of a direct-path handshake (the agent is already enrolled, so it
+	/// carries no enrollment token): respond to the controller's challenge with a
+	/// transcript-signed Hello, verify the controller, and issue a capability token.
+	async fn agent_direct_handshake(conn: &quinn::Connection, agent: &Identity, controller_pub: &str) {
+		let (mut send, mut recv) = conn.accept_bi().await.unwrap();
+		let open: StreamOpen = read_frame_capped(&mut recv, MAX_CONTROL_FRAME).await.unwrap();
+		assert!(matches!(open, StreamOpen::Handshake));
+		let challenge: Challenge = read_frame_capped(&mut recv, MAX_CONTROL_FRAME).await.unwrap();
+		assert_eq!(
+			challenge.controller_key, controller_pub,
+			"controller presents its pinned key"
+		);
+		let controller_eph = e2e::decode_eph(&challenge.controller_eph).unwrap();
+		let eph = e2e::EphemeralKeypair::generate();
+		let agent_nonce = crypto::random_nonce_b64();
+		let transcript =
+			e2e::handshake_transcript(&controller_eph, &eph.public_bytes(), &challenge.nonce, &agent_nonce);
+		let hello = Hello {
+			protocol: PROTOCOL_VERSION,
+			enrollment_token: None,
+			public_key: agent.public_b64(),
+			signature: agent.sign_b64(&transcript),
+			agent_nonce,
+			agent_eph: eph.public_b64(),
+			host: host(),
+			agent_version: "test".into(),
+		};
+		write_frame(&mut send, &hello).await.unwrap();
+		let ack: HelloAck = read_frame_capped(&mut recv, MAX_CONTROL_FRAME).await.unwrap();
+		assert!(
+			ack.accepted,
+			"controller accepts the enrolled agent over the direct path"
+		);
+		assert!(crypto::verify_b64(controller_pub, &transcript, &ack.controller_sig));
+		write_frame(
+			&mut send,
+			&SessionGrant {
+				token: crypto::random_nonce_b64(),
+			},
+		)
+		.await
+		.unwrap();
+		let _ = send.finish();
+	}
+
+	// A punched-in direct connection that authenticates as an already-tracked agent is
+	// attached as that agent's upgrade, so new streams prefer the direct path. This is
+	// the controller half of the hole-punch upgrade.
+	#[tokio::test]
+	async fn a_punched_in_connection_upgrades_the_live_agents_link() {
+		let (state, ctrl, token) = setup();
+		let ctrl = Arc::new(ctrl);
+		let ctrl_pub = ctrl.profile.public_key();
+
+		// Enroll the agent (bind its key, burn the token) and register a relay LiveConn
+		// for it — the link the upgrade attaches onto.
+		let agent = Identity::generate();
+		let agent_pub = agent.public_b64();
+		let client_id = ctrl
+			.store
+			.lock()
+			.unwrap()
+			.authenticate(Some(&token), &agent_pub)
+			.expect("enrolls by token");
+		let (_re, relay_conn, _rce, _rc) = loopback().await;
+		ctrl.live.lock().unwrap().insert(
+			client_id,
+			LiveConn {
+				link: AgentLink::relay(relay_conn, agent_pub.clone()),
+				status: None,
+				generation: 1,
+			},
+		);
+		assert!(
+			!ctrl.live.lock().unwrap().get(&client_id).unwrap().link.is_upgraded(),
+			"starts on the relay path"
+		);
+
+		// A controller dual endpoint the agent punches into.
+		tls::install_crypto_provider();
+		let (cert, key) = ctrl.profile.cert_key_der().unwrap();
+		let endpoint = tls::dual_endpoint(cert, key, (Ipv4Addr::LOCALHOST, 0).into()).unwrap();
+		let dual_addr: SocketAddr = (Ipv4Addr::LOCALHOST, endpoint.local_addr().unwrap().port()).into();
+		let agent_ep = tls::client_endpoint(dual_addr).unwrap();
+
+		// Mock agent: dial the controller directly and run the agent side of the handshake.
+		let agent_task = tokio::spawn(async move {
+			let conn = agent_ep.connect(dual_addr, "libretether.local").unwrap().await.unwrap();
+			agent_direct_handshake(&conn, &agent, &ctrl_pub).await;
+			conn // keep the connection alive so the upgrade stays healthy
+		});
+
+		// The controller accepts the punched-in connection and upgrades the link.
+		let incoming = endpoint.accept().await.expect("a punched-in connection");
+		handle_direct_upgrade(&state, &ctrl, incoming).await.unwrap();
+		let _agent_conn = agent_task.await.unwrap();
+
+		assert!(
+			ctrl.live.lock().unwrap().get(&client_id).unwrap().link.is_upgraded(),
+			"the agent's link now prefers the direct peer-to-peer path"
+		);
+	}
+
+	// A direct connection that fails to authenticate (unknown key) must not be attached
+	// to anyone — the direct path is exactly as trusted as Direct mode.
+	#[tokio::test]
+	async fn a_punched_in_connection_from_an_unknown_agent_is_dropped() {
+		let (state, ctrl, _token) = setup();
+		let ctrl = Arc::new(ctrl);
+		let ctrl_pub = ctrl.profile.public_key();
+
+		tls::install_crypto_provider();
+		let (cert, key) = ctrl.profile.cert_key_der().unwrap();
+		let endpoint = tls::dual_endpoint(cert, key, (Ipv4Addr::LOCALHOST, 0).into()).unwrap();
+		let dual_addr: SocketAddr = (Ipv4Addr::LOCALHOST, endpoint.local_addr().unwrap().port()).into();
+		let agent_ep = tls::client_endpoint(dual_addr).unwrap();
+
+		// An unenrolled agent (its key was never bound in the store) punches in and
+		// sends an otherwise-valid Hello. The controller must reject it at the store
+		// lookup and attach nothing.
+		let stranger = Identity::generate();
+		let agent_task = tokio::spawn(async move {
+			let conn = agent_ep.connect(dual_addr, "libretether.local").unwrap().await.unwrap();
+			let (mut send, mut recv) = conn.accept_bi().await.unwrap();
+			let _open: StreamOpen = read_frame_capped(&mut recv, MAX_CONTROL_FRAME).await.unwrap();
+			let challenge: Challenge = read_frame_capped(&mut recv, MAX_CONTROL_FRAME).await.unwrap();
+			let controller_eph = e2e::decode_eph(&challenge.controller_eph).unwrap();
+			let eph = e2e::EphemeralKeypair::generate();
+			let agent_nonce = crypto::random_nonce_b64();
+			let transcript =
+				e2e::handshake_transcript(&controller_eph, &eph.public_bytes(), &challenge.nonce, &agent_nonce);
+			let hello = Hello {
+				protocol: PROTOCOL_VERSION,
+				enrollment_token: None,
+				public_key: stranger.public_b64(),
+				signature: stranger.sign_b64(&transcript),
+				agent_nonce,
+				agent_eph: eph.public_b64(),
+				host: host(),
+				agent_version: "test".into(),
+			};
+			write_frame(&mut send, &hello).await.unwrap();
+			// The rejection ack may or may not arrive before the controller drops the
+			// connection — either way the agent is not upgraded, which is what matters.
+			let _ = read_frame_capped::<_, HelloAck>(&mut recv, MAX_CONTROL_FRAME).await;
+		});
+
+		let incoming = endpoint.accept().await.unwrap();
+		handle_direct_upgrade(&state, &ctrl, incoming).await.unwrap();
+		let _ = agent_task.await;
+		assert!(
+			ctrl.live.lock().unwrap().is_empty(),
+			"an unknown agent is dropped, never attached to the live map"
+		);
+		let _ = ctrl_pub;
 	}
 }

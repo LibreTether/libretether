@@ -141,6 +141,33 @@ pub fn client_endpoint(target: SocketAddr) -> std::io::Result<quinn::Endpoint> {
 	Ok(endpoint)
 }
 
+/// Build a **dual-role** QUIC [`Endpoint`](quinn::Endpoint) — one that can both dial
+/// out (client) *and* accept incoming connections (server) — on a single ephemeral
+/// UDP socket whose family matches `target`.
+///
+/// This is the endpoint the controller uses in relay mode for **peer-to-peer NAT
+/// traversal**: it dials the relay *and* the punching agent as a client, and accepts
+/// the agent's direct connection as a server, all on the *same* socket — which is what
+/// makes hole-punching work, since a NAT mapping is keyed to the source port. The
+/// server side presents the controller's own certificate (identity is still checked
+/// at the application layer via the Ed25519 handshake, exactly as in Direct mode).
+pub fn dual_endpoint(cert_der: Vec<u8>, key_der: Vec<u8>, target: SocketAddr) -> std::io::Result<quinn::Endpoint> {
+	let bind: SocketAddr = if target.is_ipv6() {
+		(std::net::Ipv6Addr::UNSPECIFIED, 0).into()
+	} else {
+		(std::net::Ipv4Addr::UNSPECIFIED, 0).into()
+	};
+	let socket = std::net::UdpSocket::bind(bind)?;
+	let mut endpoint = quinn::Endpoint::new(
+		quinn::EndpointConfig::default(),
+		Some(server_config(cert_der, key_der)),
+		socket,
+		Arc::new(quinn::TokioRuntime),
+	)?;
+	endpoint.set_default_client_config(client_config());
+	Ok(endpoint)
+}
+
 /// Resolve `addr` (an `ip:port` literal or a `host:port` name) to a single socket
 /// address, preferring the literal parse and falling back to DNS.
 pub async fn resolve(addr: &str) -> std::io::Result<SocketAddr> {
@@ -236,5 +263,52 @@ mod tests {
 			.await
 			.expect("connect over IPv4 to the [::] listener");
 		accept.await.unwrap();
+	}
+
+	/// The mechanism peer-to-peer hole-punching depends on: a single dual-role
+	/// endpoint must be able to **accept** an incoming connection *and* **dial out** —
+	/// both on its one shared socket. Without this, the controller couldn't reuse the
+	/// socket the relay observed, and the NAT mapping wouldn't line up.
+	#[tokio::test]
+	async fn dual_endpoint_can_both_accept_and_dial_on_one_socket() {
+		install_crypto_provider();
+		let (cert_a, key_a) = self_signed();
+		let (cert_b, key_b) = self_signed();
+		let probe: SocketAddr = (Ipv4Addr::LOCALHOST, 0).into();
+		let a = dual_endpoint(cert_a, key_a, probe).expect("dual endpoint A");
+		let b = dual_endpoint(cert_b, key_b, probe).expect("dual endpoint B");
+		// `local_addr` reports the wildcard bind (`0.0.0.0:port`); dial the loopback IP
+		// with each endpoint's actual port.
+		let a_addr: SocketAddr = (Ipv4Addr::LOCALHOST, a.local_addr().unwrap().port()).into();
+		let b_addr: SocketAddr = (Ipv4Addr::LOCALHOST, b.local_addr().unwrap().port()).into();
+
+		// B (client role) dials A (server role); A accepts on the same socket it will
+		// also dial from below.
+		let a_accept = {
+			let a = a.clone();
+			tokio::spawn(async move { a.accept().await.unwrap().accept().unwrap().await.unwrap() })
+		};
+		let b_to_a = b.connect(a_addr, "libretether.local").unwrap().await.unwrap();
+		let a_from_b = a_accept.await.unwrap();
+
+		// Now A (client role) dials B (server role) — proving the *same* endpoint that
+		// just accepted can also initiate a connection.
+		let b_accept = {
+			let b = b.clone();
+			tokio::spawn(async move { b.accept().await.unwrap().accept().unwrap().await.unwrap() })
+		};
+		let a_to_b = a.connect(b_addr, "libretether.local").unwrap().await.unwrap();
+		let b_from_a = b_accept.await.unwrap();
+
+		// Both directions carry data, confirming two independent live connections on the
+		// two shared sockets.
+		let (mut s, _r) = a_from_b.open_bi().await.unwrap();
+		s.write_all(b"ping").await.unwrap();
+		s.finish().unwrap();
+		let (_s2, mut r2) = b_to_a.accept_bi().await.unwrap();
+		assert_eq!(r2.read_to_end(16).await.unwrap(), b"ping");
+
+		// Keep the second pair alive to the end so the connect isn't dropped early.
+		let _ = (a_to_b, b_from_a);
 	}
 }

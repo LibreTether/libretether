@@ -15,6 +15,7 @@
 //! (see the session types below and the [`video`] module).
 
 pub mod crypto;
+pub mod e2e;
 pub mod frame;
 pub mod pairing;
 pub mod relay;
@@ -41,8 +42,13 @@ pub const ALPN: &[u8] = b"libretether/1";
 /// per-tile baseline-JPEG video format with a real inter-frame H.264 stream
 /// (decoded by WebCodecs on the controller) and swapped `SessionConfig.quality`
 /// (JPEG 1–100) for `SessionConfig.bitrate_kbps`; v7 added the live capture/encoder
-/// backend names to `SessionServer::Meta` (shown in the controller's session header).
-pub const PROTOCOL_VERSION: u32 = 7;
+/// backend names to `SessionServer::Meta` (shown in the controller's session header);
+/// v8 made the link end-to-end encrypted — the handshake carries ephemeral X25519
+/// keys (`Challenge.controller_eph` / `Hello.agent_eph`) and the mutual-auth
+/// signatures now cover the [`e2e::handshake_transcript`] (both ephemeral keys and
+/// both nonces), so every post-handshake stream is AEAD-sealed end-to-end and a
+/// relay only ever forwards ciphertext (see [`e2e`]).
+pub const PROTOCOL_VERSION: u32 = 8;
 
 /// Default UDP port the controller listens on for incoming agents.
 pub const DEFAULT_PORT: u16 = 47600;
@@ -68,8 +74,9 @@ pub struct HostInfo {
 }
 
 /// Server → agent, first message on the handshake stream: a nonce for the agent
-/// to sign, plus the controller's own Ed25519 public key so the agent can verify
-/// it is talking to the controller it enrolled with (see `HelloAck.controller_sig`).
+/// to sign, the controller's own Ed25519 public key so the agent can verify it is
+/// talking to the controller it enrolled with (see `HelloAck.controller_sig`), and
+/// the controller's ephemeral X25519 public key for the end-to-end key agreement.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Challenge {
 	/// The controller's [`PROTOCOL_VERSION`]. The agent rejects a mismatch with a
@@ -83,6 +90,11 @@ pub struct Challenge {
 	/// Mandatory: a v2+ controller always sends it, so a frame missing it is a
 	/// protocol violation and is rejected at parse time (no compatibility shim).
 	pub controller_key: String,
+	/// Base64 ephemeral X25519 public key for the end-to-end handshake. Fresh per
+	/// connection and authenticated by the controller's signature over the
+	/// [`e2e::handshake_transcript`], so a relay can't substitute its own. Mandatory —
+	/// a frame missing it is a protocol violation (no compatibility shim).
+	pub controller_eph: String,
 }
 
 /// Agent → server: proves identity and (on first connect) enrolls.
@@ -93,11 +105,16 @@ pub struct Hello {
 	pub enrollment_token: Option<String>,
 	/// Base64 Ed25519 public key — the agent's stable identity.
 	pub public_key: String,
-	/// Base64 signature over the challenge nonce.
+	/// Base64 Ed25519 signature over the [`e2e::handshake_transcript`] (which binds
+	/// both nonces and both ephemeral keys), proving the agent's identity and its
+	/// ephemeral key in one signature.
 	pub signature: String,
 	/// A fresh nonce the controller must sign back, so the agent can authenticate
 	/// the controller in turn (mutual auth). Mandatory — see [`Challenge::controller_key`].
 	pub agent_nonce: String,
+	/// Base64 ephemeral X25519 public key for the end-to-end handshake, authenticated
+	/// by `signature`. Mandatory — see [`Challenge::controller_eph`].
+	pub agent_eph: String,
 	pub host: HostInfo,
 	pub agent_version: String,
 }
@@ -130,11 +147,12 @@ pub struct HelloAck {
 	pub reason: Option<String>,
 	/// The controller-assigned client id, echoed back so the agent can log it.
 	pub client_id: Option<String>,
-	/// Base64 signature over the agent's `agent_nonce`, made with the controller's
-	/// identity key. The agent verifies this against the pinned controller key
-	/// before honouring any control/session/tunnel stream. Mandatory — see
-	/// [`Challenge::controller_key`]. (On a rejection it is an empty string, but the
-	/// field is always present on the wire.)
+	/// Base64 signature over the [`e2e::handshake_transcript`] (the same message the
+	/// agent signed), made with the controller's identity key. The agent verifies
+	/// this against the pinned controller key before honouring any
+	/// control/session/tunnel stream, which both authenticates the controller and
+	/// binds its ephemeral key. Mandatory — see [`Challenge::controller_key`]. (On a
+	/// rejection it is an empty string, but the field is always present on the wire.)
 	pub controller_sig: String,
 }
 
@@ -488,13 +506,21 @@ mod tests {
 		// Challenge without `controller_key` (and without `protocol`).
 		assert!(serde_json::from_str::<Challenge>(r#"{"protocol":3,"nonce":"n"}"#).is_err());
 		// Challenge without `protocol` — the v3 version field is mandatory too.
-		assert!(serde_json::from_str::<Challenge>(r#"{"nonce":"n","controller_key":"ck"}"#).is_err());
+		assert!(
+			serde_json::from_str::<Challenge>(r#"{"nonce":"n","controller_key":"ck","controller_eph":"e"}"#).is_err()
+		);
+		// Challenge without `controller_eph` — the v8 ephemeral key is mandatory.
+		assert!(serde_json::from_str::<Challenge>(r#"{"protocol":8,"nonce":"n","controller_key":"ck"}"#).is_err());
 		// HelloAck without `controller_sig` (the Option fields may be absent).
 		assert!(serde_json::from_str::<HelloAck>(r#"{"accepted":true}"#).is_err());
 		// Hello without `agent_nonce`.
-		let hello_missing = r#"{"protocol":2,"public_key":"k","signature":"s",
+		let hello_missing = r#"{"protocol":2,"public_key":"k","signature":"s","agent_eph":"e",
 			"host":{"hostname":"h","os":"o","arch":"a","username":"u"},"agent_version":"1"}"#;
 		assert!(serde_json::from_str::<Hello>(hello_missing).is_err());
+		// Hello without `agent_eph` — the v8 ephemeral key is mandatory.
+		let hello_no_eph = r#"{"protocol":8,"public_key":"k","signature":"s","agent_nonce":"an",
+			"host":{"hostname":"h","os":"o","arch":"a","username":"u"},"agent_version":"1"}"#;
+		assert!(serde_json::from_str::<Hello>(hello_no_eph).is_err());
 	}
 
 	#[test]
@@ -503,11 +529,13 @@ mod tests {
 			protocol: PROTOCOL_VERSION,
 			nonce: "n".into(),
 			controller_key: "ck".into(),
+			controller_eph: "ceph".into(),
 		};
 		let back: Challenge = round_trip(&challenge);
 		assert_eq!(back.protocol, PROTOCOL_VERSION);
 		assert_eq!(back.nonce, "n");
 		assert_eq!(back.controller_key, "ck");
+		assert_eq!(back.controller_eph, "ceph");
 
 		let hello = Hello {
 			protocol: PROTOCOL_VERSION,
@@ -515,6 +543,7 @@ mod tests {
 			public_key: "pk".into(),
 			signature: "sig".into(),
 			agent_nonce: "an".into(),
+			agent_eph: "aeph".into(),
 			host: HostInfo {
 				hostname: "h".into(),
 				os: "linux".into(),
@@ -525,6 +554,7 @@ mod tests {
 		};
 		let back: Hello = round_trip(&hello);
 		assert_eq!(back.agent_nonce, "an");
+		assert_eq!(back.agent_eph, "aeph");
 		assert_eq!(back.enrollment_token.as_deref(), Some("tok"));
 
 		let ack = HelloAck {

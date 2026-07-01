@@ -13,18 +13,27 @@ use std::time::{Duration, Instant};
 use anyhow::{anyhow, Context, Result};
 use libretether_common::{pipe_bidirectional, Backoff};
 use libretether_protocol::crypto::{self, Identity};
+use libretether_protocol::e2e::{self, SecureQuicRecv, SecureQuicSend, SessionKey};
 use libretether_protocol::frame::{read_frame_capped, write_frame, MAX_CONTROL_FRAME};
 use libretether_protocol::pairing::{agent_pair, PairBundle, PairingCode};
-use libretether_protocol::relay::{client_handshake, pairing_join, RelayRole};
+use libretether_protocol::relay::{client_handshake, pairing_join, RelayRole, RelaySignal};
 use libretether_protocol::{
 	tls, Challenge, ControlRequest, Hello, HelloAck, LogLevel, LogLine, LogsResult, SessionGrant, StreamAuth,
 	StreamOpen, PROTOCOL_VERSION,
 };
 use quinn::{Endpoint, RecvStream, SendStream};
+use tokio::io::AsyncWriteExt;
 
 /// Shared set of capability tokens issued (one per completed handshake) over a
 /// single connection's lifetime; a control/session/tunnel stream must present one.
 type TokenSet = Arc<Mutex<HashSet<String>>>;
+
+/// The end-to-end session key from the most recent completed handshake. Every
+/// post-handshake stream is AEAD-sealed under a key derived from this, so a relay
+/// forwarding the bytes only ever sees ciphertext. `None` until the first handshake;
+/// replaced on each re-auth (in relay mode this connection outlives many controller
+/// sessions), mirroring the single-valid-token rule in [`verify_and_grant`].
+type SessionSlot = Arc<Mutex<Option<SessionKey>>>;
 
 use crate::config::AgentConfig;
 use crate::{handlers, host, session};
@@ -194,26 +203,50 @@ async fn connect_once(cfg: &mut AgentConfig, cfg_path: &Path) -> Result<()> {
 		None => (tls::resolve(&cfg.controller_addr).await?, false),
 	};
 	let endpoint = tls::client_endpoint(addr).context("binding client socket")?;
-	let conn = if is_relay {
+	if is_relay {
 		log(&format!("dialing relay at {addr}"));
-		connect_relay(&endpoint, addr, cfg).await?
+		let (conn, hello_send, hello_recv) = connect_relay(&endpoint, addr, cfg).await?;
+		debug(&format!("quic connection established to {addr}"));
+		// Watch for peer-to-peer punch signals from the relay and, when one arrives,
+		// dial the controller directly from this same socket (see `handle_signals`).
+		// Reads the pinned key/identity now, before `serve` borrows `cfg` mutably.
+		let identity = Arc::new(cfg.identity()?);
+		let controller_key = Arc::new(cfg.require_controller_key()?);
+		let server_name = cfg.server_name.clone();
+		let signals = tokio::spawn(handle_signals(
+			endpoint.clone(),
+			hello_send,
+			hello_recv,
+			identity,
+			controller_key,
+			server_name,
+		));
+		// Serving the relay connection blocks until it drops; then stop the signal
+		// watcher (a reconnect starts a fresh one) and any direct paths tear down with it.
+		let result = serve(conn, cfg, cfg_path).await;
+		signals.abort();
+		result
 	} else {
 		log(&format!("dialing controller at {addr}"));
-		dial(&endpoint, addr, &cfg.server_name).await?
-	};
-	debug(&format!("quic connection established to {addr}"));
-	serve(conn, cfg, cfg_path).await
+		let conn = dial(&endpoint, addr, &cfg.server_name).await?;
+		debug(&format!("quic connection established to {addr}"));
+		serve(conn, cfg, cfg_path).await
+	}
 }
 
 /// Dial the relay and register as an agent; the controller's streams will then
-/// arrive piped through it.
-async fn connect_relay(endpoint: &Endpoint, addr: SocketAddr, cfg: &AgentConfig) -> Result<quinn::Connection> {
+/// arrive piped through it. Returns the connection plus the hello stream's halves —
+/// the relay pushes peer-to-peer punch signals on that stream, which the agent reads
+/// (`hello_recv`) while holding `hello_send` open to keep the stream alive.
+async fn connect_relay(
+	endpoint: &Endpoint,
+	addr: SocketAddr,
+	cfg: &AgentConfig,
+) -> Result<(quinn::Connection, SendStream, RecvStream)> {
 	let conn = dial(endpoint, addr, &cfg.server_name).await?;
 	let identity = cfg.identity()?;
-	// Shared client side of the relay handshake (secret + key-ownership proof). We
-	// don't use the hello stream afterwards — the relay routes the controller's
-	// streams on fresh ones — so the returned halves are dropped.
-	client_handshake(
+	// Shared client side of the relay handshake (secret + key-ownership proof).
+	let (hello_send, hello_recv) = client_handshake(
 		&conn,
 		RelayRole::Agent,
 		cfg.relay_secret.as_deref().unwrap_or_default(),
@@ -222,7 +255,90 @@ async fn connect_relay(endpoint: &Endpoint, addr: SocketAddr, cfg: &AgentConfig)
 	.await
 	.context("relay registration")?;
 	log("registered with relay; awaiting controller");
-	Ok(conn)
+	Ok((conn, hello_send, hello_recv))
+}
+
+/// Read peer-to-peer signals the relay pushes on the agent's hello stream and act on
+/// them. Today the only signal is [`RelaySignal::Punch`]: the agent dials the
+/// controller's reflexive address directly, from the *same* endpoint/socket it uses
+/// for the relay, so the NAT mapping the relay observed is reused and the punch can
+/// land. `hello_send` is held only to keep the stream open.
+async fn handle_signals(
+	endpoint: Endpoint,
+	_hello_send: SendStream,
+	mut hello_recv: RecvStream,
+	identity: Arc<Identity>,
+	controller_key: Arc<String>,
+	server_name: String,
+) {
+	loop {
+		let signal = match read_frame_capped::<_, RelaySignal>(&mut hello_recv, MAX_CONTROL_FRAME).await {
+			Ok(s) => s,
+			Err(_) => break, // the relay closed the signal channel (session ended)
+		};
+		match signal {
+			RelaySignal::Punch {
+				controller_addr,
+				rendezvous,
+			} => {
+				let endpoint = endpoint.clone();
+				let identity = identity.clone();
+				let controller_key = controller_key.clone();
+				let server_name = server_name.clone();
+				tokio::spawn(async move {
+					punch_to_controller(
+						&endpoint,
+						&controller_addr,
+						&rendezvous,
+						identity,
+						controller_key,
+						&server_name,
+					)
+					.await;
+				});
+			}
+		}
+	}
+}
+
+/// Attempt a direct peer-to-peer connection to the controller for a hole-punch. The
+/// controller address is chosen by the relay, so it is *not* trusted here — the direct
+/// connection still runs the full mutual handshake (`serve_direct`), so a bogus or
+/// hostile address simply fails to authenticate and is dropped (fail-closed). On a
+/// successful punch the agent serves the controller over the direct path until it
+/// drops; on failure (typically symmetric NAT/CGNAT) it stays on the relay.
+async fn punch_to_controller(
+	endpoint: &Endpoint,
+	controller_addr: &str,
+	rendezvous: &str,
+	identity: Arc<Identity>,
+	controller_key: Arc<String>,
+	server_name: &str,
+) {
+	let Ok(addr) = controller_addr.parse::<SocketAddr>() else {
+		log_at(
+			LogLevel::Warn,
+			&format!("ignoring punch signal with an unparseable controller address {controller_addr:?}"),
+		);
+		return;
+	};
+	let rv = rendezvous.chars().take(8).collect::<String>();
+	debug(&format!(
+		"hole-punch: dialing controller directly at {addr} (rendezvous {rv}…)"
+	));
+	// Dial from the relay socket. quinn retransmits Initials across the connect window,
+	// covering the brief moment before the controller punches its own NAT open.
+	match dial(endpoint, addr, server_name).await {
+		Ok(conn) => {
+			log(&format!("direct peer-to-peer path to controller {addr} established"));
+			if let Err(e) = serve_direct(conn, identity, controller_key).await {
+				debug(&format!("direct path to {addr} ended: {e}"));
+			}
+		}
+		Err(e) => debug(&format!(
+			"hole-punch to {addr} did not connect ({e}); staying on the relay"
+		)),
+	}
 }
 
 async fn dial(endpoint: &Endpoint, addr: SocketAddr, server_name: &str) -> Result<quinn::Connection> {
@@ -255,34 +371,14 @@ pub async fn pair(relay_addr: &str, code: &PairingCode, server_name: &str) -> Re
 /// arrive piped through the relay; the logic is identical.
 async fn serve(conn: quinn::Connection, cfg: &mut AgentConfig, cfg_path: &Path) -> Result<()> {
 	log("connected; awaiting challenge");
-
-	// Handshake stream is opened by the controller.
-	let (mut send, mut recv) = conn.accept_bi().await.context("accept handshake stream")?;
-	debug("handshake stream accepted; verifying controller");
-	match read_frame_capped::<_, StreamOpen>(&mut recv, MAX_CONTROL_FRAME).await? {
-		StreamOpen::Handshake => {}
-		other => return Err(anyhow!("expected handshake stream, got {other:?}")),
-	}
-
 	let identity = cfg.identity()?;
-	let tokens: TokenSet = Arc::new(Mutex::new(HashSet::new()));
-
 	// The controller key must have been pinned at enrollment. There is no
 	// trust-on-first-use: an agent without a pinned key must be re-enrolled.
 	let expected = cfg.require_controller_key()?;
 
-	// Mutual handshake: prove our identity, verify the controller's against the
-	// pinned key, and receive the capability token (issued into `tokens`) that
-	// every later stream must carry.
-	let client_id = verify_and_grant(
-		&mut send,
-		&mut recv,
-		&identity,
-		cfg.enrollment_token.clone(),
-		&expected,
-		&tokens,
-	)
-	.await?;
+	// Accept the controller's handshake stream and complete the mutual auth + ECDHE.
+	let (client_id, tokens, session_key) =
+		accept_handshake(&conn, &identity, cfg.enrollment_token.clone(), &expected).await?;
 	log(&format!(
 		"authenticated as client {}",
 		client_id.clone().unwrap_or_default()
@@ -300,12 +396,63 @@ async fn serve(conn: quinn::Connection, cfg: &mut AgentConfig, cfg_path: &Path) 
 		}
 	}
 
-	// Serve control + session streams until the connection ends. In relay mode
-	// this connection is to the relay and outlives any single controller, so a
-	// reconnecting controller opens a fresh handshake stream here — hand the
-	// identity, pinned key and token set to each stream (see `reauth`).
-	let identity = Arc::new(identity);
-	let controller_key = Arc::new(expected);
+	serve_streams(conn, Arc::new(identity), Arc::new(expected), tokens, session_key).await
+}
+
+/// Serve one already-established direct peer-to-peer connection (a NAT hole-punch
+/// upgrade). Identical to [`serve`] minus the config side (the agent is already
+/// enrolled, so there is no enrollment token to burn or config to persist).
+async fn serve_direct(conn: quinn::Connection, identity: Arc<Identity>, controller_key: Arc<String>) -> Result<()> {
+	let (client_id, tokens, session_key) = accept_handshake(&conn, &identity, None, &controller_key).await?;
+	log(&format!(
+		"direct peer-to-peer path up as client {}",
+		client_id.unwrap_or_default()
+	));
+	serve_streams(conn, identity, controller_key, tokens, session_key).await
+}
+
+/// Accept the controller's handshake stream (the first stream it opens) and run the
+/// mutual auth + end-to-end key agreement, returning the client id and the populated
+/// token/session-key slots the serve loop hands to each subsequent stream.
+async fn accept_handshake(
+	conn: &quinn::Connection,
+	identity: &Identity,
+	enrollment_token: Option<String>,
+	controller_key: &str,
+) -> Result<(Option<String>, TokenSet, SessionSlot)> {
+	let (mut send, mut recv) = conn.accept_bi().await.context("accept handshake stream")?;
+	debug("handshake stream accepted; verifying controller");
+	match read_frame_capped::<_, StreamOpen>(&mut recv, MAX_CONTROL_FRAME).await? {
+		StreamOpen::Handshake => {}
+		other => return Err(anyhow!("expected handshake stream, got {other:?}")),
+	}
+	let tokens: TokenSet = Arc::new(Mutex::new(HashSet::new()));
+	// The end-to-end key agreed by the handshake; every later stream is sealed under it.
+	let session_key: SessionSlot = Arc::new(Mutex::new(None));
+	let client_id = verify_and_grant(
+		&mut send,
+		&mut recv,
+		identity,
+		enrollment_token,
+		controller_key,
+		&tokens,
+		&session_key,
+	)
+	.await?;
+	Ok((client_id, tokens, session_key))
+}
+
+/// Serve control/session/tunnel streams on `conn` until it ends. In relay mode this
+/// connection is to the relay and outlives any single controller, so a reconnecting
+/// controller opens a fresh handshake stream here (see `reauth`), replacing the token
+/// and session key in the shared slots.
+async fn serve_streams(
+	conn: quinn::Connection,
+	identity: Arc<Identity>,
+	controller_key: Arc<String>,
+	tokens: TokenSet,
+	session_key: SessionSlot,
+) -> Result<()> {
 	loop {
 		let (send, recv) = conn.accept_bi().await.map_err(|e| anyhow!("connection ended: {e}"))?;
 		debug("accepted a new stream from the controller");
@@ -315,6 +462,7 @@ async fn serve(conn: quinn::Connection, cfg: &mut AgentConfig, cfg_path: &Path) 
 			identity.clone(),
 			controller_key.clone(),
 			tokens.clone(),
+			session_key.clone(),
 		));
 	}
 }
@@ -329,11 +477,12 @@ fn stream_label(open: &StreamOpen) -> String {
 	}
 }
 
-/// The agent side of the mutual handshake on a handshake stream: prove our
-/// identity over the controller's nonce, verify the controller's signature over
-/// our nonce against the expected (pinned) key, and on success issue a fresh
-/// per-connection capability token. Returns the controller-assigned `client_id`,
-/// or an error if the controller is rejected or fails verification.
+/// The agent side of the mutual handshake on a handshake stream: agree an ephemeral
+/// key, prove our identity by signing the shared transcript, verify the
+/// controller's signature over the same transcript against the expected (pinned)
+/// key, and on success derive the end-to-end session key and issue a fresh
+/// per-connection capability token. Returns the controller-assigned `client_id`, or
+/// an error if the controller is rejected or fails verification.
 async fn verify_and_grant(
 	send: &mut SendStream,
 	recv: &mut RecvStream,
@@ -341,6 +490,7 @@ async fn verify_and_grant(
 	enrollment_token: Option<String>,
 	expected_key: &str,
 	tokens: &Mutex<HashSet<String>>,
+	session_key: &Mutex<Option<SessionKey>>,
 ) -> Result<Option<String>> {
 	let challenge: Challenge = read_frame_capped(recv, MAX_CONTROL_FRAME)
 		.await
@@ -354,13 +504,27 @@ async fn verify_and_grant(
 			challenge.protocol
 		));
 	}
+	let controller_eph =
+		e2e::decode_eph(&challenge.controller_eph).ok_or_else(|| anyhow!("controller ephemeral key is malformed"))?;
+
+	// Our ephemeral half of the end-to-end key agreement, and the transcript both
+	// ends sign: it commits to both ephemeral keys and both nonces, so a relay can't
+	// swap in its own ephemeral key without breaking a signature it can't forge.
+	let ephemeral = e2e::EphemeralKeypair::generate();
 	let agent_nonce = crypto::random_nonce_b64();
+	let transcript = e2e::handshake_transcript(
+		&controller_eph,
+		&ephemeral.public_bytes(),
+		&challenge.nonce,
+		&agent_nonce,
+	);
 	let hello = Hello {
 		protocol: PROTOCOL_VERSION,
 		enrollment_token,
 		public_key: identity.public_b64(),
-		signature: identity.sign_b64(challenge.nonce.as_bytes()),
+		signature: identity.sign_b64(&transcript),
 		agent_nonce: agent_nonce.clone(),
+		agent_eph: ephemeral.public_b64(),
 		host: host::host_info(),
 		agent_version: AGENT_VERSION.to_string(),
 	};
@@ -374,22 +538,32 @@ async fn verify_and_grant(
 	}
 
 	// Authenticate the controller before trusting it with any stream: its key
-	// must match the pinned one and its signature over our nonce must verify.
+	// must match the pinned one and its signature over the transcript must verify.
 	let presented = challenge.controller_key.trim();
 	if !crypto::ct_eq(expected_key, presented) {
 		return Err(anyhow!(
 			"controller key mismatch — refusing connection (possible impersonation)"
 		));
 	}
-	if !crypto::verify_b64(presented, agent_nonce.as_bytes(), &ack.controller_sig) {
+	if !crypto::verify_b64(presented, &transcript, &ack.controller_sig) {
 		return Err(anyhow!("controller identity signature invalid — refusing connection"));
 	}
 
-	// Hand the verified controller a capability token for this connection. Only the
-	// most recent handshake's token is valid: in relay mode this one connection
-	// outlives many controller sessions, so evict any prior token rather than
-	// letting the set grow unbounded (a displaced controller's streams are dead).
+	// The controller is verified and its ephemeral key is bound to that verified
+	// signature, so complete the ECDHE and derive the end-to-end session key.
+	let shared = ephemeral
+		.diffie_hellman(&controller_eph)
+		.ok_or_else(|| anyhow!("end-to-end key agreement produced a degenerate shared secret"))?;
+	let key = SessionKey::derive(&shared, &transcript);
+
+	// Hand the verified controller a capability token for this connection, and store
+	// the session key it will use. Only the most recent handshake's token/key is
+	// valid: in relay mode this one connection outlives many controller sessions, so
+	// replace any prior state (a displaced controller's streams are dead). Store both
+	// before sending the grant, so the controller's first encrypted stream can never
+	// arrive before we're ready to decrypt it.
 	let token = crypto::random_nonce_b64();
+	*session_key.lock().unwrap() = Some(key);
 	{
 		let mut tokens = tokens.lock().unwrap();
 		tokens.clear();
@@ -403,22 +577,42 @@ async fn verify_and_grant(
 }
 
 async fn handle_stream(
-	mut send: SendStream,
+	send: SendStream,
 	mut recv: RecvStream,
 	identity: Arc<Identity>,
 	controller_key: Arc<String>,
 	tokens: TokenSet,
+	session_key: SessionSlot,
 ) {
 	let open = match read_frame_capped::<_, StreamOpen>(&mut recv, MAX_CONTROL_FRAME).await {
 		Ok(o) => o,
 		Err(_) => return,
 	};
 	debug(&format!("stream opened: {}", stream_label(&open)));
-	// Handshake streams establish trust; every other stream must present the
-	// capability token from a completed handshake. This is what stops a party
-	// that can reach the agent (e.g. through the relay with only the owner
-	// secret) but cannot complete the mutual handshake from issuing commands.
-	if !matches!(open, StreamOpen::Handshake) && !authed(&mut recv, &tokens).await {
+
+	// The handshake stream establishes trust and the end-to-end key, so it stays
+	// plaintext (there's no key yet). Every other stream is sealed under the session
+	// key from a completed handshake — the controller sends a per-stream salt, then
+	// the capability token and payload flow as AEAD records, so a relay forwarding
+	// the bytes only sees ciphertext.
+	if matches!(open, StreamOpen::Handshake) {
+		reauth(send, recv, &identity, &controller_key, &tokens, &session_key).await;
+		return;
+	}
+	let Some(key) = session_key.lock().unwrap().clone() else {
+		// A non-handshake stream before any handshake completed (only reachable if a
+		// relay routes one) has no key to decrypt under — drop it, fail closed.
+		log_at(LogLevel::Warn, "rejected stream: no end-to-end session established");
+		return;
+	};
+	let (mut send, mut recv) = match e2e::open_secure_agent(send, recv, &key).await {
+		Ok(pair) => pair,
+		Err(_) => return,
+	};
+	// The capability token now arrives over the encrypted channel. A valid decrypt
+	// already proves the peer completed the handshake; the token check is the
+	// belt-and-suspenders early reject it has always been.
+	if !authed(&mut recv, &tokens).await {
 		return;
 	}
 	match open {
@@ -429,7 +623,7 @@ async fn handle_stream(
 			};
 			let resp = handlers::handle(req).await;
 			let _ = write_frame(&mut send, &resp).await;
-			let _ = send.finish();
+			let _ = send.shutdown().await;
 			debug("control stream closed");
 		}
 		StreamOpen::Session => {
@@ -440,12 +634,14 @@ async fn handle_stream(
 			debug("session stream closed");
 		}
 		StreamOpen::Tunnel { port } => tunnel(port, send, recv).await,
-		StreamOpen::Handshake => reauth(send, recv, &identity, &controller_key, &tokens).await,
+		// Handled above (plaintext); unreachable here.
+		StreamOpen::Handshake => {}
 	}
 }
 
-/// Read and check the capability token that prefixes a non-handshake stream.
-async fn authed(recv: &mut RecvStream, tokens: &Mutex<HashSet<String>>) -> bool {
+/// Read and check the capability token that prefixes a non-handshake stream (read
+/// through the encrypted channel).
+async fn authed<R: tokio::io::AsyncRead + Unpin>(recv: &mut R, tokens: &Mutex<HashSet<String>>) -> bool {
 	let auth: StreamAuth = match read_frame_capped(recv, MAX_CONTROL_FRAME).await {
 		Ok(a) => a,
 		Err(_) => return false,
@@ -461,29 +657,42 @@ async fn authed(recv: &mut RecvStream, tokens: &Mutex<HashSet<String>>) -> bool 
 /// agent connected across controller restarts/reconnects, so a returning
 /// controller re-authenticates by opening a new handshake stream; the one-time
 /// token is long spent, so we identify by key and verify the controller against
-/// the pinned key. A successful re-auth issues a new capability token.
+/// the pinned key. A successful re-auth issues a new capability token and a fresh
+/// end-to-end session key.
 async fn reauth(
 	mut send: SendStream,
 	mut recv: RecvStream,
 	identity: &Identity,
 	controller_key: &str,
 	tokens: &Mutex<HashSet<String>>,
+	session_key: &Mutex<Option<SessionKey>>,
 ) {
-	match verify_and_grant(&mut send, &mut recv, identity, None, controller_key, tokens).await {
+	match verify_and_grant(
+		&mut send,
+		&mut recv,
+		identity,
+		None,
+		controller_key,
+		tokens,
+		session_key,
+	)
+	.await
+	{
 		Ok(client_id) => log(&format!("re-authenticated as client {}", client_id.unwrap_or_default())),
 		Err(e) => log_at(LogLevel::Warn, &format!("controller re-auth rejected: {e:#}")),
 	}
 }
 
-/// Pipe a QUIC stream to a local TCP port (the client's RDP/SSH server) — used
-/// to reach the client through the relay.
+/// Pipe an end-to-end-encrypted QUIC stream to a local TCP port (the client's
+/// RDP/SSH server) — used to reach the client through the relay.
 ///
 /// `port` is chosen by the controller and is not restricted to RDP/SSH: an
 /// authenticated controller can reach any loopback service on the agent host.
 /// This is within the trust model — only a controller that completed the mutual
-/// handshake holds a capability token, and `handle_stream` rejects any tunnel
-/// stream without one — but note the reach is intentionally unrestricted.
-async fn tunnel(port: u16, mut q_send: SendStream, q_recv: RecvStream) {
+/// handshake holds the session key and capability token, and `handle_stream`
+/// rejects any tunnel stream without them — but note the reach is intentionally
+/// unrestricted.
+async fn tunnel(port: u16, mut q_send: SecureQuicSend, q_recv: SecureQuicRecv) {
 	debug(&format!("tunnel: connecting to 127.0.0.1:{port}"));
 	match tokio::net::TcpStream::connect(("127.0.0.1", port)).await {
 		Ok(tcp) => {
@@ -494,7 +703,7 @@ async fn tunnel(port: u16, mut q_send: SendStream, q_recv: RecvStream) {
 		}
 		Err(e) => {
 			log_at(LogLevel::Warn, &format!("tunnel to 127.0.0.1:{port} failed: {e}"));
-			let _ = q_send.finish();
+			let _ = q_send.shutdown().await;
 		}
 	}
 }
@@ -562,17 +771,59 @@ mod tests {
 	/// What `verify_and_grant` resolves to: the `client_id` on success.
 	type VerifyOutcome = Result<Option<String>>;
 
-	/// Run the agent's real `verify_and_grant` on the agent (client) side.
+	/// Run the agent's real `verify_and_grant` on the agent (client) side, storing
+	/// the agreed session key into `session_key` so a test can confirm the
+	/// end-to-end key was (or wasn't) established.
 	fn spawn_agent(
 		agent_conn: quinn::Connection,
 		agent: Identity,
 		pinned_controller_key: String,
 		tokens: TokenSet,
+		session_key: SessionSlot,
 	) -> tokio::task::JoinHandle<VerifyOutcome> {
 		tokio::spawn(async move {
 			let (mut send, mut recv) = agent_conn.accept_bi().await.map_err(|e| anyhow!("accept: {e}"))?;
-			verify_and_grant(&mut send, &mut recv, &agent, None, &pinned_controller_key, &tokens).await
+			verify_and_grant(
+				&mut send,
+				&mut recv,
+				&agent,
+				None,
+				&pinned_controller_key,
+				&tokens,
+				&session_key,
+			)
+			.await
 		})
+	}
+
+	/// The controller side of the ephemeral handshake through the `HelloAck`: send a
+	/// Challenge carrying a fresh ephemeral key, read the agent's Hello, and return
+	/// the transcript both ends sign plus the Hello — so a mock controller signs the
+	/// same message the agent does. `protocol`/`presented_key` are knobs for the
+	/// rejection tests.
+	async fn controller_challenge(
+		c_send: &mut quinn::SendStream,
+		c_recv: &mut quinn::RecvStream,
+		protocol: u32,
+		presented_key: String,
+	) -> (Vec<u8>, Hello) {
+		let eph = e2e::EphemeralKeypair::generate();
+		let nonce = crypto::random_nonce_b64();
+		write_frame(
+			c_send,
+			&Challenge {
+				protocol,
+				nonce: nonce.clone(),
+				controller_key: presented_key,
+				controller_eph: eph.public_b64(),
+			},
+		)
+		.await
+		.unwrap();
+		let hello: Hello = read_frame_capped(c_recv, MAX_CONTROL_FRAME).await.unwrap();
+		let agent_eph = e2e::decode_eph(&hello.agent_eph).expect("agent sends a valid ephemeral key");
+		let transcript = e2e::handshake_transcript(&eph.public_bytes(), &agent_eph, &nonce, &hello.agent_nonce);
+		(transcript, hello)
 	}
 
 	#[tokio::test]
@@ -581,40 +832,33 @@ mod tests {
 		let ctrl = Identity::generate();
 		let agent = Identity::generate();
 		let tokens: TokenSet = Arc::new(Mutex::new(HashSet::new()));
+		let session_key: SessionSlot = Arc::new(Mutex::new(None));
 
 		// Pass a cloned handle so dropping the agent task at the end of the handshake
 		// doesn't close the connection out from under the controller's final read
 		// (in production `serve` holds the connection open in a loop).
-		let handle = spawn_agent(client.clone(), agent, ctrl.public_b64(), tokens.clone());
+		let handle = spawn_agent(
+			client.clone(),
+			agent,
+			ctrl.public_b64(),
+			tokens.clone(),
+			session_key.clone(),
+		);
 
-		// An honest controller: presents its real key, verifies the agent's
-		// signature, and signs the agent's nonce with its identity key.
+		// An honest controller: presents its real key, verifies the agent's signature
+		// over the transcript, and signs the same transcript with its identity key.
 		let (mut c_send, mut c_recv) = server.open_bi().await.unwrap();
-		let nonce = crypto::random_nonce_b64();
-		write_frame(
-			&mut c_send,
-			&Challenge {
-				protocol: PROTOCOL_VERSION,
-				nonce: nonce.clone(),
-				controller_key: ctrl.public_b64(),
-			},
-		)
-		.await
-		.unwrap();
-		let hello: Hello = read_frame_capped(&mut c_recv, MAX_CONTROL_FRAME).await.unwrap();
+		let (transcript, hello) =
+			controller_challenge(&mut c_send, &mut c_recv, PROTOCOL_VERSION, ctrl.public_b64()).await;
 		assert_eq!(hello.protocol, PROTOCOL_VERSION);
-		assert!(crypto::verify_b64(
-			&hello.public_key,
-			nonce.as_bytes(),
-			&hello.signature
-		));
+		assert!(crypto::verify_b64(&hello.public_key, &transcript, &hello.signature));
 		write_frame(
 			&mut c_send,
 			&HelloAck {
 				accepted: true,
 				reason: None,
 				client_id: Some("cid-1".into()),
-				controller_sig: ctrl.sign_b64(hello.agent_nonce.as_bytes()),
+				controller_sig: ctrl.sign_b64(&transcript),
 			},
 		)
 		.await
@@ -627,6 +871,11 @@ mod tests {
 		// received — and the only one the agent will later honour.
 		assert!(tokens.lock().unwrap().contains(&grant.token));
 		assert_eq!(tokens.lock().unwrap().len(), 1);
+		// The end-to-end session key was agreed and stored for later streams.
+		assert!(
+			session_key.lock().unwrap().is_some(),
+			"handshake must establish a session key"
+		);
 	}
 
 	/// Drive the controller side up to (and including) the `HelloAck`, with knobs
@@ -638,38 +887,16 @@ mod tests {
 		signer: &Identity,
 		accepted: bool,
 	) {
-		drive_controller_with_protocol(server, PROTOCOL_VERSION, presented_key, signer, accepted).await
-	}
-
-	/// Like [`drive_dishonest_controller`] but with an explicit protocol version,
-	/// so tests can forge a version skew.
-	async fn drive_controller_with_protocol(
-		server: &quinn::Connection,
-		protocol: u32,
-		presented_key: String,
-		signer: &Identity,
-		accepted: bool,
-	) {
 		let (mut c_send, mut c_recv) = server.open_bi().await.unwrap();
-		let nonce = crypto::random_nonce_b64();
-		write_frame(
-			&mut c_send,
-			&Challenge {
-				protocol,
-				nonce,
-				controller_key: presented_key,
-			},
-		)
-		.await
-		.unwrap();
-		let hello: Hello = read_frame_capped(&mut c_recv, MAX_CONTROL_FRAME).await.unwrap();
+		let (transcript, _hello) =
+			controller_challenge(&mut c_send, &mut c_recv, PROTOCOL_VERSION, presented_key).await;
 		write_frame(
 			&mut c_send,
 			&HelloAck {
 				accepted,
 				reason: (!accepted).then(|| "rejected".to_string()),
 				client_id: None,
-				controller_sig: signer.sign_b64(hello.agent_nonce.as_bytes()),
+				controller_sig: signer.sign_b64(&transcript),
 			},
 		)
 		.await
@@ -683,8 +910,15 @@ mod tests {
 		let pinned = Identity::generate();
 		let imposter = Identity::generate();
 		let tokens: TokenSet = Arc::new(Mutex::new(HashSet::new()));
+		let session_key: SessionSlot = Arc::new(Mutex::new(None));
 
-		let handle = spawn_agent(client, Identity::generate(), pinned.public_b64(), tokens.clone());
+		let handle = spawn_agent(
+			client,
+			Identity::generate(),
+			pinned.public_b64(),
+			tokens.clone(),
+			session_key.clone(),
+		);
 		// Imposter presents its own key (and signs with it) — a different key than
 		// the agent pinned at enrollment.
 		drive_dishonest_controller(&server, imposter.public_b64(), &imposter, true).await;
@@ -694,6 +928,10 @@ mod tests {
 			tokens.lock().unwrap().is_empty(),
 			"no token issued to an unverified controller"
 		);
+		assert!(
+			session_key.lock().unwrap().is_none(),
+			"no session key agreed with an unverified controller"
+		);
 	}
 
 	#[tokio::test]
@@ -701,8 +939,15 @@ mod tests {
 		let (_sep, server, _cep, client) = loopback().await;
 		let ctrl = Identity::generate();
 		let tokens: TokenSet = Arc::new(Mutex::new(HashSet::new()));
+		let session_key: SessionSlot = Arc::new(Mutex::new(None));
 
-		let handle = spawn_agent(client, Identity::generate(), ctrl.public_b64(), tokens.clone());
+		let handle = spawn_agent(
+			client,
+			Identity::generate(),
+			ctrl.public_b64(),
+			tokens.clone(),
+			session_key.clone(),
+		);
 		// Honest key, but a stale protocol version: the agent must fail closed right
 		// after reading the challenge — before it even sends its Hello — so we only
 		// send the challenge here (there is no Hello to read back).
@@ -713,6 +958,7 @@ mod tests {
 				protocol: PROTOCOL_VERSION + 1,
 				nonce: crypto::random_nonce_b64(),
 				controller_key: ctrl.public_b64(),
+				controller_eph: e2e::EphemeralKeypair::generate().public_b64(),
 			},
 		)
 		.await
@@ -730,14 +976,22 @@ mod tests {
 		let (_sep, server, _cep, client) = loopback().await;
 		let pinned = Identity::generate();
 		let tokens: TokenSet = Arc::new(Mutex::new(HashSet::new()));
+		let session_key: SessionSlot = Arc::new(Mutex::new(None));
 
-		let handle = spawn_agent(client, Identity::generate(), pinned.public_b64(), tokens.clone());
+		let handle = spawn_agent(
+			client,
+			Identity::generate(),
+			pinned.public_b64(),
+			tokens.clone(),
+			session_key.clone(),
+		);
 		// A peer that omits/blanks the controller key (the downgrade the
 		// `#[serde(default)]` removal guards against) must be rejected.
 		drive_dishonest_controller(&server, String::new(), &pinned, true).await;
 
 		assert!(handle.await.unwrap().is_err());
 		assert!(tokens.lock().unwrap().is_empty());
+		assert!(session_key.lock().unwrap().is_none());
 	}
 
 	#[tokio::test]
@@ -746,14 +1000,22 @@ mod tests {
 		let ctrl = Identity::generate();
 		let wrong = Identity::generate();
 		let tokens: TokenSet = Arc::new(Mutex::new(HashSet::new()));
+		let session_key: SessionSlot = Arc::new(Mutex::new(None));
 
-		let handle = spawn_agent(client, Identity::generate(), ctrl.public_b64(), tokens.clone());
-		// Correct key is presented, but the nonce is signed by the wrong key, so
+		let handle = spawn_agent(
+			client,
+			Identity::generate(),
+			ctrl.public_b64(),
+			tokens.clone(),
+			session_key.clone(),
+		);
+		// Correct key is presented, but the transcript is signed by the wrong key, so
 		// the signature won't verify against the pinned key.
 		drive_dishonest_controller(&server, ctrl.public_b64(), &wrong, true).await;
 
 		assert!(handle.await.unwrap().is_err());
 		assert!(tokens.lock().unwrap().is_empty());
+		assert!(session_key.lock().unwrap().is_none());
 	}
 
 	#[tokio::test]
@@ -761,8 +1023,15 @@ mod tests {
 		let (_sep, server, _cep, client) = loopback().await;
 		let ctrl = Identity::generate();
 		let tokens: TokenSet = Arc::new(Mutex::new(HashSet::new()));
+		let session_key: SessionSlot = Arc::new(Mutex::new(None));
 
-		let handle = spawn_agent(client, Identity::generate(), ctrl.public_b64(), tokens.clone());
+		let handle = spawn_agent(
+			client,
+			Identity::generate(),
+			ctrl.public_b64(),
+			tokens.clone(),
+			session_key.clone(),
+		);
 		drive_dishonest_controller(&server, ctrl.public_b64(), &ctrl, false).await;
 
 		assert!(handle.await.unwrap().is_err());
@@ -826,20 +1095,125 @@ mod tests {
 		});
 
 		let (_sep, server, _cep, client) = loopback().await;
+		// A shared end-to-end key: the tunnel now runs over the encrypted channel, so
+		// both ends wrap their halves before piping (the salt exchange derives the
+		// per-stream directional keys).
+		let key = SessionKey::derive(&[7u8; 32], b"tunnel-test");
+
 		// Keep `client` alive in the test; the task gets a clone so finishing the
 		// tunnel doesn't tear the connection down before the controller's read.
 		let agent_conn = client.clone();
+		let agent_key = key.clone();
 		let agent = tokio::spawn(async move {
 			let (send, recv) = agent_conn.accept_bi().await.unwrap();
+			let (send, recv) = e2e::open_secure_agent(send, recv, &agent_key).await.unwrap();
 			tunnel(port, send, recv).await;
 		});
 
-		let (mut send, mut recv) = server.open_bi().await.unwrap();
+		let (send, recv) = server.open_bi().await.unwrap();
+		let (mut send, mut recv) = e2e::open_secure_controller(send, recv, &key).await.unwrap();
 		send.write_all(b"hello-tunnel").await.unwrap();
-		let _ = send.finish();
-		let echoed = recv.read_to_end(64).await.unwrap();
+		let _ = send.shutdown().await;
+		let mut echoed = Vec::new();
+		recv.read_to_end(&mut echoed).await.unwrap();
 		assert_eq!(echoed, b"hello-tunnel");
 		agent.await.unwrap();
+	}
+
+	// The agent side of a peer-to-peer punch: `punch_to_controller` must dial the
+	// controller directly and complete the full mutual handshake over that path (via
+	// `serve_direct`), so the controller ends up with an authenticated direct link.
+	#[tokio::test]
+	async fn punch_to_controller_dials_and_completes_the_direct_handshake() {
+		tls::install_crypto_provider();
+		let controller_id = Identity::generate();
+		let controller_key = Arc::new(controller_id.public_b64());
+		let agent_id = Arc::new(Identity::generate());
+
+		// A mock controller: a server endpoint that accepts the agent's direct dial and
+		// runs the controller side of the handshake, then closes so `serve_direct` ends.
+		let (cert, key) = tls::self_signed();
+		let controller_ep = Endpoint::server(tls::server_config(cert, key), (Ipv4Addr::LOCALHOST, 0).into()).unwrap();
+		let addr: SocketAddr = (Ipv4Addr::LOCALHOST, controller_ep.local_addr().unwrap().port()).into();
+
+		let controller_task = tokio::spawn(async move {
+			let conn = controller_ep.accept().await.unwrap().accept().unwrap().await.unwrap();
+			let (mut send, mut recv) = conn.open_bi().await.unwrap();
+			write_frame(&mut send, &StreamOpen::Handshake).await.unwrap();
+			let nonce = crypto::random_nonce_b64();
+			let eph = e2e::EphemeralKeypair::generate();
+			write_frame(
+				&mut send,
+				&Challenge {
+					protocol: PROTOCOL_VERSION,
+					nonce: nonce.clone(),
+					controller_key: controller_id.public_b64(),
+					controller_eph: eph.public_b64(),
+				},
+			)
+			.await
+			.unwrap();
+			let hello: Hello = read_frame_capped(&mut recv, MAX_CONTROL_FRAME).await.unwrap();
+			let agent_eph = e2e::decode_eph(&hello.agent_eph).unwrap();
+			let transcript = e2e::handshake_transcript(&eph.public_bytes(), &agent_eph, &nonce, &hello.agent_nonce);
+			let agent_verified = crypto::verify_b64(&hello.public_key, &transcript, &hello.signature);
+			write_frame(
+				&mut send,
+				&HelloAck {
+					accepted: true,
+					reason: None,
+					client_id: Some("cid".into()),
+					controller_sig: controller_id.sign_b64(&transcript),
+				},
+			)
+			.await
+			.unwrap();
+			let _ = send.finish();
+			let grant: SessionGrant = read_frame_capped(&mut recv, MAX_CONTROL_FRAME).await.unwrap();
+			// Done — close so the agent's `serve_direct` loop returns.
+			conn.close(0u32.into(), b"done");
+			(agent_verified, grant.token)
+		});
+
+		let agent_ep = tls::client_endpoint(addr).unwrap();
+		// The agent acts on a punch signal: dial the controller directly and serve it.
+		punch_to_controller(
+			&agent_ep,
+			&addr.to_string(),
+			"rendezvous-id",
+			agent_id.clone(),
+			controller_key,
+			"libretether.local",
+		)
+		.await;
+
+		let (agent_verified, token) = controller_task.await.unwrap();
+		assert!(
+			agent_verified,
+			"the controller verified the agent's signature over the direct path"
+		);
+		assert!(
+			!token.is_empty(),
+			"the agent issued a capability token for the direct path"
+		);
+	}
+
+	// A punch signal naming an unparseable address must be ignored, not crash the
+	// signal handler.
+	#[tokio::test]
+	async fn punch_to_a_garbage_address_is_ignored() {
+		tls::install_crypto_provider();
+		let agent_ep = tls::client_endpoint((Ipv4Addr::LOCALHOST, 0).into()).unwrap();
+		// Returns without panicking; nothing to connect to.
+		punch_to_controller(
+			&agent_ep,
+			"not-an-address",
+			"rv",
+			Arc::new(Identity::generate()),
+			Arc::new(Identity::generate().public_b64()),
+			"libretether.local",
+		)
+		.await;
 	}
 
 	use tokio::io::{AsyncReadExt, AsyncWriteExt};

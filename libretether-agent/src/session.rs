@@ -20,17 +20,20 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
+use libretether_protocol::e2e::{SecureQuicRecv, SecureQuicSend};
 use libretether_protocol::frame::{read_frame_capped, MAX_CONTROL_FRAME};
 use libretether_protocol::video::{self};
 use libretether_protocol::{SessionClient, SessionConfig, SessionServer};
-use quinn::{RecvStream, SendStream};
+use tokio::io::AsyncWriteExt;
 
 use crate::encode::{self, OutFrame, RawFrame, SharedConfig};
 use crate::input::{self, InjectCmd};
 
 /// Run a session to completion. The opening [`SessionClient::Start`] is read
-/// here, then the call is dispatched to the right backend for this session.
-pub async fn run(mut send: SendStream, mut recv: RecvStream) -> std::io::Result<()> {
+/// here, then the call is dispatched to the right backend for this session. The
+/// streams are the end-to-end-encrypted halves (see [`crate::net`]); everything
+/// written here is AEAD-sealed before it reaches the wire.
+pub async fn run(mut send: SecureQuicSend, mut recv: SecureQuicRecv) -> std::io::Result<()> {
 	// Input/control events are small — cap the read tightly so a buggy or hostile
 	// controller can't force a large allocation on the session stream (frames the
 	// other direction legitimately need the wide cap; these never do).
@@ -80,7 +83,7 @@ pub async fn run(mut send: SendStream, mut recv: RecvStream) -> std::io::Result<
 }
 
 /// X11 backend: stateless per-frame `xcap` capture + `enigo` input injection.
-async fn x11_session(cfg: SessionConfig, mut send: SendStream, mut recv: RecvStream) -> std::io::Result<()> {
+async fn x11_session(cfg: SessionConfig, mut send: SecureQuicSend, mut recv: SecureQuicRecv) -> std::io::Result<()> {
 	// Recover DISPLAY/XAUTHORITY from the live session before the capture and
 	// injector threads start, so both can authenticate to the X server.
 	crate::x11env::ensure();
@@ -162,7 +165,7 @@ async fn x11_session(cfg: SessionConfig, mut send: SendStream, mut recv: RecvStr
 	// lingering capture loop would contend with the next session for `xcap`).
 	stop.store(true, Ordering::Relaxed);
 	drop(out_rx);
-	let _ = send.finish();
+	let _ = send.shutdown().await;
 	reader.abort();
 	let _ = injector.send(InjectCmd::Stop);
 	let _ = injector_thread.join();

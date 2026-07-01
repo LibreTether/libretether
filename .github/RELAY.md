@@ -2,12 +2,19 @@
 
 `libretether-relay` is an optional server you run on a public host so that **neither** the
 controller nor the clients need to be reachable — both dial *out* to the relay, which routes
-between them. It carries everything: the control plane, the live session, and tunneled RDP/SSH.
-Use it for fleets where neither end is exposed. For the security model, see
+between them. It carries the control plane, the live session, and tunneled RDP/SSH. Where the
+network allows, sessions **upgrade to a direct peer-to-peer path** (a NAT hole-punch the relay
+brokers), so most traffic goes straight between the two ends — lower latency and no metered relay
+egress — and the relay carries only the hard-NAT minority. Use it for fleets where neither end is
+exposed. For the security model and how the punch works, see
 [ARCHITECTURE.md](ARCHITECTURE.md#security-model).
 
 Authentication is layered: two relay **secrets** gate access to the relay, and the agent still
-proves its identity to the controller end-to-end with Ed25519 — the relay only forwards bytes.
+proves its identity to the controller end-to-end with Ed25519. The session is also **end-to-end
+encrypted** — the controller and agent agree an application-layer key bound to their pinned
+identities, so the relay only ever forwards **ciphertext** and never sees your screen, input,
+command output, or tunneled RDP/SSH. It still needs to be available and trusted not to *disrupt*
+service, but it is not trusted with the contents of a session.
 
 ## Quick start
 

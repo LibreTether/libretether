@@ -10,10 +10,11 @@ use ashpd::desktop::remote_desktop::{Axis, DeviceType, KeyState, RemoteDesktop, 
 use ashpd::desktop::screencast::{CursorMode, Screencast, SelectSourcesOptions, SourceType};
 use ashpd::desktop::{PersistMode, Session};
 use ashpd::enumflags2::BitFlags;
+use libretether_protocol::e2e::{SecureQuicRecv, SecureQuicSend};
 use libretether_protocol::frame::{read_frame_capped, MAX_CONTROL_FRAME};
 use libretether_protocol::video;
 use libretether_protocol::{InputEvent, MouseButton, SessionClient, SessionConfig, SessionServer};
-use quinn::{RecvStream, SendStream};
+use tokio::io::AsyncWriteExt;
 
 use crate::encode::{self, OutFrame, RawFrame, SharedConfig};
 
@@ -33,14 +34,14 @@ struct Portal {
 }
 
 /// Entry point used by `session::run` when on Wayland.
-pub async fn run_session(cfg: SessionConfig, send: SendStream, recv: RecvStream) -> std::io::Result<()> {
+pub async fn run_session(cfg: SessionConfig, send: SecureQuicSend, recv: SecureQuicRecv) -> std::io::Result<()> {
 	if let Err(e) = serve(cfg, send, recv).await {
 		crate::net::log(&format!("wayland session: {e:#}"));
 	}
 	Ok(())
 }
 
-async fn serve(cfg: SessionConfig, mut send: SendStream, recv: RecvStream) -> Result<()> {
+async fn serve(cfg: SessionConfig, mut send: SecureQuicSend, recv: SecureQuicRecv) -> Result<()> {
 	let cfg = cfg.sanitized();
 	let portal = match setup_portal().await {
 		Ok(p) => p,
@@ -162,7 +163,7 @@ async fn serve(cfg: SessionConfig, mut send: SendStream, recv: RecvStream) -> Re
 	reader.abort();
 	let _ = tokio::time::timeout(std::time::Duration::from_secs(2), injector).await;
 	let _ = portal.session.close().await;
-	let _ = send.finish();
+	let _ = send.shutdown().await;
 	Ok(())
 }
 

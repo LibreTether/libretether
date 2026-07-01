@@ -43,8 +43,35 @@ the client to log in.
   dependency.
 - **Relay (server-backed)** — `libretether-relay` runs on a public host; the controller **and**
   every client dial *out* to it, so nothing on either side is exposed. The relay routes between
-  them and carries everything: control plane, live session, and tunneled RDP/SSH. See
-  [RELAY.md](RELAY.md).
+  them and carries the control plane, live session, and tunneled RDP/SSH. Sessions **upgrade to a
+  direct peer-to-peer path** whenever a NAT hole-punch succeeds (see below), so the relay carries
+  only the hard-NAT minority. See [RELAY.md](RELAY.md).
+
+### Peer-to-peer NAT traversal
+
+In relay mode the relay doubles as a **STUN-like rendezvous**: it observes each peer's reflexive
+(public) address as the source of that peer's QUIC connection, and can hand each side the other's.
+Both peers use a single **dual-role endpoint** — one UDP socket that dials the relay *and* accepts a
+direct connection — so the NAT mapping the relay observed is exactly the one a punch reuses.
+
+The upgrade is opportunistic and layered on top of the reliable relay path:
+
+1. When an agent registers, the controller asks the relay to broker a punch (a `RelayRequest::Punch`).
+   The relay pushes the controller's reflexive address to the agent on its (otherwise idle) hello
+   stream (a `RelaySignal::Punch`) and replies to the controller with the agent's.
+2. The **agent dials the controller directly** from its relay socket (which opens the agent's NAT),
+   while the **controller sends a few packets toward the agent** to open its own NAT. When both NATs
+   are address/port-restricted cones this meets in the middle; symmetric NAT/CGNAT doesn't, and the
+   attempt simply times out.
+3. The direct connection runs the **normal mutual handshake** (Ed25519 auth + the end-to-end key
+   agreement), so it's exactly as trusted as Direct mode — the relay only exchanged addresses, it
+   didn't grant anything. The controller then attaches it to the agent's link as an upgrade.
+4. New control/session/tunnel streams **prefer the direct path**; an in-flight session finishes on
+   whatever path it started on. If the direct path drops, streams **fall back to the relay**
+   transparently, and the relay stays the authority for online/offline presence throughout.
+
+The end-to-end AEAD (above) covers the direct path too, so upgrading changes only *where the bytes
+flow*, never their confidentiality.
 
 ## The live video pipeline
 
@@ -131,6 +158,18 @@ byte.
   secret — cannot impersonate the controller and drive an agent. After the handshake the agent
   issues a per-connection **capability token** that every control/screen/tunnel stream must
   carry, so unauthenticated streams (e.g. injected through the relay) are rejected.
+- **End-to-end encryption.** On top of the transport, every post-handshake stream is wrapped in an
+  application-layer AEAD (ChaCha20-Poly1305) whose key is agreed end-to-end and bound to the pinned
+  Ed25519 identities. Folded into the mutual handshake is a **signed ephemeral X25519 key
+  agreement** (a station-to-station AKE): each side sends an ephemeral X25519 public key and signs
+  a transcript committing to *both* ephemeral keys and *both* nonces with its long-term identity,
+  and verifies the peer's signature against the pinned key — so a man-in-the-middle (a malicious
+  relay included) can't substitute an ephemeral key without breaking a signature it can't forge.
+  The ephemeral keys give **forward secrecy**; the derived session key seals every later stream, so
+  **in relay mode the relay only ever forwards ciphertext** and can't read the screen, input,
+  command output, or tunneled RDP/SSH. It is always on (the same single record layer runs in Direct
+  and Tailscale mode too — defence in depth over QUIC's TLS, and no "is this encrypted?" branch to
+  get wrong). See [the record layer below](#end-to-end-record-layer).
 - **One-time enrollment token.** Baked into the deploy script, it binds the very first
   connection, then is burned.
 - **Phone pairing (SPAKE2 PAKE).** Enrollment over the browser portal is carried by a PAKE keyed
@@ -138,10 +177,24 @@ byte.
   code's secret half, so it can't read the enrollment bundle or machine-in-the-middle it; the
   controller key is still pinned, and a wrong code gets a single online guess before the slot is
   burned. Both ends show a matching verify phrase as a final cross-check.
-- **Transport.** QUIC encrypts everything with TLS 1.3. On a tailnet the link is additionally
-  end-to-end encrypted. In **relay mode** the relay forwards bytes and can see the decrypted
-  stream, so a **trusted relay host** is assumed; the owner secret is a single controller-slot
-  credential, so treat it as sensitive for *availability* too.
+- **Transport.** QUIC encrypts everything with TLS 1.3, and on a tailnet WireGuard sits underneath
+  as well. Confidentiality no longer rests on the transport in relay mode — the end-to-end AEAD
+  above does that — so a **trusted relay host is no longer assumed for confidentiality**. The owner
+  secret is a single controller-slot credential, so treat it as sensitive for *availability* (a
+  holder can deny or disrupt service), but it grants no view into the session.
+
+### End-to-end record layer
+
+After the handshake, each stream the controller opens carries its `StreamOpen` header in the clear
+(so the agent can still tell a handshake stream from a data stream and route it), then the
+controller sends a random 32-byte per-stream salt. Both ends run the salt and the session key
+through HKDF into a fresh pair of directional keys (controller→agent and agent→controller), so
+every stream — and each direction within it — has a unique key and starts its AEAD nonce counter at
+zero with no risk of reuse. Everything after the salt, **including the capability token**, is a
+sequence of length-prefixed ChaCha20-Poly1305 records. The record layer (`SecureSend`/`SecureRecv`
+in `libretether-protocol::e2e`) implements `AsyncRead`/`AsyncWrite`, so the framing, H.264 video,
+and RDP/SSH tunnel code above it is oblivious to the encryption; a tampered, reordered, or
+truncated record fails the AEAD and drops the stream (fail-closed).
 
 ## Design decisions
 
@@ -168,4 +221,7 @@ made the version check mutual (skew fails closed on both ends); v4 added the log
 replaced the JSON+base64 frame with a binary tile-delta format and added live quality control;
 v6 replaced the per-tile baseline-JPEG video with a real inter-frame **H.264** stream decoded by
 WebCodecs (and swapped JPEG quality for a target bitrate); v7 added the live capture/encoder
-backend names to the session metadata.
+backend names to the session metadata; v8 made the link **end-to-end encrypted** — the handshake
+now carries ephemeral X25519 keys and the mutual-auth signatures cover a transcript over both
+ephemeral keys and both nonces, so every post-handshake stream is AEAD-sealed and a relay only
+forwards ciphertext.
