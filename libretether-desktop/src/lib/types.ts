@@ -136,8 +136,8 @@ export interface SessionMeta {
  *  Sent to `start_control` and `configure_control`. */
 export interface SessionConfig {
 	display: number
-	/** JPEG quality, 1–100. */
-	quality: number
+	/** Target H.264 bitrate in kbps (clamped 200–80000 on the agent). */
+	bitrate_kbps: number
 	/** Upper bound on frames per second. */
 	max_fps: number
 	/** Resolution scale percentage, 10–100 (100 = native). */

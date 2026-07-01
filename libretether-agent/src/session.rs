@@ -48,9 +48,9 @@ pub async fn run(mut send: SendStream, mut recv: RecvStream) -> std::io::Result<
 		}
 	};
 	crate::net::log(&format!(
-		"session starting: display {} q{} {}fps scale {}%{}",
+		"session starting: display {} {}kbps {}fps scale {}%{}",
 		cfg.display,
-		cfg.quality,
+		cfg.bitrate_kbps,
 		cfg.max_fps,
 		cfg.scale,
 		if cfg.auto { " (auto)" } else { "" },

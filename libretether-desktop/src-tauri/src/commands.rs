@@ -1212,12 +1212,12 @@ mod tests {
 		assert_fields(
 			SessionConfig {
 				display: 0,
-				quality: 70,
+				bitrate_kbps: 8_000,
 				max_fps: 30,
 				scale: 100,
 				auto: false,
 			},
-			&["display", "quality", "max_fps", "scale", "auto"],
+			&["display", "bitrate_kbps", "max_fps", "scale", "auto"],
 		);
 	}
 

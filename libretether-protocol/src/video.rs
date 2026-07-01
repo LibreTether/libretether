@@ -1,38 +1,28 @@
 //! Binary wire format for live-session video, multiplexed on the session stream
 //! alongside JSON [`SessionServer`] control messages.
 //!
-//! The previous format JSON-wrapped a base64 string per frame — ~33% bandwidth
-//! overhead plus a full re-serialize on every hop. This replaces it with a
-//! compact binary frame carrying raw JPEG bytes for only the screen *tiles* that
-//! changed since the last frame (delta encoding), with periodic full keyframes.
-//!
-//! Each message on the agent→controller direction is one length-delimited blob
-//! (big-endian `u32` length prefix, same as [`crate::frame`]) whose first byte is
-//! a tag:
+//! Each agent→controller message is one length-delimited blob (big-endian `u32`
+//! length prefix, same as [`crate::frame`]) whose first byte is a tag:
 //!
 //! * [`TAG_CONTROL`] — the remaining bytes are a JSON [`SessionServer`]
 //!   (`Meta`/`Error`). These are rare and small.
-//! * [`TAG_FRAME`] — the remaining bytes are a binary video frame:
+//! * [`TAG_FRAME`] — the remaining bytes are one H.264 access unit:
 //!
 //! ```text
-//! u8   kind        0 = keyframe (every tile), 1 = delta (changed tiles only)
+//! u8   kind        0 = keyframe (IDR, carries SPS/PPS), 1 = delta (P-frame)
 //! u64  seq         monotonic frame counter
-//! u32  width       encoded frame width  (after downscale)
-//! u32  height      encoded frame height (after downscale)
-//! u16  tile_size   grid cell size in px; a tile's pixel origin is col*tile_size, row*tile_size
-//! u32  count       number of tiles in this message
-//! count × {
-//!   u16 col        tile column
-//!   u16 row        tile row
-//!   u32 jpeg_len
-//!   u8[jpeg_len]   baseline JPEG of this tile
-//! }
+//! u32  width       coded frame width  (after downscale, always even)
+//! u32  height      coded frame height (after downscale, always even)
+//! u32  len         access-unit byte length
+//! u8[len]          H.264 Annex-B access unit (start-code-delimited NALs)
 //! ```
 //!
-//! The decoder composites tiles onto a canvas at `(col*tile_size, row*tile_size)`;
-//! a keyframe first resizes/clears the canvas to `width`×`height`. This format is
-//! the single source of truth — the TypeScript decoder in the desktop app mirrors
-//! it byte for byte.
+//! The decoder feeds the access unit straight to a WebCodecs `VideoDecoder` as an
+//! `EncodedVideoChunk` (`type` = key→`"key"`, delta→`"delta"`). A keyframe is
+//! self-contained — OpenH264 prepends SPS+PPS to every IDR — so the decoder can
+//! (re)configure from any keyframe without a side-channel `description`. This
+//! format is the single source of truth; the TypeScript decoder in the desktop
+//! app mirrors it byte for byte.
 
 use serde::de::DeserializeOwned;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -45,37 +35,28 @@ pub const TAG_CONTROL: u8 = 0;
 /// First byte of a session message: a binary video frame follows.
 pub const TAG_FRAME: u8 = 1;
 
-/// `kind` byte: every tile is present (a full frame).
+/// `kind` byte: an IDR access unit (SPS/PPS + intra-coded picture), decodable on
+/// its own.
 pub const KIND_KEY: u8 = 0;
-/// `kind` byte: only changed tiles are present.
+/// `kind` byte: a P-frame, decodable only on top of the preceding frames.
 pub const KIND_DELTA: u8 = 1;
 
-/// One encoded screen tile at grid position `(col, row)`.
-pub struct Tile {
-	pub col: u16,
-	pub row: u16,
-	pub jpeg: Vec<u8>,
-}
+/// Fixed header size of a [`TAG_FRAME`] body, up to (but excluding) the access
+/// unit bytes: `kind(1) + seq(8) + width(4) + height(4) + len(4)`.
+pub const FRAME_HEADER_LEN: usize = 1 + 8 + 4 + 4 + 4;
 
-/// Build a complete [`TAG_FRAME`] message body (tag byte included) for the given
-/// tiles. `key` selects keyframe vs delta. The caller writes the result with
-/// [`write_message`].
-pub fn frame_message(key: bool, seq: u64, width: u32, height: u32, tile_size: u16, tiles: &[Tile]) -> Vec<u8> {
-	let payload: usize = tiles.iter().map(|t| 2 + 2 + 4 + t.jpeg.len()).sum();
-	let mut buf = Vec::with_capacity(1 + 1 + 8 + 4 + 4 + 2 + 4 + payload);
+/// Build a complete [`TAG_FRAME`] message body (tag byte included) wrapping one
+/// H.264 access unit. `key` selects keyframe (IDR) vs delta (P). The caller writes
+/// the result with [`write_message`].
+pub fn frame_message(key: bool, seq: u64, width: u32, height: u32, au: &[u8]) -> Vec<u8> {
+	let mut buf = Vec::with_capacity(1 + FRAME_HEADER_LEN + au.len());
 	buf.push(TAG_FRAME);
 	buf.push(if key { KIND_KEY } else { KIND_DELTA });
 	buf.extend_from_slice(&seq.to_be_bytes());
 	buf.extend_from_slice(&width.to_be_bytes());
 	buf.extend_from_slice(&height.to_be_bytes());
-	buf.extend_from_slice(&tile_size.to_be_bytes());
-	buf.extend_from_slice(&(tiles.len() as u32).to_be_bytes());
-	for t in tiles {
-		buf.extend_from_slice(&t.col.to_be_bytes());
-		buf.extend_from_slice(&t.row.to_be_bytes());
-		buf.extend_from_slice(&(t.jpeg.len() as u32).to_be_bytes());
-		buf.extend_from_slice(&t.jpeg);
-	}
+	buf.extend_from_slice(&(au.len() as u32).to_be_bytes());
+	buf.extend_from_slice(au);
 	buf
 }
 
@@ -155,32 +136,31 @@ mod tests {
 
 	#[tokio::test]
 	async fn frame_message_round_trips_over_a_stream() {
-		let tiles = vec![
-			Tile {
-				col: 0,
-				row: 0,
-				jpeg: vec![1, 2, 3],
-			},
-			Tile {
-				col: 3,
-				row: 1,
-				jpeg: vec![9, 8],
-			},
-		];
-		let body = frame_message(true, 7, 640, 480, 256, &tiles);
+		let au = vec![0, 0, 0, 1, 0x67, 0x42, 0x00, 0x1f]; // a fake Annex-B SPS start
+		let body = frame_message(true, 7, 640, 480, &au);
 		let (mut a, mut b) = tokio::io::duplex(4096);
 		write_message(&mut a, &body).await.unwrap();
 
 		match read_inbound(&mut b).await.unwrap() {
 			Inbound::Frame(payload) => {
-				// kind=key, seq=7, then geometry — spot-check the header.
 				assert_eq!(payload[0], KIND_KEY);
 				assert_eq!(u64::from_be_bytes(payload[1..9].try_into().unwrap()), 7);
 				assert_eq!(u32::from_be_bytes(payload[9..13].try_into().unwrap()), 640);
 				assert_eq!(u32::from_be_bytes(payload[13..17].try_into().unwrap()), 480);
-				assert_eq!(u16::from_be_bytes(payload[17..19].try_into().unwrap()), 256);
-				assert_eq!(u32::from_be_bytes(payload[19..23].try_into().unwrap()), 2);
+				assert_eq!(u32::from_be_bytes(payload[17..21].try_into().unwrap()), au.len() as u32);
+				assert_eq!(&payload[21..], &au[..]);
 			}
+			_ => panic!("expected a frame"),
+		}
+	}
+
+	#[tokio::test]
+	async fn delta_kind_is_tagged() {
+		let body = frame_message(false, 2, 320, 240, &[9, 9, 9]);
+		let (mut a, mut b) = tokio::io::duplex(4096);
+		write_message(&mut a, &body).await.unwrap();
+		match read_inbound(&mut b).await.unwrap() {
+			Inbound::Frame(payload) => assert_eq!(payload[0], KIND_DELTA),
 			_ => panic!("expected a frame"),
 		}
 	}

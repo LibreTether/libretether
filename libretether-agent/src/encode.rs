@@ -1,48 +1,47 @@
-//! The capture→encode→write pipeline's middle stage, shared by the X11 and
-//! Wayland backends.
+//! The capture→encode→write pipeline's middle stage, shared by the X11, Windows
+//! and Wayland backends.
 //!
 //! A capture source hands raw RGBA frames in on a single-slot channel (newest
-//! wins; stale frames are dropped to stay real-time). This stage downscales,
-//! splits the frame into a grid of tiles, hashes each tile to find what changed
-//! since the last frame, JPEG-encodes only the changed tiles (in parallel across
-//! cores), and writes a binary [`libretether_protocol::video`] frame out. Full
-//! keyframes are sent on start, on a geometry/scale change, and on an explicit
-//! refresh.
+//! wins; stale frames are dropped to stay real-time). This stage downscales to an
+//! even-dimensioned canvas, converts to I420, and feeds an **inter-frame H.264
+//! encoder** (OpenH264). Only what *moved* between frames costs bits — the codec's
+//! motion estimation replaces the old per-tile dirty-rectangle scheme — and a
+//! cheap whole-frame hash still short-circuits a perfectly static screen to zero
+//! bandwidth. Each encoded access unit is written as a binary
+//! [`libretether_protocol::video`] frame; the controller decodes it with WebCodecs.
 //!
 //! Running this off the capture thread is what unblocks the frame rate: capturing
 //! the next frame overlaps encoding the current one, instead of the old serial
-//! "capture → encode → send → sleep" loop that capped throughput regardless of
-//! how fast the machine was.
+//! "capture → encode → send → sleep" loop.
 
 use std::borrow::Cow;
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use image::imageops::{self, FilterType};
 use image::RgbaImage;
-use jpeg_encoder::{ColorType, Encoder};
-use libretether_protocol::video::{self, Tile};
+use libretether_protocol::video;
 use libretether_protocol::SessionConfig;
+use openh264::encoder::{
+	BitRate, Encoder, EncoderConfig, FrameRate, FrameType, Profile, RateControlMode, UsageType, VuiConfig,
+};
+use openh264::formats::YUVSlices;
+use openh264::OpenH264API;
 use rayon::prelude::*;
-
-/// Grid cell size, in source pixels. 256 keeps per-tile JPEG header overhead
-/// small while still giving delta encoding useful granularity (a moving cursor or
-/// a typing caret only dirties one or two tiles).
-const TILE_SIZE: u16 = 256;
 
 /// Adaptive-mode bounds: never drop the effective scale below this, and step it
 /// by this much. A raise only happens after a streak of comfortable frames so the
-/// scale doesn't flap (each change forces a keyframe).
+/// scale doesn't flap (each change re-inits the encoder and forces a keyframe).
 const AUTO_MIN_SCALE: u8 = 40;
 const AUTO_STEP: u8 = 10;
 const AUTO_RAISE_AFTER: u32 = 30;
 
 /// Live, lock-free view of the session knobs, shared between the capture thread
-/// (reads `max_fps`), the encoder thread (reads quality/scale/auto), and the
+/// (reads `max_fps`), the encoder thread (reads bitrate/scale/auto), and the
 /// session reader (writes them on `Configure`/`Refresh`).
 pub struct SharedConfig {
-	quality: AtomicU8,
+	bitrate_kbps: AtomicU32,
 	scale: AtomicU8,
 	max_fps: AtomicU8,
 	auto: AtomicBool,
@@ -52,7 +51,7 @@ pub struct SharedConfig {
 impl SharedConfig {
 	pub fn new(cfg: &SessionConfig) -> Arc<Self> {
 		Arc::new(Self {
-			quality: AtomicU8::new(cfg.quality),
+			bitrate_kbps: AtomicU32::new(cfg.bitrate_kbps),
 			scale: AtomicU8::new(cfg.scale),
 			max_fps: AtomicU8::new(cfg.max_fps),
 			auto: AtomicBool::new(cfg.auto),
@@ -62,9 +61,9 @@ impl SharedConfig {
 	}
 
 	/// Apply a new (already-sanitized) config live. Always forces a keyframe so the
-	/// new quality/scale take effect cleanly (and a scale change resizes the canvas).
+	/// new settings take effect cleanly.
 	pub fn apply(&self, cfg: &SessionConfig) {
-		self.quality.store(cfg.quality, Ordering::Relaxed);
+		self.bitrate_kbps.store(cfg.bitrate_kbps, Ordering::Relaxed);
 		self.scale.store(cfg.scale, Ordering::Relaxed);
 		self.max_fps.store(cfg.max_fps, Ordering::Relaxed);
 		self.auto.store(cfg.auto, Ordering::Relaxed);
@@ -79,8 +78,8 @@ impl SharedConfig {
 		self.force_key.swap(false, Ordering::Relaxed)
 	}
 
-	fn quality(&self) -> u8 {
-		self.quality.load(Ordering::Relaxed)
+	fn bitrate_kbps(&self) -> u32 {
+		self.bitrate_kbps.load(Ordering::Relaxed)
 	}
 
 	fn scale(&self) -> u8 {
@@ -97,7 +96,7 @@ impl SharedConfig {
 	}
 }
 
-/// A captured frame from either backend, before downscale/encode.
+/// A captured frame from any backend, before downscale/encode.
 pub struct RawFrame {
 	pub width: u32,
 	pub height: u32,
@@ -106,20 +105,9 @@ pub struct RawFrame {
 	pub origin_x: i32,
 	pub origin_y: i32,
 	pub rgba: RgbaImage,
-	/// Microseconds the producing thread spent obtaining this frame (the xcap grab
-	/// on X11/Windows/macOS, or the PipeWire→RGBA conversion on Wayland) — fed into
-	/// the per-stage stats so the capture cost is visible alongside encode/network.
+	/// Microseconds the producing thread spent obtaining this frame — fed into the
+	/// per-stage stats so capture cost is visible alongside encode/network.
 	pub capture_us: u64,
-}
-
-/// Per-stage timing + tile counts for one frame, returned by [`Tiler::encode`].
-pub struct EncodeOutcome {
-	/// The frame body, or `None` if nothing changed (the hash still ran).
-	pub body: Option<Vec<u8>>,
-	pub hash_us: u64,
-	pub encode_us: u64,
-	pub total_tiles: u32,
-	pub changed_tiles: u32,
 }
 
 /// An encoded frame ready to write to the session stream.
@@ -140,16 +128,23 @@ pub fn run(
 	tx: tokio::sync::mpsc::Sender<OutFrame>,
 	shared: Arc<SharedConfig>,
 ) {
-	let mut tiler = Tiler::new(TILE_SIZE);
 	let mut seq = 0u64;
-	// Effective scale ceiling for adaptive mode; tracks the configured scale when
-	// auto is off.
 	let mut eff_scale = shared.scale();
 	let mut good_streak = 0u32;
 	let mut stats = Stats::new();
 
+	// The encoder is rebuilt when its rate-control inputs (bitrate/fps) or the coded
+	// dimensions change; each backend is built for a fixed resolution and a rebuild
+	// starts a fresh keyframe. On Windows a hardware Media Foundation encoder is used
+	// when available (see `build_encoder`), otherwise software OpenH264.
+	let mut enc: Option<Box<dyn ScreenEncoder>> = None;
+	let mut built = (0u32, 0u8, 0u32, 0u32); // (bitrate, fps, width, height)
+	let mut last_hash: Option<u64> = None;
+	let mut last_dims = (0u32, 0u32);
+
 	while let Ok(raw) = rx.recv() {
-		let quality = shared.quality();
+		let bitrate = shared.bitrate_kbps();
+		let fps = shared.max_fps() as u8;
 		let ceiling = shared.scale();
 		let auto = shared.auto();
 		eff_scale = if auto {
@@ -157,48 +152,88 @@ pub fn run(
 		} else {
 			ceiling
 		};
+		let force_key = shared.take_force_key();
 
-		if shared.take_force_key() {
-			tiler.reset();
+		// Downscale to an even-dimensioned canvas (4:2:0 needs even w/h). At 100%
+		// scale with even source dims this borrows untouched — no per-frame resize.
+		let prep_started = Instant::now();
+		let scaled = prepare(&raw.rgba, eff_scale);
+		let (cw, ch) = (scaled.width(), scaled.height());
+		let downscale_us = prep_started.elapsed().as_micros() as u64;
+
+		if enc.is_none() || built != (bitrate, fps, cw, ch) {
+			match build_encoder(cw as usize, ch as usize, bitrate, fps) {
+				Ok(e) => {
+					enc = Some(e);
+					built = (bitrate, fps, cw, ch);
+					last_hash = None;
+				}
+				Err(e) => {
+					crate::net::log(&format!("h264 encoder init failed: {e:#}"));
+					break;
+				}
+			}
 		}
 
-		let down_started = Instant::now();
-		let scaled = downscale(&raw.rgba, eff_scale);
-		let downscale_us = down_started.elapsed().as_micros() as u64;
+		// Static-frame gate: an identical frame emits nothing, holding an idle
+		// screen at zero bandwidth and skipping the encode. A forced keyframe or a
+		// dimension change always re-encodes.
+		let hash_started = Instant::now();
+		let hash = frame_hash(scaled.as_raw());
+		let hash_us = hash_started.elapsed().as_micros() as u64;
+		if !force_key && last_hash == Some(hash) && last_dims == (cw, ch) {
+			stats.record_skip(&raw, downscale_us, hash_us);
+			stats.maybe_log(eff_scale, bitrate);
+			continue;
+		}
 
-		let mut outcome = tiler.encode(&scaled, quality, &mut seq);
+		// The backend owns colour conversion (RGBA → I420/NV12) and the encode.
+		let encoder = enc.as_mut().expect("encoder built above");
+		let enc_started = Instant::now();
+		let result = encoder.encode(scaled.as_raw(), cw as usize, ch as usize, force_key);
+		let encode_us = enc_started.elapsed().as_micros() as u64;
+		last_hash = Some(hash);
+		last_dims = (cw, ch);
 
-		// Send only when something changed (a static frame produces no body). Take the
-		// body out so the rest of `outcome` (its timings/counts) stays borrowable for
-		// the stats below.
-		let body = outcome.body.take();
-		let bytes = body.as_ref().map_or(0, |b| b.len() as u64);
-		let sent = body.is_some();
-		let mut send_us = 0u64;
-		if let Some(body) = body {
-			let out = OutFrame {
-				source_width: raw.width,
-				source_height: raw.height,
-				origin_x: raw.origin_x,
-				origin_y: raw.origin_y,
-				body,
-			};
-			// Backpressure (not frame-dropping): a delta frame must reach the
-			// controller or its canvas goes stale, so block here. How long we block
-			// measures how far behind the link is.
-			let send_started = Instant::now();
-			if tx.blocking_send(out).is_err() {
+		let (is_key, au) = match result {
+			Ok(Some(v)) => v,
+			// The encoder dropped this frame to hold the bitrate — send nothing, like
+			// the static gate.
+			Ok(None) => {
+				stats.record_skip(&raw, downscale_us, hash_us);
+				stats.maybe_log(eff_scale, bitrate);
+				continue;
+			}
+			Err(e) => {
+				crate::net::log(&format!("h264 encode failed: {e:#}"));
 				break;
 			}
-			send_us = send_started.elapsed().as_micros() as u64;
-		}
+		};
 
-		// Adaptive scale reacts to encode/network only — capture and downscale don't
-		// shrink with scale (downscale runs *after* capture), so lowering scale can't
-		// fix a capture-bound stream.
+		seq += 1;
+		let body = video::frame_message(is_key, seq, cw, ch, &au);
+		let bytes = body.len() as u64;
+		let out = OutFrame {
+			source_width: raw.width,
+			source_height: raw.height,
+			origin_x: raw.origin_x,
+			origin_y: raw.origin_y,
+			body,
+		};
+		// Backpressure (not frame-dropping): a P-frame must reach the controller or
+		// its canvas goes stale, so block here. How long we block measures how far
+		// behind the link is.
+		let send_started = Instant::now();
+		if tx.blocking_send(out).is_err() {
+			break;
+		}
+		let send_us = send_started.elapsed().as_micros() as u64;
+
+		// Adaptive scale reacts to encode/network pressure (a scale change re-inits
+		// the encoder, which emits a fresh keyframe on the next frame).
 		if auto {
 			let interval_us = 1_000_000 / shared.max_fps();
-			let behind = outcome.encode_us > interval_us || send_us > interval_us;
+			let behind = encode_us > interval_us || send_us > interval_us;
 			if behind && eff_scale > AUTO_MIN_SCALE {
 				eff_scale = eff_scale.saturating_sub(AUTO_STEP).max(AUTO_MIN_SCALE);
 				good_streak = 0;
@@ -211,25 +246,256 @@ pub fn run(
 			}
 		}
 
-		stats.record(&raw, downscale_us, &outcome, send_us, bytes, sent);
-		stats.maybe_log(eff_scale, quality);
+		stats.record(&raw, downscale_us, hash_us, encode_us, send_us, bytes, is_key);
+		stats.maybe_log(eff_scale, bitrate);
 	}
 }
 
+/// A live H.264 encoder backend. Implementations own their codec state and any
+/// colour-conversion scratch buffers; [`run`] drives them with already-scaled,
+/// even-dimensioned RGBA frames. Each instance is built for a fixed resolution —
+/// `run` rebuilds it when the coded dimensions (or bitrate/fps) change, so a
+/// rebuild is also where a fresh keyframe naturally falls.
+pub(crate) trait ScreenEncoder {
+	/// Encode one tightly-packed RGBA frame at `w`×`h` (both even). Returns the
+	/// Annex-B access unit plus whether it's a keyframe (IDR), or `None` when the
+	/// encoder produced no output (a frame it dropped to hold the bitrate).
+	/// `force_key` requests an IDR for this frame.
+	fn encode(&mut self, rgba: &[u8], w: usize, h: usize, force_key: bool) -> anyhow::Result<Option<(bool, Vec<u8>)>>;
+}
+
+/// Pick the best backend for this platform: a hardware Media Foundation encoder on
+/// Windows (when the `media-foundation` feature is built in and a usable encoder
+/// MFT exists), else software OpenH264 everywhere. Both emit the same H.264 wire
+/// format — this is a runtime capability choice, not a protocol fallback, so a
+/// missing hardware encoder degrades to software without a version break.
+fn build_encoder(width: usize, height: usize, bitrate_kbps: u32, fps: u8) -> anyhow::Result<Box<dyn ScreenEncoder>> {
+	#[cfg(all(windows, feature = "media-foundation"))]
+	{
+		match crate::mf_encoder::MediaFoundationEncoder::new(width, height, bitrate_kbps, fps) {
+			Ok(enc) => {
+				crate::net::log("h264: hardware Media Foundation encoder");
+				return Ok(Box::new(enc));
+			}
+			Err(e) => {
+				crate::net::log(&format!(
+					"h264: Media Foundation unavailable ({e:#}); using software OpenH264"
+				));
+			}
+		}
+	}
+	Ok(Box::new(OpenH264Encoder::new(width, height, bitrate_kbps, fps)?))
+}
+
+/// Software H.264 via OpenH264 — the cross-platform backend and the Windows
+/// fallback. Owns the encoder plus a reusable I420 conversion buffer.
+struct OpenH264Encoder {
+	enc: Encoder,
+	yuv: I420,
+	width: usize,
+	height: usize,
+}
+
+impl OpenH264Encoder {
+	fn new(width: usize, height: usize, bitrate_kbps: u32, fps: u8) -> anyhow::Result<Self> {
+		// Baseline profile (no B-frames, CAVLC) for the widest WebCodecs decode
+		// support, including WebKitGTK; rate control sized to the target bitrate.
+		let config = EncoderConfig::new()
+			.usage_type(UsageType::ScreenContentRealTime)
+			.rate_control_mode(RateControlMode::Bitrate)
+			.bitrate(BitRate::from_bps(bitrate_kbps.saturating_mul(1000)))
+			.max_frame_rate(FrameRate::from_hz(fps.max(1) as f32))
+			.profile(Profile::Baseline)
+			.vui(VuiConfig::bt601())
+			// Frame-skip must be on for bitrate-mode rate control to actually hold the
+			// target — when motion outpaces the budget the encoder drops a frame (an
+			// empty access unit we forward as nothing), the right degradation under a
+			// bitrate cap. Steady-state static frames never reach the encoder anyway:
+			// the whole-frame hash gate short-circuits them first.
+			.skip_frames(true)
+			// Not supported in screen-content mode (OpenH264 auto-disables them and
+			// warns); set explicitly to keep the logs clean.
+			.adaptive_quantization(false)
+			.background_detection(false)
+			.num_threads(1);
+		let enc = Encoder::with_api_config(OpenH264API::from_source(), config)
+			.map_err(|e| anyhow::anyhow!("openh264 init: {e}"))?;
+		Ok(Self {
+			enc,
+			yuv: I420::new(width, height),
+			width,
+			height,
+		})
+	}
+}
+
+impl ScreenEncoder for OpenH264Encoder {
+	fn encode(&mut self, rgba: &[u8], w: usize, h: usize, force_key: bool) -> anyhow::Result<Option<(bool, Vec<u8>)>> {
+		debug_assert_eq!(
+			(w, h),
+			(self.width, self.height),
+			"frame size must match the built encoder"
+		);
+		if force_key {
+			self.enc.force_intra_frame();
+		}
+		// RGBA → I420 (BT.601 limited range; signalled via the encoder's VUI).
+		rgba_to_i420(rgba, w, h, &mut self.yuv);
+		let slices = self.yuv.as_slices();
+		let bs = self
+			.enc
+			.encode(&slices)
+			.map_err(|e| anyhow::anyhow!("openh264 encode: {e}"))?;
+		let au = bs.to_vec();
+		if au.is_empty() {
+			return Ok(None);
+		}
+		Ok(Some((matches!(bs.frame_type(), FrameType::IDR | FrameType::I), au)))
+	}
+}
+
+/// Downscale by `scale` percent to even dimensions, borrowing the original
+/// untouched when it already matches (the common 100%/even case). 4:2:0 requires
+/// even width and height, so odd targets are rounded down.
+fn prepare(img: &RgbaImage, scale: u8) -> Cow<'_, RgbaImage> {
+	let (w, h) = (img.width(), img.height());
+	let tw = even(((w as u64 * scale as u64) / 100) as u32).max(2);
+	let th = even(((h as u64 * scale as u64) / 100) as u32).max(2);
+	if tw == w && th == h {
+		Cow::Borrowed(img)
+	} else {
+		Cow::Owned(imageops::resize(img, tw, th, FilterType::Triangle))
+	}
+}
+
+#[inline]
+fn even(x: u32) -> u32 {
+	x & !1
+}
+
+/// A reusable I420 (YUV 4:2:0 planar) buffer: `Y` (w×h) then `U` and `V`
+/// (w/2×h/2 each) packed contiguously.
+struct I420 {
+	data: Vec<u8>,
+	w: usize,
+	h: usize,
+}
+
+impl I420 {
+	fn new(w: usize, h: usize) -> Self {
+		let (cw, ch) = (w / 2, h / 2);
+		Self {
+			data: vec![0u8; w * h + 2 * cw * ch],
+			w,
+			h,
+		}
+	}
+
+	fn ensure(&mut self, w: usize, h: usize) {
+		if self.w != w || self.h != h {
+			*self = I420::new(w, h);
+		}
+	}
+
+	/// Borrow the three planes as an OpenH264 `YUVSource`.
+	fn as_slices(&self) -> YUVSlices<'_> {
+		let (cw, ch) = (self.w / 2, self.h / 2);
+		let (y, uv) = self.data.split_at(self.w * self.h);
+		let (u, v) = uv.split_at(cw * ch);
+		YUVSlices::new((y, u, v), (self.w, self.h), (self.w, cw, cw))
+	}
+}
+
+/// Convert tightly-packed RGBA into `dst` as I420, BT.601 limited range. The Y
+/// plane parallelizes over rows; chroma over 2×2-block rows (each averaging a
+/// 2×2 quad). `w` and `h` must be even.
+fn rgba_to_i420(rgba: &[u8], w: usize, h: usize, dst: &mut I420) {
+	dst.ensure(w, h);
+	let (cw, ch) = (w / 2, h / 2);
+	let (y_plane, uv) = dst.data.split_at_mut(w * h);
+	let (u_plane, v_plane) = uv.split_at_mut(cw * ch);
+
+	y_plane.par_chunks_mut(w).enumerate().for_each(|(row, yrow)| {
+		let base = row * w * 4;
+		for (x, y) in yrow.iter_mut().enumerate() {
+			let p = base + x * 4;
+			let (r, g, b) = (rgba[p] as i32, rgba[p + 1] as i32, rgba[p + 2] as i32);
+			*y = clamp8(((66 * r + 129 * g + 25 * b + 128) >> 8) + 16);
+		}
+	});
+
+	let _ = ch;
+	u_plane
+		.par_chunks_mut(cw)
+		.zip(v_plane.par_chunks_mut(cw))
+		.enumerate()
+		.for_each(|(crow, (urow, vrow))| {
+			let y0 = crow * 2;
+			for cx in 0..cw {
+				let x0 = cx * 2;
+				let (mut r, mut g, mut b) = (0i32, 0i32, 0i32);
+				for dy in 0..2 {
+					let row_base = (y0 + dy) * w * 4;
+					for dx in 0..2 {
+						let p = row_base + (x0 + dx) * 4;
+						r += rgba[p] as i32;
+						g += rgba[p + 1] as i32;
+						b += rgba[p + 2] as i32;
+					}
+				}
+				r >>= 2;
+				g >>= 2;
+				b >>= 2;
+				urow[cx] = clamp8(((-38 * r - 74 * g + 112 * b + 128) >> 8) + 128);
+				vrow[cx] = clamp8(((112 * r - 94 * g - 18 * b + 128) >> 8) + 128);
+			}
+		});
+}
+
+#[inline]
+fn clamp8(v: i32) -> u8 {
+	v.clamp(0, 255) as u8
+}
+
+/// FNV-1a over the frame, parallelized in blocks. Used only to detect a frame
+/// identical to the last one (skip the encode), so the order-independent block
+/// fold is fine — any pixel change flips the result.
+fn frame_hash(bytes: &[u8]) -> u64 {
+	const BLOCK: usize = 1 << 16;
+	bytes
+		.par_chunks(BLOCK)
+		.enumerate()
+		.map(|(i, c)| fnv1a(c).wrapping_add(i as u64).rotate_left((i % 64) as u32))
+		.reduce(|| 0xcbf2_9ce4_8422_2325, |a, b| a ^ b)
+}
+
+fn fnv1a(bytes: &[u8]) -> u64 {
+	let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+	let mut chunks = bytes.chunks_exact(8);
+	for c in &mut chunks {
+		let v = u64::from_le_bytes(c.try_into().unwrap());
+		h = (h ^ v).wrapping_mul(0x0000_0100_0000_01b3);
+	}
+	for &b in chunks.remainder() {
+		h = (h ^ b as u64).wrapping_mul(0x0000_0100_0000_01b3);
+	}
+	h
+}
+
 /// Rolling per-stage timing, logged ~once a second while a session runs so the
-/// operator can see exactly where the frame budget goes (capture vs hash vs encode
-/// vs network) on each guest — the basis for deciding what to optimize next.
+/// operator can see exactly where the frame budget goes (capture vs downscale vs
+/// hash vs encode vs network) on each guest. The `encode` figure covers the
+/// backend's colour conversion plus the H.264 encode.
 struct Stats {
 	window_start: Instant,
 	frames: u32,
 	sent: u32,
+	keyframes: u32,
 	capture_us: u64,
 	downscale_us: u64,
 	hash_us: u64,
 	encode_us: u64,
 	send_us: u64,
-	changed_tiles: u64,
-	total_tiles: u64,
 	bytes: u64,
 }
 
@@ -239,324 +505,148 @@ impl Stats {
 			window_start: Instant::now(),
 			frames: 0,
 			sent: 0,
+			keyframes: 0,
 			capture_us: 0,
 			downscale_us: 0,
 			hash_us: 0,
 			encode_us: 0,
 			send_us: 0,
-			changed_tiles: 0,
-			total_tiles: 0,
 			bytes: 0,
 		}
 	}
 
+	#[allow(clippy::too_many_arguments)]
 	fn record(
 		&mut self,
 		raw: &RawFrame,
 		downscale_us: u64,
-		outcome: &EncodeOutcome,
+		hash_us: u64,
+		encode_us: u64,
 		send_us: u64,
 		bytes: u64,
-		sent: bool,
+		key: bool,
 	) {
 		self.frames += 1;
-		if sent {
-			self.sent += 1;
+		self.sent += 1;
+		if key {
+			self.keyframes += 1;
 		}
 		self.capture_us += raw.capture_us;
 		self.downscale_us += downscale_us;
-		self.hash_us += outcome.hash_us;
-		self.encode_us += outcome.encode_us;
+		self.hash_us += hash_us;
+		self.encode_us += encode_us;
 		self.send_us += send_us;
-		self.changed_tiles += outcome.changed_tiles as u64;
-		self.total_tiles += outcome.total_tiles as u64;
 		self.bytes += bytes;
 	}
 
-	fn maybe_log(&mut self, scale: u8, quality: u8) {
+	/// A frame that produced no output (static gate or encoder skip): it still cost
+	/// capture/downscale/hash, so account for those.
+	fn record_skip(&mut self, raw: &RawFrame, downscale_us: u64, hash_us: u64) {
+		self.frames += 1;
+		self.capture_us += raw.capture_us;
+		self.downscale_us += downscale_us;
+		self.hash_us += hash_us;
+	}
+
+	fn maybe_log(&mut self, scale: u8, bitrate: u32) {
 		let elapsed = self.window_start.elapsed();
 		if elapsed < Duration::from_secs(1) || self.frames == 0 {
 			return;
 		}
 		let n = self.frames as f64;
-		// Mean milliseconds per processed frame for each stage.
 		let ms = |total: u64| (total as f64 / n) / 1000.0;
 		let fps = n / elapsed.as_secs_f64();
 		let kib_per_sent = (self.bytes as f64 / self.sent.max(1) as f64) / 1024.0;
-		// Per-second telemetry: useful for tuning but far too chatty for the default
-		// Info view, so it's logged at Debug (the Logs page filters it out by default).
+		// Per-second telemetry: useful for tuning but too chatty for the default Info
+		// view, so it's logged at Debug (the Logs page filters it out by default).
 		crate::net::debug(&format!(
-			"stream {fps:.0} fps ({} sent/s) | cap {:.1} down {:.1} hash {:.1} enc {:.1} net {:.1} ms/f | {:.0}/{:.0} tiles {kib_per_sent:.0} KiB/f | scale {scale}% q{quality}",
+			"stream {fps:.0} fps ({}/s sent, {} key) | cap {:.1} down {:.1} hash {:.1} enc {:.1} net {:.1} ms/f | {kib_per_sent:.0} KiB/sent | scale {scale}% {bitrate}kbps",
 			self.sent,
+			self.keyframes,
 			ms(self.capture_us),
 			ms(self.downscale_us),
 			ms(self.hash_us),
 			ms(self.encode_us),
 			ms(self.send_us),
-			self.changed_tiles as f64 / n,
-			self.total_tiles as f64 / n,
 		));
 		*self = Stats::new();
 	}
 }
 
-/// Downscale by `scale` percent, borrowing the original untouched at 100%.
-fn downscale(img: &RgbaImage, scale: u8) -> Cow<'_, RgbaImage> {
-	if scale >= 100 {
-		return Cow::Borrowed(img);
-	}
-	let nw = (img.width() * scale as u32 / 100).max(1);
-	let nh = (img.height() * scale as u32 / 100).max(1);
-	Cow::Owned(imageops::resize(img, nw, nh, FilterType::Triangle))
-}
-
-/// Splits a frame into a tile grid, tracks per-tile content hashes, and emits
-/// only changed tiles between keyframes.
-pub struct Tiler {
-	tile: u16,
-	width: u32,
-	height: u32,
-	cols: u32,
-	rows: u32,
-	/// Per-tile content hash from the last emitted frame, row-major `cols × rows`.
-	hashes: Vec<u64>,
-}
-
-impl Tiler {
-	pub fn new(tile: u16) -> Self {
-		Self {
-			tile,
-			width: 0,
-			height: 0,
-			cols: 0,
-			rows: 0,
-			hashes: Vec::new(),
-		}
-	}
-
-	/// Force the next frame to be a full keyframe (geometry/scale/quality changed).
-	pub fn reset(&mut self) {
-		self.hashes.clear();
-		self.width = 0;
-		self.height = 0;
-	}
-
-	/// Encode `img` into a binary frame body (with per-stage timings), or a body of
-	/// `None` if nothing changed since the previous frame. Bumps `seq` only when a
-	/// frame is actually produced.
-	pub fn encode(&mut self, img: &RgbaImage, quality: u8, seq: &mut u64) -> EncodeOutcome {
-		let (w, h) = (img.width(), img.height());
-		let tile = self.tile as u32;
-		let key = w != self.width || h != self.height || self.hashes.is_empty();
-		if key {
-			self.width = w;
-			self.height = h;
-			self.cols = w.div_ceil(tile);
-			self.rows = h.div_ceil(tile);
-			self.hashes = vec![0u64; (self.cols * self.rows) as usize];
-		}
-		let (cols, rows) = (self.cols, self.rows);
-		let count = (cols * rows) as usize;
-
-		// Hash every tile (parallel, read-only over the frame).
-		let hash_started = Instant::now();
-		let current: Vec<u64> = (0..count)
-			.into_par_iter()
-			.map(|idx| {
-				let rect = tile_rect(idx as u32, cols, tile, w, h);
-				hash_tile(img, rect)
-			})
-			.collect();
-		let hash_us = hash_started.elapsed().as_micros() as u64;
-
-		// On a keyframe every tile is sent; otherwise only those whose hash moved.
-		let changed: Vec<usize> = if key {
-			(0..count).collect()
-		} else {
-			(0..count).filter(|&i| current[i] != self.hashes[i]).collect()
-		};
-		if changed.is_empty() {
-			return EncodeOutcome {
-				body: None,
-				hash_us,
-				encode_us: 0,
-				total_tiles: count as u32,
-				changed_tiles: 0,
-			};
-		}
-
-		// Encode the selected tiles in parallel.
-		let encode_started = Instant::now();
-		let tiles: Vec<Tile> = changed
-			.par_iter()
-			.map(|&i| {
-				let rect = tile_rect(i as u32, cols, tile, w, h);
-				Tile {
-					col: (i as u32 % cols) as u16,
-					row: (i as u32 / cols) as u16,
-					jpeg: encode_region(img, rect, quality),
-				}
-			})
-			.collect();
-		let encode_us = encode_started.elapsed().as_micros() as u64;
-
-		self.hashes = current;
-		*seq += 1;
-		EncodeOutcome {
-			body: Some(video::frame_message(key, *seq, w, h, self.tile, &tiles)),
-			hash_us,
-			encode_us,
-			total_tiles: count as u32,
-			changed_tiles: changed.len() as u32,
-		}
-	}
-}
-
-/// A tile's pixel rectangle, clamped to the frame's edges.
-struct Rect {
-	x: u32,
-	y: u32,
-	w: u32,
-	h: u32,
-}
-
-fn tile_rect(idx: u32, cols: u32, tile: u32, fw: u32, fh: u32) -> Rect {
-	let (cx, cy) = (idx % cols, idx / cols);
-	let (x, y) = (cx * tile, cy * tile);
-	Rect {
-		x,
-		y,
-		w: tile.min(fw - x),
-		h: tile.min(fh - y),
-	}
-}
-
-/// FNV-1a over a tile's pixels — fast, and a 64-bit hash makes a missed update
-/// (a collision) astronomically unlikely.
-fn hash_tile(img: &RgbaImage, rect: Rect) -> u64 {
-	let stride = img.width() as usize * 4;
-	let raw = img.as_raw();
-	let row_bytes = rect.w as usize * 4;
-	let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-	for row in 0..rect.h {
-		let start = (rect.y + row) as usize * stride + rect.x as usize * 4;
-		let bytes = &raw[start..start + row_bytes];
-		let mut chunks = bytes.chunks_exact(8);
-		for c in &mut chunks {
-			let v = u64::from_le_bytes(c.try_into().unwrap());
-			h = (h ^ v).wrapping_mul(0x0000_0100_0000_01b3);
-		}
-		for &b in chunks.remainder() {
-			h = (h ^ b as u64).wrapping_mul(0x0000_0100_0000_01b3);
-		}
-	}
-	h
-}
-
-/// Copy a tile out of the frame into a tight RGBA buffer and JPEG-encode it. The
-/// encoder ignores the alpha channel, so no separate RGB conversion is needed.
-fn encode_region(img: &RgbaImage, rect: Rect, quality: u8) -> Vec<u8> {
-	let stride = img.width() as usize * 4;
-	let raw = img.as_raw();
-	let row_bytes = rect.w as usize * 4;
-	let mut buf = Vec::with_capacity(row_bytes * rect.h as usize);
-	for row in 0..rect.h {
-		let start = (rect.y + row) as usize * stride + rect.x as usize * 4;
-		buf.extend_from_slice(&raw[start..start + row_bytes]);
-	}
-	let mut out = Vec::new();
-	let encoder = Encoder::new(&mut out, quality);
-	// width/height fit u16 comfortably — a tile is at most TILE_SIZE px.
-	encoder
-		.encode(&buf, rect.w as u16, rect.h as u16, ColorType::Rgba)
-		.expect("jpeg encode of an in-bounds tile cannot fail");
-	out
-}
-
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use libretether_protocol::video::{Inbound, KIND_DELTA, KIND_KEY};
 
 	fn solid(w: u32, h: u32, px: [u8; 4]) -> RgbaImage {
 		RgbaImage::from_pixel(w, h, image::Rgba(px))
 	}
 
-	async fn read_back(body: &[u8]) -> Vec<u8> {
-		let (mut a, mut b) = tokio::io::duplex(1 << 20);
-		video::write_message(&mut a, body).await.unwrap();
-		match video::read_inbound(&mut b).await.unwrap() {
-			Inbound::Frame(payload) => payload,
-			_ => panic!("expected a frame"),
-		}
-	}
-
-	#[tokio::test]
-	async fn first_frame_is_a_keyframe_with_every_tile() {
-		let mut tiler = Tiler::new(256);
-		let mut seq = 0;
-		// 300×300 with tile 256 → a 2×2 grid (4 tiles).
-		let body = tiler
-			.encode(&solid(300, 300, [10, 20, 30, 255]), 70, &mut seq)
-			.body
-			.unwrap();
-		let payload = read_back(&body).await;
-		assert_eq!(payload[0], KIND_KEY);
-		assert_eq!(seq, 1);
-		let count = u32::from_be_bytes(payload[19..23].try_into().unwrap());
-		assert_eq!(count, 4, "keyframe must carry all 4 tiles");
-	}
-
-	#[tokio::test]
-	async fn unchanged_frame_emits_nothing() {
-		let mut tiler = Tiler::new(256);
-		let mut seq = 0;
-		let img = solid(300, 300, [1, 2, 3, 255]);
-		tiler.encode(&img, 70, &mut seq).body.unwrap();
-		assert!(
-			tiler.encode(&img, 70, &mut seq).body.is_none(),
-			"a static frame sends nothing"
-		);
-		assert_eq!(seq, 1);
-	}
-
-	#[tokio::test]
-	async fn delta_sends_only_changed_tiles() {
-		let mut tiler = Tiler::new(256);
-		let mut seq = 0;
-		let mut img = solid(300, 300, [0, 0, 0, 255]);
-		tiler.encode(&img, 70, &mut seq).body.unwrap(); // keyframe
-
-		// Touch one pixel in the top-left tile only.
-		img.put_pixel(5, 5, image::Rgba([255, 255, 255, 255]));
-		let body = tiler.encode(&img, 70, &mut seq).body.unwrap();
-		let payload = read_back(&body).await;
-		assert_eq!(payload[0], KIND_DELTA);
-		let count = u32::from_be_bytes(payload[19..23].try_into().unwrap());
-		assert_eq!(count, 1, "only the dirtied tile should be sent");
-		// And it is the (0,0) tile.
-		assert_eq!(u16::from_be_bytes(payload[23..25].try_into().unwrap()), 0);
-		assert_eq!(u16::from_be_bytes(payload[25..27].try_into().unwrap()), 0);
-	}
-
-	#[tokio::test]
-	async fn reset_forces_a_fresh_keyframe() {
-		let mut tiler = Tiler::new(256);
-		let mut seq = 0;
-		let img = solid(300, 300, [9, 9, 9, 255]);
-		tiler.encode(&img, 70, &mut seq).body.unwrap();
-		tiler.reset();
-		let body = tiler.encode(&img, 70, &mut seq).body.unwrap();
-		let payload = read_back(&body).await;
-		assert_eq!(payload[0], KIND_KEY, "after reset the next frame is a keyframe");
+	#[test]
+	fn prepare_rounds_to_even_and_borrows_at_native() {
+		// 100% with even dims borrows untouched.
+		let img = solid(200, 100, [0, 0, 0, 255]);
+		assert!(matches!(prepare(&img, 100), Cow::Borrowed(_)));
+		// Downscale halves dimensions (and stays even).
+		let small = prepare(&img, 50);
+		assert_eq!((small.width(), small.height()), (100, 50));
+		// Odd target dims are rounded down to even.
+		let odd = solid(101, 51, [0, 0, 0, 255]);
+		let prepped = prepare(&odd, 100);
+		assert_eq!((prepped.width(), prepped.height()), (100, 50));
 	}
 
 	#[test]
-	fn downscale_halves_dimensions() {
-		let img = solid(200, 100, [0, 0, 0, 255]);
-		let small = downscale(&img, 50);
-		assert_eq!((small.width(), small.height()), (100, 50));
-		// 100% borrows the original (same dimensions, no resize).
-		assert_eq!(downscale(&img, 100).dimensions(), (200, 100));
+	fn rgba_to_i420_fills_expected_plane_sizes() {
+		let img = solid(4, 2, [255, 255, 255, 255]);
+		let mut yuv = I420::new(2, 2);
+		rgba_to_i420(img.as_raw(), 4, 2, &mut yuv);
+		assert_eq!(yuv.w, 4);
+		assert_eq!(yuv.h, 2);
+		// Y (4×2) + U (2×1) + V (2×1) = 8 + 2 + 2.
+		assert_eq!(yuv.data.len(), 8 + 2 + 2);
+		// White → Y near 235 (limited-range peak).
+		assert!(yuv.data[0] > 230, "white luma should be near 235, got {}", yuv.data[0]);
+	}
+
+	#[test]
+	fn static_frame_hash_is_stable_and_change_sensitive() {
+		let a = solid(16, 16, [10, 20, 30, 255]);
+		let mut b = a.clone();
+		assert_eq!(frame_hash(a.as_raw()), frame_hash(b.as_raw()));
+		b.put_pixel(3, 3, image::Rgba([0, 0, 0, 255]));
+		assert_ne!(frame_hash(a.as_raw()), frame_hash(b.as_raw()));
+	}
+
+	/// Does the Annex-B access unit contain an SPS NAL (type 7)? Mirrors the
+	/// controller's `avcCodecFromKeyframe`, which reads the codec string from it.
+	fn has_sps(au: &[u8]) -> bool {
+		au.windows(3)
+			.enumerate()
+			.any(|(i, w)| w == [0, 0, 1] && au.get(i + 3).is_some_and(|b| b & 0x1f == 7))
+	}
+
+	#[test]
+	fn first_frame_is_an_idr_then_deltas_follow() {
+		let mut enc = OpenH264Encoder::new(64, 64, 4_000, 30).expect("encoder builds");
+		let frame = solid(64, 64, [120, 130, 140, 255]);
+
+		let (key, au) = enc
+			.encode(frame.as_raw(), 64, 64, false)
+			.unwrap()
+			.expect("keyframe emitted");
+		assert!(key, "first frame must be a keyframe");
+		assert!(
+			has_sps(&au),
+			"keyframe must carry an in-band SPS so the decoder can configure"
+		);
+
+		// A second, slightly different frame should still produce output (a P-frame).
+		let mut moved = frame.clone();
+		moved.put_pixel(10, 10, image::Rgba([0, 0, 0, 255]));
+		let (_, au2) = enc
+			.encode(moved.as_raw(), 64, 64, false)
+			.unwrap()
+			.expect("delta emitted");
+		assert!(!au2.is_empty());
 	}
 }

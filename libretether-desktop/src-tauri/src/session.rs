@@ -30,8 +30,8 @@ pub fn start(state: &AppState, ctrl: Arc<ActiveController>, id: Uuid, cfg: Sessi
 	crate::logbook::info(
 		"session",
 		&format!(
-			"starting screen-control session for {id} (display {} q{} {}fps scale {}%)",
-			cfg.display, cfg.quality, cfg.max_fps, cfg.scale
+			"starting screen-control session for {id} (display {} {}kbps {}fps scale {}%)",
+			cfg.display, cfg.bitrate_kbps, cfg.max_fps, cfg.scale
 		),
 	);
 

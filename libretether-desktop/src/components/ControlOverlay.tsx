@@ -2,14 +2,14 @@ import { Eye, Keyboard, Loader2, MousePointer2, Power } from "lucide-react"
 import { useCallback, useEffect, useRef, useState } from "react"
 import * as api from "../lib/api"
 import type { ClientDto, InputEvent, MouseButton, SessionConfig, SessionMeta } from "../lib/types"
-import { parseFrame } from "../lib/videoFrame"
+import { avcCodecFromKeyframe, parseFrame } from "../lib/videoFrame"
 import { QualityControls } from "./QualityControls"
 
 const BUTTONS: Record<number, MouseButton> = { 0: "left", 1: "middle", 2: "right" }
 
 // The session opens in adaptive mode at native resolution; the controller can
 // retune it live from the QualityControls menu.
-const INITIAL_CONFIG: SessionConfig = { auto: true, display: 0, max_fps: 30, quality: 70, scale: 100 }
+const INITIAL_CONFIG: SessionConfig = { auto: true, bitrate_kbps: 8000, display: 0, max_fps: 30, scale: 100 }
 
 export function ControlOverlay({
 	client,
@@ -34,12 +34,20 @@ export function ControlOverlay({
 	const prevFramesRef = useRef(0)
 	const [fps, setFps] = useState(0)
 
-	// Incoming frames are decoded/drawn strictly in arrival order: a delta frame
-	// only carries the tiles that changed, so dropping or reordering one would leave
-	// the canvas permanently stale. `queueRef` buffers raw frame buffers and
-	// `drainingRef` guards the single in-flight drainer.
-	const queueRef = useRef<ArrayBuffer[]>([])
-	const drainingRef = useRef(false)
+	// Frames are decoded strictly in arrival order: a P-frame builds on the frames
+	// before it, so reordering or dropping one corrupts the picture until the next
+	// keyframe. WebCodecs preserves submission order and the agent delivers frames in
+	// order over the channel, so we feed them straight through — no queue needed.
+	const decoderRef = useRef<VideoDecoder | null>(null)
+	// The codec string is derived from the first keyframe's SPS; track it so a
+	// profile/level change reconfigures the decoder.
+	const codecRef = useRef<string | null>(null)
+	// EncodedVideoChunk wants a monotonic timestamp; the value is arbitrary for
+	// in-order baseline H.264 (no B-frames), so a simple counter suffices.
+	const tsRef = useRef(0)
+	// Latest config, read by the decoder's error-recovery path without making the
+	// session effect depend on it.
+	const configRef = useRef(config)
 	const aliveRef = useRef(true)
 
 	// Coalesce pointer moves to one send per animation frame.
@@ -70,44 +78,83 @@ export function ControlOverlay({
 		[client.id, readOnly]
 	)
 
-	// Decode a frame's changed tiles and composite them onto the canvas. A keyframe
-	// (re)sizes the canvas; tiles are decoded off the main thread via createImageBitmap.
-	const drawFrame = useCallback(async (buf: ArrayBuffer) => {
+	// Draw a decoded frame onto the canvas, sizing the canvas to match it. The
+	// decoder owns scaling/color conversion on the GPU, so this is a single blit.
+	const onDecoded = useCallback((frame: VideoFrame) => {
 		const canvas = canvasRef.current
-		if (!canvas) return
-		const frame = parseFrame(buf)
-		if (frame.key && (canvas.width !== frame.width || canvas.height !== frame.height)) {
-			canvas.width = frame.width
-			canvas.height = frame.height
-		}
-		const ctx = canvas.getContext("2d")
-		if (!ctx) return
-		const bitmaps = await Promise.all(
-			frame.tiles.map((t) => createImageBitmap(new Blob([t.bytes], { type: "image/jpeg" })))
-		)
-		if (!aliveRef.current) {
-			for (const b of bitmaps) b.close()
+		if (!canvas || !aliveRef.current) {
+			frame.close()
 			return
 		}
-		for (let i = 0; i < frame.tiles.length; i++) {
-			const t = frame.tiles[i]
-			ctx.drawImage(bitmaps[i], t.col * frame.tileSize, t.row * frame.tileSize)
-			bitmaps[i].close()
+		if (canvas.width !== frame.displayWidth || canvas.height !== frame.displayHeight) {
+			canvas.width = frame.displayWidth
+			canvas.height = frame.displayHeight
 		}
+		const ctx = canvas.getContext("2d")
+		if (ctx) ctx.drawImage(frame, 0, 0)
+		frame.close()
 	}, [])
 
-	const drain = useCallback(async () => {
-		if (drainingRef.current) return
-		drainingRef.current = true
-		try {
-			while (queueRef.current.length) {
-				const buf = queueRef.current.shift()
-				if (buf) await drawFrame(buf)
+	// Drop the decoder and ask the agent for a fresh keyframe to rebuild from. A
+	// corrupt or missed frame can't be patched, only restarted from an IDR;
+	// `configure_control` re-sends the live config, which forces one agent-side.
+	const resetDecoder = useCallback(() => {
+		const dec = decoderRef.current
+		decoderRef.current = null
+		codecRef.current = null
+		if (dec && dec.state !== "closed") {
+			try {
+				dec.close()
+			} catch {
+				/* already gone */
 			}
-		} finally {
-			drainingRef.current = false
 		}
-	}, [drawFrame])
+		api.configureControl(client.id, configRef.current).catch(() => {})
+	}, [client.id])
+
+	// Feed one frame to the decoder. A keyframe (re)configures it from the in-band
+	// SPS; deltas arriving before the decoder is configured are dropped (the stream
+	// opens with a keyframe, so that only happens briefly during error recovery).
+	const handleFrame = useCallback(
+		(buf: ArrayBuffer) => {
+			if (!aliveRef.current) return
+			const frame = parseFrame(buf)
+			if (frame.key) {
+				const codec = avcCodecFromKeyframe(frame.data) ?? "avc1.42e01f"
+				if (!decoderRef.current || codecRef.current !== codec) {
+					if (decoderRef.current && decoderRef.current.state !== "closed") {
+						try {
+							decoderRef.current.close()
+						} catch {
+							/* already gone */
+						}
+					}
+					const dec = new VideoDecoder({
+						error: () => aliveRef.current && resetDecoder(),
+						output: onDecoded
+					})
+					dec.configure({ codec, optimizeForLatency: true })
+					decoderRef.current = dec
+					codecRef.current = codec
+				}
+			}
+			const dec = decoderRef.current
+			if (dec?.state !== "configured") return
+			try {
+				dec.decode(
+					new EncodedVideoChunk({
+						data: frame.data,
+						timestamp: tsRef.current,
+						type: frame.key ? "key" : "delta"
+					})
+				)
+				tsRef.current += 1000
+			} catch {
+				if (aliveRef.current) resetDecoder()
+			}
+		},
+		[onDecoded, resetDecoder]
+	)
 
 	// Release everything currently held, then forget it. Safe to call repeatedly.
 	const releaseAll = useCallback(() => {
@@ -143,8 +190,7 @@ export function ControlOverlay({
 			api.startControl(client.id, INITIAL_CONFIG, (buf) => {
 				if (!aliveRef.current) return
 				framesRef.current += 1
-				queueRef.current.push(buf)
-				void drain()
+				handleFrame(buf)
 			}).catch((e) => aliveRef.current && setError(api.errString(e)))
 		}, 0)
 		surfaceRef.current?.focus()
@@ -152,7 +198,15 @@ export function ControlOverlay({
 		return () => {
 			aliveRef.current = false
 			clearTimeout(startTimer)
-			queueRef.current = []
+			const dec = decoderRef.current
+			decoderRef.current = null
+			if (dec && dec.state !== "closed") {
+				try {
+					dec.close()
+				} catch {
+					/* already gone */
+				}
+			}
 			// Flush any held keys/buttons *before* tearing the session down so the
 			// releases still reach the agent (the agent also releases on stop as a
 			// backstop, but this covers both backends and is immediate).
@@ -160,7 +214,7 @@ export function ControlOverlay({
 			api.stopControl(client.id).catch(() => {})
 			for (const u of unlisteners) u.then((fn) => fn())
 		}
-	}, [client.id, releaseAll, drain])
+	}, [client.id, releaseAll, handleFrame])
 
 	// Report fps ~1 Hz as the delta since the last tick (see above).
 	useEffect(() => {
@@ -170,6 +224,11 @@ export function ControlOverlay({
 		}, 1000)
 		return () => window.clearInterval(t)
 	}, [])
+
+	// Keep the decoder's view of the live config current for error recovery.
+	useEffect(() => {
+		configRef.current = config
+	}, [config])
 
 	// Keyboard is handled at the window level (not on the focused surface) so that
 	// control doesn't silently die the moment focus moves to the header, a button,

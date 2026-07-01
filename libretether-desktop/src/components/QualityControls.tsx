@@ -4,17 +4,22 @@ import type { SessionConfig } from "../lib/types"
 
 /** Bundled quality presets. `display` is preserved from the live config. */
 const PRESETS = {
-	Auto: { auto: true, max_fps: 30, quality: 70, scale: 100 },
-	High: { auto: false, max_fps: 30, quality: 82, scale: 100 },
-	Low: { auto: false, max_fps: 20, quality: 50, scale: 50 },
-	Medium: { auto: false, max_fps: 30, quality: 65, scale: 75 }
+	Auto: { auto: true, bitrate_kbps: 8000, max_fps: 30, scale: 100 },
+	High: { auto: false, bitrate_kbps: 12000, max_fps: 30, scale: 100 },
+	Low: { auto: false, bitrate_kbps: 2500, max_fps: 20, scale: 50 },
+	Medium: { auto: false, bitrate_kbps: 6000, max_fps: 30, scale: 75 }
 } satisfies Record<string, Omit<SessionConfig, "display">>
 
 type PresetName = keyof typeof PRESETS
 
 function activePreset(cfg: SessionConfig): PresetName | "Custom" {
 	for (const [name, p] of Object.entries(PRESETS) as [PresetName, (typeof PRESETS)[PresetName]][]) {
-		if (p.scale === cfg.scale && p.quality === cfg.quality && p.max_fps === cfg.max_fps && p.auto === cfg.auto) {
+		if (
+			p.scale === cfg.scale &&
+			p.bitrate_kbps === cfg.bitrate_kbps &&
+			p.max_fps === cfg.max_fps &&
+			p.auto === cfg.auto
+		) {
 			return name
 		}
 	}
@@ -51,7 +56,11 @@ export function QualityControls({ value, onChange }: { value: SessionConfig; onC
 				type="button"
 			>
 				<Gauge className="h-3.5 w-3.5" />
-				<span>{current === "Custom" ? `${value.scale}% · q${value.quality}` : current}</span>
+				<span>
+					{current === "Custom"
+						? `${value.scale}% · ${(value.bitrate_kbps / 1000).toFixed(1)} Mbps`
+						: current}
+				</span>
 			</button>
 
 			{open && (
@@ -98,12 +107,13 @@ export function QualityControls({ value, onChange }: { value: SessionConfig; onC
 								value={value.scale}
 							/>
 							<Slider
-								label="Quality"
-								max={100}
-								min={10}
-								onChange={(v) => setField({ quality: v })}
-								step={5}
-								value={value.quality}
+								label="Bitrate"
+								max={30000}
+								min={1000}
+								onChange={(v) => setField({ bitrate_kbps: v })}
+								step={500}
+								suffix=" kbps"
+								value={value.bitrate_kbps}
 							/>
 							<Slider
 								label="Frame rate"

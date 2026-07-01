@@ -175,7 +175,7 @@ unsafe fn run_frames(
 		// of the duplicated image), so there's nothing new to encode.
 		let present = info.LastPresentTime != 0;
 		let interval = Duration::from_millis(1000 / shared.max_fps());
-		let due = last_emit.map_or(true, |t| t.elapsed() >= interval);
+		let due = last_emit.is_none_or(|t| t.elapsed() >= interval);
 
 		if present && due {
 			if let Some(resource) = resource.as_ref() {

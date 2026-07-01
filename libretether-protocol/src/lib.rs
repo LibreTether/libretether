@@ -37,8 +37,11 @@ pub const ALPN: &[u8] = b"libretether/1";
 /// added the [`ControlRequest::FetchLogs`] RPC so the controller can pull an
 /// agent's recent log buffer; v5 replaced the JSON+base64 live-session `Frame`
 /// with binary, tile-delta [`video`] frames and added `SessionConfig.scale` +
-/// the [`SessionClient::Configure`] live-quality control.
-pub const PROTOCOL_VERSION: u32 = 5;
+/// the [`SessionClient::Configure`] live-quality control; v6 replaced the
+/// per-tile baseline-JPEG video format with a real inter-frame H.264 stream
+/// (decoded by WebCodecs on the controller) and swapped `SessionConfig.quality`
+/// (JPEG 1–100) for `SessionConfig.bitrate_kbps`.
+pub const PROTOCOL_VERSION: u32 = 6;
 
 /// Default UDP port the controller listens on for incoming agents.
 pub const DEFAULT_PORT: u16 = 47600;
@@ -328,8 +331,10 @@ pub struct ScreenshotResult {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct SessionConfig {
 	pub display: u32,
-	/// JPEG quality, 1–100.
-	pub quality: u8,
+	/// Target H.264 bitrate in kilobits per second. The encoder's rate control
+	/// sizes each frame to hold the stream around this average; raise it for
+	/// sharper motion, lower it for a thinner link.
+	pub bitrate_kbps: u32,
 	/// Upper bound on frames per second the agent should emit.
 	pub max_fps: u8,
 	/// Resolution scale as a percentage, 10–100. The agent downscales each
@@ -343,13 +348,18 @@ pub struct SessionConfig {
 	pub auto: bool,
 }
 
+/// Bitrate clamp bounds (kbps): floor keeps a usable picture, ceiling caps a
+/// hostile or fat-fingered config from demanding an absurd allocation/link.
+pub const MIN_BITRATE_KBPS: u32 = 200;
+pub const MAX_BITRATE_KBPS: u32 = 80_000;
+
 impl SessionConfig {
 	/// Clamp every knob into its valid range. Applied on the agent before use so a
 	/// malformed or hostile config can't drive a divide-by-zero or a wild allocation.
 	pub fn sanitized(self) -> Self {
 		Self {
 			display: self.display,
-			quality: self.quality.clamp(1, 100),
+			bitrate_kbps: self.bitrate_kbps.clamp(MIN_BITRATE_KBPS, MAX_BITRATE_KBPS),
 			max_fps: self.max_fps.clamp(1, 60),
 			scale: self.scale.clamp(10, 100),
 			auto: self.auto,
@@ -361,7 +371,7 @@ impl Default for SessionConfig {
 	fn default() -> Self {
 		Self {
 			display: 0,
-			quality: 70,
+			bitrate_kbps: 8_000,
 			max_fps: 30,
 			scale: 100,
 			auto: false,

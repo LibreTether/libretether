@@ -112,7 +112,21 @@ jobs:
         if: startsWith(matrix.runner, 'ubuntu')
         run: |
           sudo apt-get update
-          sudo apt-get install -y pkg-config clang libxdo-dev libxcb1-dev libxrandr-dev libxfixes-dev libdbus-1-dev libpipewire-0.3-dev libxkbcommon-dev
+          sudo apt-get install -y pkg-config clang libxdo-dev libxcb1-dev libxrandr-dev libxfixes-dev libdbus-1-dev libpipewire-0.3-dev libxkbcommon-dev nasm
+
+      # OpenH264 (the agent's H.264 encoder) builds its x86 SIMD kernels with nasm.
+      # Only x86_64 targets use it — the aarch64 Linux build has no x86 asm, and the
+      # macOS universal build needs it only for its x86_64 slice.
+      - name: Install nasm (macOS)
+        if: startsWith(matrix.runner, 'macos')
+        run: brew install nasm
+
+      - name: Install nasm (Windows)
+        if: startsWith(matrix.runner, 'windows')
+        shell: bash
+        run: |
+          choco install nasm -y
+          echo "C:\\Program Files\\NASM" >> "$GITHUB_PATH"
 
       - uses: actions-rust-lang/setup-rust-toolchain@v1.16.1
         # Don't let the action export RUSTFLAGS (it defaults to "-D warnings"):

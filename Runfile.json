@@ -74,7 +74,7 @@
 			"commands": [
 				{
 					"cases": {
-						"linux": "sudo apt-get update && sudo apt-get install -y libwebkit2gtk-4.1-dev build-essential curl wget file libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev libxcb1-dev libxrandr-dev libxfixes-dev libdbus-1-dev libpipewire-0.3-dev libxkbcommon-dev clang freerdp3-x11",
+						"linux": "sudo apt-get update && sudo apt-get install -y libwebkit2gtk-4.1-dev build-essential curl wget file libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev libxcb1-dev libxrandr-dev libxfixes-dev libdbus-1-dev libpipewire-0.3-dev libxkbcommon-dev clang freerdp3-x11 nasm",
 						"macos": "xcode-select --install || true"
 					},
 					"default": "echo 'No system setup step for {{ RUN.os }} — install the Tauri prerequisites manually: https://tauri.app/start/prerequisites/'",

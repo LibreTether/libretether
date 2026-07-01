@@ -9,6 +9,14 @@ license = "AGPL-3.0-only"
 name = "libretether-agent"
 path = "src/main.rs"
 
+[features]
+# Hardware H.264 on Windows via a Media Foundation encoder MFT, used in preference
+# to software OpenH264 when a usable encoder exists (falls back automatically).
+# OFF by default: the backend (src/mf_encoder.rs) is an async-MFT implementation
+# that must be compiled and validated on Windows before it's turned on in a
+# release build — enabling this on a non-Windows target is a no-op.
+media-foundation = []
+
 [dependencies]
 libretether-protocol = { path = "../libretether-protocol" }
 libretether-common = { path = "../libretether-common" }
@@ -23,11 +31,12 @@ dirs = "6"
 base64 = "0.22"
 whoami = "1"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
-# Fast, pure-Rust JPEG encoder (SIMD via std::arch — no C/cmake in the
-# cross-compile, unlike libjpeg-turbo). Used for the live-session tile encoder;
-# `image`'s encoder stays for one-shot PNG screenshots.
-jpeg-encoder = "0.6"
-# Data-parallel tile hashing + JPEG encoding across cores.
+# Inter-frame H.264 for the live session, decoded by WebCodecs on the controller.
+# `source` compiles OpenH264's bundled C++ via `cc` (no cmake). x86 SIMD wants
+# `nasm` at build time; without it set `OPENH264_NO_ASM=1` for the slower C-only
+# kernels. `image`'s JPEG/PNG path stays for one-shot screenshots.
+openh264 = { version = "0.9", default-features = false, features = ["source"] }
+# Data-parallel RGBA→I420 conversion + frame hashing across cores.
 rayon = "1"
 xcap = "0.3"
 enigo = "0.3"
@@ -62,4 +71,11 @@ features = [
 	"Win32_Graphics_Direct3D11",
 	"Win32_Graphics_Dxgi",
 	"Win32_Graphics_Dxgi_Common",
+	# Media Foundation H.264 encoder MFT (feature = "media-foundation"). Bindings
+	# are cheap to generate and only referenced behind that feature, so they're
+	# listed unconditionally on the Windows target.
+	"Win32_Media_MediaFoundation",
+	"Win32_System_Com",
+	"Win32_System_Ole",
+	"Win32_System_Variant",
 ]
