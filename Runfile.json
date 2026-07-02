@@ -25,8 +25,17 @@
 			"description": "Full workspace gate: everything in check:static + check:rust. CI splits these — check:static once, check:rust per-OS in a matrix — but locally `run check` does both"
 		},
 		"check:rust": {
-			"commands": "cargo clippy --workspace --all-targets -- -D warnings",
-			"description": "OS-dependent gate: clippy the whole Rust workspace (CI runs this on Linux, macOS and Windows so per-OS code — the Windows encoder, macOS capture, etc. — can't rot)"
+			"commands": [
+				"cargo clippy --workspace --all-targets -- -D warnings",
+				{
+					"cases": {
+						"linux": "if ! command -v cargo-xwin >/dev/null 2>&1; then echo '==> cargo-xwin not installed — skipping the Windows (msvc) cross-check. Enable it once with: cargo install --locked cargo-xwin'; exit 0; fi; LLVM_BIN=; if command -v llvm-lib >/dev/null 2>&1; then LLVM_BIN=$(dirname \"$(command -v llvm-lib)\"); else for cfg in llvm-config llvm-config-21 llvm-config-20 llvm-config-19 llvm-config-18 llvm-config-17 llvm-config-16; do if command -v \"$cfg\" >/dev/null 2>&1; then d=$(\"$cfg\" --bindir); if [ -x \"$d/llvm-lib\" ]; then LLVM_BIN=$d; break; fi; fi; done; fi; if [ -z \"$LLVM_BIN\" ]; then echo '==> cargo-xwin is installed but no LLVM llvm-lib archiver was found — install the llvm package (provides llvm-lib). Aborting the Windows cross-check.' >&2; exit 1; fi; rustup target add x86_64-pc-windows-msvc >/dev/null 2>&1 || true; echo \"==> Windows (msvc) cross-check via cargo-xwin — LLVM: $LLVM_BIN\"; OPENH264_NO_ASM=1 PATH=\"$LLVM_BIN:$PATH\" cargo xwin clippy -p libretether-agent -p libretether-relay -p libretether-protocol -p libretether-common --target x86_64-pc-windows-msvc --all-targets -- -D warnings"
+					},
+					"default": "echo native clippy above is the {{ RUN.os }} gate here - no windows cross-check needed",
+					"match": "{{ RUN.os }}"
+				}
+			],
+			"description": "OS-dependent gate: clippy the whole Rust workspace (CI runs this on Linux, macOS and Windows so per-OS code — the Windows encoder, macOS capture, etc. — can't rot). On Linux it ALSO cross-clippies the shippable non-desktop crates for x86_64-pc-windows-msvc via cargo-xwin, so Windows-only agent/relay code is linted locally without a Windows box (needs `cargo install cargo-xwin` + clang/LLVM; OPENH264_NO_ASM skips nasm and the LLVM bindir is auto-discovered). Skips cleanly when cargo-xwin isn't installed — e.g. the CI Linux leg, where the windows-latest leg is the real Windows gate. The desktop (Tauri) crate is left to the native Windows leg."
 		},
 		"check:static": {
 			"commands": [
@@ -77,7 +86,11 @@
 			"commands": [
 				{
 					"cases": {
-						"linux": "sudo apt-get update && sudo apt-get install -y libwebkit2gtk-4.1-dev build-essential curl wget file libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev libxcb1-dev libxrandr-dev libxfixes-dev libdbus-1-dev libpipewire-0.3-dev libxkbcommon-dev clang freerdp3-x11 nasm",
+						"linux": [
+							"sudo apt-get update",
+							"sudo apt-get install -y libwebkit2gtk-4.1-dev build-essential curl wget file libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev libxcb1-dev libxrandr-dev libxfixes-dev libdbus-1-dev libpipewire-0.3-dev libxkbcommon-dev clang llvm freerdp3-x11 nasm",
+							"cargo install --locked cargo-xwin"
+						],
 						"macos": "xcode-select --install || true"
 					},
 					"default": "echo 'No system setup step for {{ RUN.os }} — install the Tauri prerequisites manually: https://tauri.app/start/prerequisites/'",
@@ -85,7 +98,7 @@
 				},
 				"pnpm install"
 			],
-			"description": "Install system prerequisites (Tauri/WebKit deps) and JS dependencies (husky hooks are set up by the package.json prepare script)"
+			"description": "Install system prerequisites (Tauri/WebKit deps) and JS dependencies (husky hooks are set up by the package.json prepare script). On Linux it also installs the Windows cross-compile toolchain used by `check:rust` — `llvm` (provides the llvm-lib archiver + llvm-config for auto-discovery) and cargo-xwin — so the msvc cross-clippy runs after setup with no extra steps. cargo-xwin fetches the MSVC SDK itself on first use; only add `lld` by hand if you later want to cross-*build* .exe (linking), not just clippy."
 		},
 		"test": {
 			"commands": "cargo test --workspace {{ ARGS }}",
