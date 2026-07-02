@@ -9,8 +9,8 @@ use libretether_protocol::relay::{
 	self, AdminRequest, AdminResponse, RelayRequest, RelayRole, TenantCredentials, TenantInfo,
 };
 use libretether_protocol::{
-	tls, AgentStatus, ControlRequest, ControlResponse, ExecResult, InputEvent, ScreenshotResult, SessionConfig,
-	DEFAULT_PORT, PROTOCOL_VERSION,
+	tls, AgentStatus, ControlRequest, ControlResponse, DirListing, ExecResult, InputEvent, ScreenshotResult,
+	SessionConfig, DEFAULT_PORT, PROTOCOL_VERSION,
 };
 use serde::Serialize;
 use tauri::{Emitter, State};
@@ -22,6 +22,7 @@ use crate::registry::{Client, ClientOs};
 use crate::server::control_request;
 use crate::state::{ActiveController, AppState, ControllerKind};
 use crate::tailscale::{self, TailscaleInfo};
+use crate::transfer_queue::{Direction, TransferItem};
 use crate::{deploy, session};
 
 /// Send a control request to the active agent and extract the expected response
@@ -785,6 +786,124 @@ pub async fn stop_control(state: State<'_, AppState>, id: String) -> AppResult<(
 	Ok(())
 }
 
+// ---------------------------------------------------------------- file transfer
+
+/// List a directory on a connected agent, for the remote pane of the transfer browser.
+/// `path == None` seeds it with the agent's home directory + filesystem roots.
+#[tauri::command]
+pub async fn browse_remote(state: State<'_, AppState>, id: String, path: Option<String>) -> AppResult<DirListing> {
+	let (ctrl, id) = active_and_id(state.inner(), &id)?;
+	let conn = ctrl.connection(id).ok_or(AppError::Offline)?;
+	expect_response!(&conn, &ControlRequest::Browse { path }, ControlResponse::Dir)
+}
+
+/// List a directory on the controller host, for the local pane of the transfer browser.
+/// Uses the same implementation as the remote browse, so the two panes match.
+#[tauri::command]
+pub async fn browse_local(path: Option<String>) -> AppResult<DirListing> {
+	tokio::task::spawn_blocking(move || libretether_protocol::transfer::browse(path.as_deref()))
+		.await
+		.map_err(|e| AppError::msg(format!("browse task failed: {e}")))?
+		.map_err(AppError::Io)
+}
+
+/// The active controller's transfer queue (all items, any status). Live progress arrives
+/// via `transfer:progress:{id}` events; the list itself refreshes on `transfers:changed`.
+#[tauri::command]
+pub async fn list_transfers(state: State<'_, AppState>) -> AppResult<Vec<TransferItem>> {
+	let Some(ctrl) = state.inner().active() else {
+		return Ok(Vec::new());
+	};
+	let items = ctrl.transfers.lock().unwrap().list().to_vec();
+	Ok(items)
+}
+
+/// Enqueue a transfer and start it if the machine is online. `remote_path` is the source
+/// (download) or destination directory (upload) on the agent; `local_path` is the
+/// destination directory (download) or source (upload) on this host.
+#[tauri::command]
+pub async fn enqueue_transfer(
+	state: State<'_, AppState>,
+	client_id: String,
+	direction: Direction,
+	remote_path: String,
+	local_path: String,
+	is_dir: bool,
+) -> AppResult<TransferItem> {
+	let state = state.inner().clone();
+	let ctrl = state.require_active()?;
+	let client = parse_id(&client_id)?;
+	if remote_path.trim().is_empty() || local_path.trim().is_empty() {
+		return Err(AppError::msg("both a source and a destination are required"));
+	}
+	let name = transfer_name(direction, &remote_path, &local_path);
+	let item = TransferItem::new(client, direction, remote_path, local_path, is_dir, name);
+	let created = item.clone();
+	ctrl.mutate_transfers(|q| q.enqueue(item));
+	let app = state.0.app.get().cloned();
+	crate::transfer::emit_changed(&app);
+	crate::logbook::info(
+		"transfer",
+		&format!(
+			"queued {} of '{}' for {client}",
+			direction_label(direction),
+			created.name
+		),
+	);
+	// Start now if the machine is online (sequential per machine).
+	crate::transfer::resume_for(&state, &ctrl, client);
+	Ok(created)
+}
+
+/// Pause a running (or queued) transfer.
+#[tauri::command]
+pub async fn pause_transfer(state: State<'_, AppState>, id: String) -> AppResult<()> {
+	let state = state.inner().clone();
+	let ctrl = state.require_active()?;
+	crate::transfer::pause(&ctrl, parse_id(&id)?);
+	crate::transfer::emit_changed(&state.0.app.get().cloned());
+	Ok(())
+}
+
+/// Resume a paused or errored transfer (re-queues it and kicks the machine's queue).
+#[tauri::command]
+pub async fn resume_transfer(state: State<'_, AppState>, id: String) -> AppResult<()> {
+	let state = state.inner().clone();
+	let ctrl = state.require_active()?;
+	crate::transfer::resume(&state, &ctrl, parse_id(&id)?);
+	crate::transfer::emit_changed(&state.0.app.get().cloned());
+	Ok(())
+}
+
+/// Cancel and remove a transfer from the queue (stops it if running).
+#[tauri::command]
+pub async fn remove_transfer(state: State<'_, AppState>, id: String) -> AppResult<()> {
+	let state = state.inner().clone();
+	let ctrl = state.require_active()?;
+	crate::transfer::cancel(&state, &ctrl, parse_id(&id)?);
+	crate::transfer::emit_changed(&state.0.app.get().cloned());
+	Ok(())
+}
+
+/// Display name for a queued transfer: the base name of its source.
+fn transfer_name(direction: Direction, remote_path: &str, local_path: &str) -> String {
+	let src = match direction {
+		Direction::Download => remote_path,
+		Direction::Upload => local_path,
+	};
+	std::path::Path::new(src)
+		.file_name()
+		.map(|s| s.to_string_lossy().into_owned())
+		.unwrap_or_else(|| src.to_string())
+}
+
+fn direction_label(direction: Direction) -> &'static str {
+	match direction {
+		Direction::Download => "download",
+		Direction::Upload => "upload",
+	}
+}
+
 /// Resolve `(host, port)` to point a client at — tunneling through the relay
 /// when the agent isn't directly reachable.
 async fn client_endpoint(
@@ -1118,9 +1237,11 @@ mod tests {
 			std::process::id(),
 			N.fetch_add(1, Ordering::Relaxed)
 		));
+		let transfers = crate::transfer_queue::TransferQueue::load(path.with_extension("transfers")).unwrap();
 		ActiveController::new(
 			ControllerProfile::new("test".into(), kind),
 			ClientStore::load(path).unwrap(),
+			transfers,
 		)
 	}
 
@@ -1416,6 +1537,74 @@ mod tests {
 			},
 			&["ts_secs", "level", "source", "message"],
 		);
+	}
+
+	#[test]
+	fn transfer_dtos_match_types_ts() {
+		use crate::transfer_queue::TransferStatus;
+		use libretether_protocol::{DirEntry, EntryKind};
+
+		assert_fields(
+			DirEntry {
+				name: "f".into(),
+				kind: EntryKind::File,
+				size: 0,
+				mtime: None,
+			},
+			&["name", "kind", "size", "mtime"],
+		);
+		assert_fields(
+			DirListing {
+				path: "/".into(),
+				parent: None,
+				roots: Vec::new(),
+				entries: Vec::new(),
+			},
+			&["path", "parent", "roots", "entries"],
+		);
+		assert_fields(
+			TransferItem::new(
+				Uuid::nil(),
+				Direction::Download,
+				"/r".into(),
+				"/l".into(),
+				false,
+				"n".into(),
+			),
+			&[
+				"id",
+				"client_id",
+				"direction",
+				"remote_path",
+				"local_path",
+				"is_dir",
+				"name",
+				"total_files",
+				"total_bytes",
+				"files_done",
+				"bytes_done",
+				"status",
+				"error",
+				"created_at",
+				"updated_at",
+			],
+		);
+		// The frontend switches on these literals.
+		assert_eq!(serde_json::to_value(EntryKind::File).unwrap(), "file");
+		assert_eq!(serde_json::to_value(EntryKind::Dir).unwrap(), "dir");
+		assert_eq!(serde_json::to_value(EntryKind::Symlink).unwrap(), "symlink");
+		assert_eq!(serde_json::to_value(EntryKind::Other).unwrap(), "other");
+		assert_eq!(serde_json::to_value(Direction::Download).unwrap(), "download");
+		assert_eq!(serde_json::to_value(Direction::Upload).unwrap(), "upload");
+		for (s, lit) in [
+			(TransferStatus::Queued, "queued"),
+			(TransferStatus::Active, "active"),
+			(TransferStatus::Paused, "paused"),
+			(TransferStatus::Done, "done"),
+			(TransferStatus::Error, "error"),
+		] {
+			assert_eq!(serde_json::to_value(s).unwrap(), lit);
+		}
 	}
 
 	#[test]

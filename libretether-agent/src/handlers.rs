@@ -6,8 +6,8 @@ use std::time::{Duration, Instant};
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
 use libretether_protocol::{
-	AgentStatus, ControlRequest, ControlResponse, ExecResult, LogLevel, PortProbe, ScreenshotResult, SshInfo,
-	DEFAULT_EXEC_TIMEOUT_SECS, MAX_EXEC_TIMEOUT_SECS,
+	AgentStatus, ControlRequest, ControlResponse, DirListing, ExecResult, LogLevel, PortProbe, ScreenshotResult,
+	SshInfo, DEFAULT_EXEC_TIMEOUT_SECS, MAX_EXEC_TIMEOUT_SECS,
 };
 use tokio::process::Command;
 
@@ -48,6 +48,10 @@ fn request_label(req: &ControlRequest) -> String {
 		ControlRequest::FetchLogs { .. } => "fetch logs".into(),
 		ControlRequest::ProbePort { port } => format!("probe port {port}"),
 		ControlRequest::EnableSsh => "enable ssh".into(),
+		ControlRequest::Browse { path } => match path {
+			Some(p) => format!("browse {p}"),
+			None => "browse (roots)".into(),
+		},
 	}
 }
 
@@ -102,7 +106,22 @@ async fn dispatch(req: ControlRequest) -> ControlResponse {
 				message: format!("starting embedded SSH server: {e}"),
 			},
 		},
+		ControlRequest::Browse { path } => match browse(path).await {
+			Ok(listing) => ControlResponse::Dir(listing),
+			Err(e) => ControlResponse::Error { message: e },
+		},
 	}
+}
+
+/// List a directory (or, with `path == None`, seed the file-transfer browser with the
+/// home directory and the filesystem roots) using the shared browse implementation.
+/// Runs the blocking `std::fs` work on the blocking pool, like [`screenshot`].
+async fn browse(path: Option<String>) -> Result<DirListing, String> {
+	tokio::task::spawn_blocking(move || {
+		libretether_protocol::transfer::browse(path.as_deref()).map_err(|e| e.to_string())
+	})
+	.await
+	.map_err(|e| format!("browse task failed: {e}"))?
 }
 
 /// Best-effort TCP reachability check for a loopback service on the agent host

@@ -8,6 +8,7 @@ import type {
 	ControllerKind,
 	ControllerSummary,
 	CreateClientResult,
+	DirListing,
 	ExecResult,
 	InputEvent,
 	LogEntry,
@@ -18,7 +19,10 @@ import type {
 	SessionMeta,
 	Settings,
 	TenantCredentials,
-	TenantInfo
+	TenantInfo,
+	TransferDirection,
+	TransferItem,
+	TransferProgress
 } from "./types"
 
 // The packaged app always runs inside Tauri (which defines `__TAURI_INTERNALS__`)
@@ -73,6 +77,27 @@ export const stopControl = (id: string) => call<void>("stop_control", { id })
 export const connectRdp = (id: string) => call<void>("connect_rdp", { id })
 export const connectSsh = (id: string) => call<void>("connect_ssh", { id })
 
+// ---------------------------------------------------------------- file transfer
+/** List a directory on a connected agent (remote pane). `path === null` seeds the
+ *  browser with the agent's home dir + filesystem roots. */
+export const browseRemote = (id: string, path: string | null) => call<DirListing>("browse_remote", { id, path })
+/** List a directory on this host (local pane). `path === null` seeds it. */
+export const browseLocal = (path: string | null) => call<DirListing>("browse_local", { path })
+export const listTransfers = () => call<TransferItem[]>("list_transfers")
+/** Enqueue a transfer (starts immediately if the machine is online). `remotePath` is
+ *  the source (download) or destination dir (upload) on the agent; `localPath` is the
+ *  destination dir (download) or source (upload) on this host. */
+export const enqueueTransfer = (
+	clientId: string,
+	direction: TransferDirection,
+	remotePath: string,
+	localPath: string,
+	isDir: boolean
+) => call<TransferItem>("enqueue_transfer", { clientId, direction, isDir, localPath, remotePath })
+export const pauseTransfer = (id: string) => call<void>("pause_transfer", { id })
+export const resumeTransfer = (id: string) => call<void>("resume_transfer", { id })
+export const removeTransfer = (id: string) => call<void>("remove_transfer", { id })
+
 // ---------------------------------------------------------------- controllers
 export const listControllers = () => call<ControllerSummary[]>("list_controllers")
 export const createController = (name: string, kind: ControllerKind) =>
@@ -121,6 +146,11 @@ export const onSessionError = (id: string, cb: (msg: string) => void): Promise<U
 	sub<string>(`session:error:${id}`, (e) => cb(e.payload))
 export const onPairingCompleted = (cb: (e: PairingCompleted) => void): Promise<UnlistenFn> =>
 	sub<PairingCompleted>("pairing:completed", (e) => cb(e.payload))
+/** Live per-transfer progress (throttled). The payload's `id` says which transfer. */
+export const onTransferProgress = (cb: (p: TransferProgress) => void): Promise<UnlistenFn> =>
+	sub<TransferProgress>("transfer:progress", (e) => cb(e.payload))
+/** The transfer queue changed (enqueue / status change / removal) — reload the list. */
+export const onTransfersChanged = (cb: () => void): Promise<UnlistenFn> => sub("transfers:changed", () => cb())
 
 /** Normalise an error thrown from `invoke` into a readable string. Tauri can
  *  reject with a plain object (e.g. `{ message }`) rather than a string/Error, so

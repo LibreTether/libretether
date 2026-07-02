@@ -133,6 +133,8 @@ async fn handle_direct(state: AppState, ctrl: Arc<ActiveController>, incoming: q
 
 	let link = AgentLink::direct(conn.clone());
 	if let Some((id, generation)) = enroll_and_register(&state, &ctrl, link).await? {
+		// Resume any queued file transfers for this machine now that it's online.
+		crate::transfer::resume_for(&state, &ctrl, id);
 		conn.closed().await;
 		cleanup(&state, &ctrl, id, Some(generation));
 		log(&format!("agent {id} disconnected"));
@@ -255,9 +257,13 @@ async fn relay_session(
 				let endpoint = endpoint.clone();
 				tauri::async_runtime::spawn(async move {
 					match enroll_and_register(&state, &ctrl, link).await {
-						// Registered over the relay — now try to open a faster direct
-						// peer-to-peer path (best-effort; stays on the relay if it can't).
-						Ok(Some(_)) => attempt_upgrade(&ctrl, &relay_conn, &endpoint, &public_key).await,
+						// Registered over the relay — resume queued transfers, then try to
+						// open a faster direct peer-to-peer path (best-effort; stays on the
+						// relay if it can't).
+						Ok(Some((id, _))) => {
+							crate::transfer::resume_for(&state, &ctrl, id);
+							attempt_upgrade(&ctrl, &relay_conn, &endpoint, &public_key).await
+						}
 						Ok(None) => {}
 						Err(e) => log_err(&format!("enroll via relay failed: {e}")),
 					}
@@ -716,7 +722,8 @@ mod tests {
 		);
 		let mut store = ClientStore::load(dir.join("clients.json")).unwrap();
 		let token = store.create("box".into(), ClientOs::Linux).enrollment_token.unwrap();
-		let ctrl = ActiveController::new(profile, store);
+		let transfers = crate::transfer_queue::TransferQueue::load(dir.join("transfers.json")).unwrap();
+		let ctrl = ActiveController::new(profile, store, transfers);
 		(state, ctrl, token)
 	}
 

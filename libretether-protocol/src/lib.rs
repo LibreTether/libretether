@@ -21,6 +21,7 @@ pub mod pairing;
 pub mod relay;
 pub mod secret;
 pub mod tls;
+pub mod transfer;
 pub mod video;
 mod wordlist;
 
@@ -47,8 +48,10 @@ pub const ALPN: &[u8] = b"libretether/1";
 /// keys (`Challenge.controller_eph` / `Hello.agent_eph`) and the mutual-auth
 /// signatures now cover the [`e2e::handshake_transcript`] (both ephemeral keys and
 /// both nonces), so every post-handshake stream is AEAD-sealed end-to-end and a
-/// relay only ever forwards ciphertext (see [`e2e`]).
-pub const PROTOCOL_VERSION: u32 = 8;
+/// relay only ever forwards ciphertext (see [`e2e`]); v9 added file transfer — the
+/// [`ControlRequest::Browse`] directory-listing RPC and the
+/// [`StreamOpen::Download`] / [`StreamOpen::Upload`] streams (see [`transfer`]).
+pub const PROTOCOL_VERSION: u32 = 9;
 
 /// Default UDP port the controller listens on for incoming agents.
 pub const DEFAULT_PORT: u16 = 47600;
@@ -173,6 +176,17 @@ pub enum StreamOpen {
 	/// A raw TCP tunnel: the agent connects to `127.0.0.1:port` and pipes bytes
 	/// both ways (used to reach the client's RDP/SSH server through the relay).
 	Tunnel { port: u16 },
+	/// Download a file or directory tree **from** the agent to the controller. The
+	/// controller sends a [`transfer::DownloadRequest`]; the agent replies with a
+	/// [`transfer::TransferManifest`] + streamed entries, then streams each file's
+	/// bytes. The controller is the receiver and commits to `.part` files. See
+	/// [`transfer`] for the full exchange.
+	Download,
+	/// Upload a file or directory tree **to** the agent from the controller. The
+	/// controller sends a [`transfer::UploadRequest`] + manifest, then streams each
+	/// file's bytes; the agent is the receiver and commits to `.part` files. See
+	/// [`transfer`].
+	Upload,
 }
 
 // ---------------------------------------------------------------- control RPC
@@ -213,6 +227,13 @@ pub enum ControlRequest {
 	ProbePort {
 		port: u16,
 	},
+	/// List a directory on the agent host, for the file-transfer browser. `path ==
+	/// None` seeds the browser: the reply's `roots` holds the filesystem roots (the
+	/// home dir plus drive letters on Windows / `/` on unix) and `entries` lists the
+	/// home directory. A `Some(path)` lists that directory's contents.
+	Browse {
+		path: Option<String>,
+	},
 }
 
 /// The matching response, written back on the same stream.
@@ -227,7 +248,49 @@ pub enum ControlResponse {
 	Ssh(SshInfo),
 	Logs(LogsResult),
 	PortReachable(PortProbe),
-	Error { message: String },
+	/// A directory listing, in reply to [`ControlRequest::Browse`].
+	Dir(DirListing),
+	Error {
+		message: String,
+	},
+}
+
+/// What a [`DirEntry`] is. Symlinks are reported as `Symlink` (not silently
+/// followed) so the browser can show them and avoid walking into loops.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EntryKind {
+	File,
+	Dir,
+	Symlink,
+	Other,
+}
+
+/// One entry in a [`DirListing`] — a file, directory or symlink in the browsed
+/// directory. Used verbatim for both remote (over the wire) and local (controller
+/// host) browsing, so the two file-transfer panes share one shape.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DirEntry {
+	pub name: String,
+	pub kind: EntryKind,
+	/// Size in bytes (0 for directories / entries whose size is unavailable).
+	pub size: u64,
+	/// Modification time in Unix seconds, when the platform reports it.
+	pub mtime: Option<u64>,
+}
+
+/// The result of browsing a directory: where we are, how to go up, the roots to
+/// seed the browser (only on a seed request), and the entries.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DirListing {
+	/// The absolute, resolved path that was listed (the home dir on a seed request).
+	pub path: String,
+	/// The parent directory, for an "up" button; `None` at a filesystem root.
+	pub parent: Option<String>,
+	/// Filesystem roots to seed the browser (home dir first, then drives on Windows /
+	/// `/` on unix). Populated only on a seed (`path == None`) request; empty otherwise.
+	pub roots: Vec<String>,
+	pub entries: Vec<DirEntry>,
 }
 
 /// How to reach the agent's built-in SSH server (see [`ControlRequest::EnableSsh`]).

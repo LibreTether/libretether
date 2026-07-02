@@ -41,6 +41,7 @@
 
 use anyhow::{anyhow, bail, Context, Result};
 use std::sync::Once;
+use std::time::Instant;
 
 use windows::core::{Interface, GUID};
 use windows::Win32::Media::MediaFoundation::*;
@@ -77,12 +78,14 @@ pub struct MediaFoundationEncoder {
 	/// can configure from in-band parameter sets. MF signals these out-of-band in
 	/// `MF_MT_MPEG_SEQUENCE_HEADER`; we re-inject them on every IDR.
 	sequence_header: Vec<u8>,
-	nv12: Vec<u8>,
 	width: usize,
 	height: usize,
 	/// Monotonic sample time in 100-ns units (MF wants timestamps; only monotonicity matters).
 	frame_index: i64,
 	frame_dur_hns: i64,
+	/// Sub-phase timing (µs) of the last `encode`: (convert, submit, drain). Reported
+	/// to the stats line via [`ScreenEncoder::last_phases`].
+	last_phases: (u64, u64, u64),
 }
 
 impl MediaFoundationEncoder {
@@ -133,25 +136,29 @@ impl MediaFoundationEncoder {
 				events,
 				codec_api,
 				sequence_header,
-				nv12: vec![0u8; width * height + 2 * (width / 2) * (height / 2)],
 				width,
 				height,
 				frame_index: 0,
 				frame_dur_hns: 10_000_000 / fps as i64,
+				last_phases: (0, 0, 0),
 			})
 		}
 	}
 
-	/// Wrap the current NV12 scratch in an `IMFSample` at the next timestamp.
-	unsafe fn make_input_sample(&self) -> Result<IMFSample> {
-		let len = self.nv12.len() as u32;
+	/// Build an input `IMFSample` for `rgba`, converting RGBA→NV12 **directly into the
+	/// MF buffer's memory** — no intermediate scratch, no second copy. A fresh buffer
+	/// per frame keeps the async MFT safe: it may hold the input until the GPU has
+	/// consumed it, so we must not overwrite a buffer still in flight.
+	unsafe fn make_input_sample(&self, rgba: &[u8], w: usize, h: usize) -> Result<IMFSample> {
+		let len = w * h + 2 * (w / 2) * (h / 2);
 		let sample = MFCreateSample()?;
-		let buffer = MFCreateMemoryBuffer(len)?;
+		let buffer = MFCreateMemoryBuffer(len as u32)?;
 		let mut ptr = std::ptr::null_mut::<u8>();
 		buffer.Lock(&mut ptr, None, None)?;
-		std::ptr::copy_nonoverlapping(self.nv12.as_ptr(), ptr, self.nv12.len());
+		// Convert straight into the locked buffer instead of a scratch + memcpy.
+		rgba_to_nv12(rgba, w, h, std::slice::from_raw_parts_mut(ptr, len));
 		buffer.Unlock()?;
-		buffer.SetCurrentLength(len)?;
+		buffer.SetCurrentLength(len as u32)?;
 		sample.AddBuffer(&buffer)?;
 		sample.SetSampleTime(self.frame_index * self.frame_dur_hns)?;
 		sample.SetSampleDuration(self.frame_dur_hns)?;
@@ -286,12 +293,14 @@ impl ScreenEncoder for MediaFoundationEncoder {
 					.codec_api
 					.SetValue(&CODECAPI_AVEncVideoForceKeyFrame, &VARIANT::from(1u32));
 			}
-			rgba_to_nv12(rgba, w, h, &mut self.nv12);
-			let sample = self.make_input_sample()?;
+			// Convert (RGBA→NV12 into the MF buffer).
+			let t = Instant::now();
+			let sample = self.make_input_sample(rgba, w, h)?;
+			let convert_us = t.elapsed().as_micros() as u64;
 			self.frame_index += 1;
 
-			// Feed one input, then collect whatever the encoder has ready. In
-			// low-latency mode this is typically this frame's output.
+			// Submit: feed one input to the codec.
+			let t = Instant::now();
 			match self.transform.ProcessInput(0, &sample, 0) {
 				Ok(()) => {}
 				Err(e) if e.code() == MF_E_NOTACCEPTING => {
@@ -299,9 +308,15 @@ impl ScreenEncoder for MediaFoundationEncoder {
 				}
 				Err(e) => bail!("ProcessInput failed: {e}"),
 			}
+			let submit_us = t.elapsed().as_micros() as u64;
 
+			// Drain: collect whatever the encoder has ready (async — often this frame's
+			// output arrives on a later call).
+			let t = Instant::now();
 			let mut outputs = Vec::new();
 			self.drain_outputs(&mut outputs)?;
+			let drain_us = t.elapsed().as_micros() as u64;
+			self.last_phases = (convert_us, submit_us, drain_us);
 
 			// Collapse to a single access unit for this call. If the encoder emitted
 			// more than one, concatenate in order (still a valid Annex-B stream); if
@@ -323,6 +338,10 @@ impl ScreenEncoder for MediaFoundationEncoder {
 
 	fn kind(&self) -> &'static str {
 		"Media Foundation (hardware)"
+	}
+
+	fn last_phases(&self) -> (u64, u64, u64) {
+		self.last_phases
 	}
 }
 

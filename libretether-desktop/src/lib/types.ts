@@ -191,3 +191,63 @@ export type InputEvent =
 	| { t: "mouse_scroll"; dx: number; dy: number }
 	| { t: "key"; code: string; pressed: boolean }
 	| { t: "text"; text: string }
+
+// ---------------------------------------------------------------- file transfer
+
+/** Mirrors the Rust `EntryKind` (serde snake_case). */
+export type EntryKind = "file" | "dir" | "symlink" | "other"
+
+/** One entry in a directory listing. Mirrors the Rust `DirEntry`. */
+export interface DirEntry {
+	name: string
+	kind: EntryKind
+	/** Size in bytes (0 for directories). */
+	size: number
+	/** Modification time in Unix seconds, when available. */
+	mtime: number | null
+}
+
+/** A browsed directory. Mirrors the Rust `DirListing`. `roots` is populated only on a
+ *  seed request (path === null) — the home dir + drives/`/` to jump to. */
+export interface DirListing {
+	path: string
+	parent: string | null
+	roots: string[]
+	entries: DirEntry[]
+}
+
+/** Direction of a transfer relative to the agent. Mirrors the Rust `Direction`. */
+export type TransferDirection = "download" | "upload"
+
+/** Lifecycle of a queued transfer. Mirrors the Rust `TransferStatus`. */
+export type TransferStatus = "queued" | "active" | "paused" | "done" | "error"
+
+/** A queued/running/finished transfer. Mirrors the Rust `TransferItem`. `remote_path`
+ *  is the source (download) or destination dir (upload) on the agent; `local_path` is
+ *  the destination dir (download) or source (upload) on this host. */
+export interface TransferItem {
+	id: string
+	client_id: string
+	direction: TransferDirection
+	remote_path: string
+	local_path: string
+	is_dir: boolean
+	name: string
+	total_files: number
+	total_bytes: number
+	files_done: number
+	bytes_done: number
+	status: TransferStatus
+	error: string | null
+	created_at: number
+	updated_at: number
+}
+
+/** Payload of the global `transfer:progress` event. */
+export interface TransferProgress {
+	id: string
+	files_done: number
+	bytes_done: number
+	total_files: number
+	total_bytes: number
+}

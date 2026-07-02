@@ -230,4 +230,7 @@ WebCodecs (and swapped JPEG quality for a target bitrate); v7 added the live cap
 backend names to the session metadata; v8 made the link **end-to-end encrypted** — the handshake
 now carries ephemeral X25519 keys and the mutual-auth signatures cover a transcript over both
 ephemeral keys and both nonces, so every post-handshake stream is AEAD-sealed and a relay only
-forwards ciphertext.
+forwards ciphertext; v9 added **file transfer** — a `ControlRequest::Browse` directory-listing RPC
+and resumable `StreamOpen::Download` / `StreamOpen::Upload` streams (a per-file manifest + chunked
+bytes, with the receiver owning durability via `.part` files so a transfer resumes after a network
+blip or restart).

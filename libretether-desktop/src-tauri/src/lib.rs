@@ -11,6 +11,8 @@ mod session;
 mod ssh;
 mod state;
 mod tailscale;
+mod transfer;
+mod transfer_queue;
 mod tunnel;
 mod window;
 
@@ -82,6 +84,13 @@ pub fn run() {
 			commands::save_text_file,
 			commands::get_controller_logs,
 			commands::client_logs,
+			commands::browse_remote,
+			commands::browse_local,
+			commands::list_transfers,
+			commands::enqueue_transfer,
+			commands::pause_transfer,
+			commands::resume_transfer,
+			commands::remove_transfer,
 		])
 		.run(tauri::generate_context!())
 		.expect("error while running LibreTether");

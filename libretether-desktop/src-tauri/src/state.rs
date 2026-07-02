@@ -21,6 +21,7 @@ use uuid::Uuid;
 use crate::error::{AppError, AppResult};
 use crate::link::AgentLink;
 use crate::registry::{now_secs, ClientStore};
+use crate::transfer_queue::TransferQueue;
 
 /// Event emitted whenever the client list or a client's connection state changes.
 pub const EVENT_CHANGED: &str = "clients:changed";
@@ -177,6 +178,15 @@ pub struct SessionHandle {
 	pub token: u64,
 }
 
+/// A running file-transfer driver. Aborting `task` drops its QUIC stream (the agent
+/// treats that as a clean interruption; the receiver's `.part` file survives for a
+/// later resume). `client_id` lets us enforce one active transfer per machine.
+pub struct TransferHandle {
+	pub client_id: Uuid,
+	pub task: tauri::async_runtime::JoinHandle<()>,
+	pub token: u64,
+}
+
 /// A loopback tunnel forwarding to a client's RDP/SSH port through the relay.
 /// Kept so it can be reused (instead of leaking a new listener per connect) and
 /// torn down when the client is removed or the controller exits.
@@ -195,6 +205,10 @@ pub struct ActiveController {
 	pub store: Mutex<ClientStore>,
 	pub live: Mutex<HashMap<Uuid, LiveConn>>,
 	pub sessions: Mutex<HashMap<Uuid, SessionHandle>>,
+	/// The persisted file-transfer queue for this controller.
+	pub transfers: Mutex<TransferQueue>,
+	/// Currently-running transfer drivers, keyed by transfer id.
+	pub transfers_live: Mutex<HashMap<Uuid, TransferHandle>>,
 	/// Active loopback tunnels keyed by `(client, remote_port)`.
 	pub tunnels: Mutex<HashMap<(Uuid, u16), TunnelHandle>>,
 	/// The live relay connection in relay mode, so commands can open a stream to the
@@ -214,13 +228,16 @@ pub struct ActiveController {
 }
 
 impl ActiveController {
-	/// Construct an active controller with empty live state.
-	pub fn new(profile: ControllerProfile, store: ClientStore) -> Self {
+	/// Construct an active controller with empty live state and the given (already
+	/// loaded) transfer queue.
+	pub fn new(profile: ControllerProfile, store: ClientStore, transfers: TransferQueue) -> Self {
 		Self {
 			profile,
 			store: Mutex::new(store),
 			live: Mutex::new(HashMap::new()),
 			sessions: Mutex::new(HashMap::new()),
+			transfers: Mutex::new(transfers),
+			transfers_live: Mutex::new(HashMap::new()),
 			tunnels: Mutex::new(HashMap::new()),
 			relay_conn: Mutex::new(None),
 			relay_log_seq: AtomicU64::new(u64::MAX),
@@ -279,11 +296,35 @@ impl ActiveController {
 		}
 		result
 	}
+
+	/// Mutate the transfer queue, then persist it to disk after releasing the lock (same
+	/// pattern as [`Self::mutate_store`]). A write failure is logged, not returned — a
+	/// dropped persist only costs a stale on-disk hint, never correctness (the resume
+	/// offset is re-derived from the receiver's `.part` file regardless).
+	pub fn mutate_transfers<R>(&self, f: impl FnOnce(&mut TransferQueue) -> R) -> R {
+		let _persist = self.persist_lock.lock().unwrap();
+		let (result, snapshot) = {
+			let mut q = self.transfers.lock().unwrap();
+			let r = f(&mut q);
+			(r, q.snapshot())
+		};
+		match snapshot {
+			Ok((path, raw)) => {
+				if let Err(e) = libretether_protocol::secret::write_str(path, &raw) {
+					crate::logbook::warn("transfer", &format!("failed to persist transfer queue: {e}"));
+				}
+			}
+			Err(e) => crate::logbook::warn("transfer", &format!("failed to serialize transfer queue: {e}")),
+		}
+		result
+	}
 }
 
 struct ActiveHandle {
 	controller: Arc<ActiveController>,
 	serve_task: tauri::async_runtime::JoinHandle<()>,
+	/// Background poller that resumes queued transfers to online machines.
+	pump_task: tauri::async_runtime::JoinHandle<()>,
 }
 
 pub struct Inner {
@@ -437,7 +478,11 @@ impl AppState {
 		self.deactivate();
 		let profile = self.load_profile(id)?;
 		let store = ClientStore::load(self.profile_dir(id).join("clients.json"))?;
-		let controller = Arc::new(ActiveController::new(profile, store));
+		let mut transfers = TransferQueue::load(self.profile_dir(id).join("transfers.json"))?;
+		// Any transfer that was mid-flight when we last exited is demoted to Queued so it
+		// restarts (and re-derives its resume offset) rather than being left "Active".
+		transfers.requeue_active();
+		let controller = Arc::new(ActiveController::new(profile, store, transfers));
 
 		let mode = if controller.profile.kind.relay().is_some() {
 			"relay"
@@ -458,10 +503,15 @@ impl AppState {
 				crate::server::serve(state, ctrl).await;
 			}
 		});
+		// Backstop poller: resumes queued transfers to any machine that's already online
+		// (a reconnect kicks them immediately via `transfer::resume_for`; this catches
+		// transient failures and transfers enqueued while a machine was already up).
+		let pump_task = tauri::async_runtime::spawn(crate::transfer::pump(self.clone(), controller.clone()));
 
 		*self.0.active.lock().unwrap() = Some(ActiveHandle {
 			controller: controller.clone(),
 			serve_task,
+			pump_task,
 		});
 		{
 			let mut settings = self.0.settings.lock().unwrap();
@@ -482,8 +532,12 @@ impl AppState {
 				&format!("deactivating controller '{}'", handle.controller.profile.name),
 			);
 			handle.serve_task.abort();
+			handle.pump_task.abort();
 			for (_, session) in handle.controller.sessions.lock().unwrap().drain() {
 				session.task.abort();
+			}
+			for (_, transfer) in handle.controller.transfers_live.lock().unwrap().drain() {
+				transfer.task.abort();
 			}
 			for (_, tunnel) in handle.controller.tunnels.lock().unwrap().drain() {
 				tunnel.task.abort();

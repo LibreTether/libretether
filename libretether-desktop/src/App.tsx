@@ -1,5 +1,7 @@
 import {
+	ArrowLeftRight,
 	Eye,
+	FolderSync,
 	MonitorSmartphone,
 	MonitorUp,
 	Plug,
@@ -19,6 +21,8 @@ import { DeployScript } from "./components/DeployScript"
 import { DetailDrawer } from "./components/DetailDrawer"
 import { ShortcutsOverlay } from "./components/ShortcutsOverlay"
 import { type Page, Sidebar } from "./components/Sidebar"
+import { TransferDialog } from "./components/TransferDialog"
+import { TransfersPanel } from "./components/TransfersPanel"
 import { Button, Drawer, Spinner } from "./components/ui"
 import * as api from "./lib/api"
 import { useHotkeys } from "./lib/hotkeys"
@@ -40,6 +44,8 @@ function Shell({ active, onExit }: { active: ActiveInfo; onExit: () => void }) {
 	// stream but forwards no input (see ControlOverlay's `readOnly`).
 	const [controlSession, setControlSession] = useState<{ id: string; watch: boolean } | null>(null)
 	const [detailId, setDetailId] = useState<string | null>(null)
+	const [transferId, setTransferId] = useState<string | null>(null)
+	const [transfersOpen, setTransfersOpen] = useState(false)
 	const [addOpen, setAddOpen] = useState(false)
 	const [deploy, setDeploy] = useState<DeployState | null>(null)
 	const [paletteOpen, setPaletteOpen] = useState(false)
@@ -66,10 +72,12 @@ function Shell({ active, onExit }: { active: ActiveInfo; onExit: () => void }) {
 	// themselves if a machine is removed underneath them).
 	const control = controlSession ? (clients.find((c) => c.id === controlSession.id) ?? null) : null
 	const detail = detailId ? (clients.find((c) => c.id === detailId) ?? null) : null
+	const transfer = transferId ? (clients.find((c) => c.id === transferId) ?? null) : null
 	useEffect(() => {
 		if (controlSession && !clients.some((c) => c.id === controlSession.id)) setControlSession(null)
 		if (detailId && !clients.some((c) => c.id === detailId)) setDetailId(null)
-	}, [clients, controlSession, detailId])
+		if (transferId && !clients.some((c) => c.id === transferId)) setTransferId(null)
+	}, [clients, controlSession, detailId, transferId])
 
 	const exit = async () => {
 		try {
@@ -81,7 +89,7 @@ function Shell({ active, onExit }: { active: ActiveInfo; onExit: () => void }) {
 	}
 
 	const controlling = !!control
-	const overlayOpen = paletteOpen || shortcutsOpen || addOpen || !!detail || !!deploy
+	const overlayOpen = paletteOpen || shortcutsOpen || addOpen || !!detail || !!transfer || transfersOpen || !!deploy
 
 	// Command palette + help are reachable any time the live-control surface isn't
 	// capturing the keyboard.
@@ -146,6 +154,14 @@ function Shell({ active, onExit }: { active: ActiveInfo; onExit: () => void }) {
 					setPage("machines")
 					setAddOpen(true)
 				}
+			},
+			{
+				group: "Quick actions",
+				icon: <ArrowLeftRight className="h-4 w-4" />,
+				id: "act-transfers",
+				keywords: "transfers files downloads uploads queue progress",
+				label: "Show transfers",
+				run: () => setTransfersOpen(true)
 			}
 		]
 		for (const c of clients) {
@@ -186,6 +202,15 @@ function Shell({ active, onExit }: { active: ActiveInfo; onExit: () => void }) {
 					keywords: `rdp remote desktop ${kw}`,
 					label: "Connect via RDP",
 					run: () => actions.rdp(c)
+				},
+				{
+					disabled: !c.online,
+					group: c.name,
+					icon: <FolderSync className="h-4 w-4" />,
+					id: `xfer:${c.id}`,
+					keywords: `transfer files upload download copy send receive ${kw}`,
+					label: "Transfer files…",
+					run: () => setTransferId(c.id)
 				},
 				{
 					group: c.name,
@@ -229,6 +254,7 @@ function Shell({ active, onExit }: { active: ActiveInfo; onExit: () => void }) {
 						onAdd={() => setAddOpen(true)}
 						onControl={(c) => setControlSession({ id: c.id, watch: false })}
 						onDetail={(c) => setDetailId(c.id)}
+						onFiles={(c) => setTransferId(c.id)}
 						onWatch={(c) => setControlSession({ id: c.id, watch: true })}
 					/>
 				)}
@@ -266,6 +292,15 @@ function Shell({ active, onExit }: { active: ActiveInfo; onExit: () => void }) {
 					readOnly={controlSession?.watch}
 				/>
 			)}
+			{transfer && (
+				<TransferDialog
+					client={transfer}
+					key={transfer.id}
+					onClose={() => setTransferId(null)}
+					onQueued={() => setTransfersOpen(true)}
+				/>
+			)}
+			<TransfersPanel clients={clients} onClose={() => setTransfersOpen(false)} open={transfersOpen} />
 		</div>
 	)
 }

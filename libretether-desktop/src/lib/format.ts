@@ -59,6 +59,19 @@ export function tokenizeCommand(input: string): string[] {
 	return tokens
 }
 
+/** Human-readable byte size, e.g. "0 B", "4.0 KB", "1.2 GB" (base-1024, SI-ish label). */
+export function formatBytes(bytes: number): string {
+	if (bytes < 1024) return `${bytes} B`
+	const units = ["KB", "MB", "GB", "TB", "PB"]
+	let value = bytes / 1024
+	let i = 0
+	while (value >= 1024 && i < units.length - 1) {
+		value /= 1024
+		i++
+	}
+	return `${value.toFixed(value < 10 ? 1 : 0)} ${units[i]}`
+}
+
 /** A filesystem-safe slug for a client name. */
 export function slug(name: string): string {
 	return (

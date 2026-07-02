@@ -224,6 +224,8 @@ pub fn run(
 		let enc_started = Instant::now();
 		let result = encoder.encode(scaled.as_raw(), cw as usize, ch as usize, force_key);
 		let encode_us = enc_started.elapsed().as_micros() as u64;
+		// Sub-phase breakdown of that encode (convert/codec/drain), for the stats line.
+		let phases = encoder.last_phases();
 		last_hash = Some(hash);
 		last_dims = (cw, ch);
 
@@ -278,7 +280,7 @@ pub fn run(
 			}
 		}
 
-		stats.record(&raw, downscale_us, hash_us, encode_us, send_us, bytes, is_key);
+		stats.record(&raw, downscale_us, hash_us, encode_us, phases, send_us, bytes, is_key);
 		stats.maybe_log(eff_scale, bitrate);
 	}
 }
@@ -298,6 +300,15 @@ pub(crate) trait ScreenEncoder {
 	/// Human-readable backend name, logged once per session so an operator can see
 	/// which encoder is actually running (software vs hardware).
 	fn kind(&self) -> &'static str;
+
+	/// Sub-phase timing of the most recent [`Self::encode`] call, in microseconds:
+	/// `(convert, core, drain)` — colour conversion, the codec call (Media Foundation
+	/// `ProcessInput`), and output collection (`ProcessOutput`/drain). Lets the stats
+	/// line show *where* the encode budget goes. Backends that don't split it (software
+	/// OpenH264) return zeros — their whole cost shows as `enc`.
+	fn last_phases(&self) -> (u64, u64, u64) {
+		(0, 0, 0)
+	}
 }
 
 /// Env var selecting the encoder backend at runtime (no rebuild): `software`,
@@ -543,38 +554,29 @@ fn clamp8(v: i32) -> u8 {
 #[allow(dead_code)]
 pub(crate) fn rgba_to_nv12(rgba: &[u8], w: usize, h: usize, dst: &mut [u8]) {
 	let (y_plane, uv_plane) = dst.split_at_mut(w * h);
-	for row in 0..h {
-		let base = row * w * 4;
-		let yrow = &mut y_plane[row * w..row * w + w];
-		for (x, y) in yrow.iter_mut().enumerate() {
-			let p = base + x * 4;
-			let (r, g, b) = (rgba[p] as i32, rgba[p + 1] as i32, rgba[p + 2] as i32);
+	// Y plane: iterate row/pixel slices with `chunks_exact` so the bounds checks are
+	// elided and the inner loop autovectorizes — this pass is ~w·h iterations and was
+	// the dominant CPU cost of the encode path. Same BT.601 integer math as before.
+	for (row_rgba, row_y) in rgba.chunks_exact(w * 4).zip(y_plane.chunks_exact_mut(w)) {
+		for (px, y) in row_rgba.chunks_exact(4).zip(row_y.iter_mut()) {
+			let (r, g, b) = (px[0] as i32, px[1] as i32, px[2] as i32);
 			*y = clamp8(((66 * r + 129 * g + 25 * b + 128) >> 8) + 16);
 		}
 	}
+	// Chroma (NV12 interleaved U,V): one 2×2 box-average per output pair. Each chroma
+	// row is `w` bytes (w/2 U + w/2 V). Slice the two source rows once so the block
+	// reads stay within fixed-length subslices.
 	let cw = w / 2;
-	for cy in 0..h / 2 {
+	for (cy, uv_row) in uv_plane.chunks_exact_mut(w).enumerate() {
+		let row0 = &rgba[(cy * 2) * w * 4..(cy * 2 + 1) * w * 4];
+		let row1 = &rgba[(cy * 2 + 1) * w * 4..(cy * 2 + 2) * w * 4];
 		for cx in 0..cw {
-			let (x0, y0) = (cx * 2, cy * 2);
-			let (mut r, mut g, mut b) = (0i32, 0i32, 0i32);
-			for dy in 0..2 {
-				let rb = (y0 + dy) * w * 4;
-				for dx in 0..2 {
-					let p = rb + (x0 + dx) * 4;
-					r += rgba[p] as i32;
-					g += rgba[p + 1] as i32;
-					b += rgba[p + 2] as i32;
-				}
-			}
-			r >>= 2;
-			g >>= 2;
-			b >>= 2;
-			let u = clamp8(((-38 * r - 74 * g + 112 * b + 128) >> 8) + 128);
-			let v = clamp8(((112 * r - 94 * g - 18 * b + 128) >> 8) + 128);
-			// Interleaved: each chroma row is 2·cw bytes (U,V,U,V,…), so `w` per row.
-			let idx = cy * w + cx * 2;
-			uv_plane[idx] = u;
-			uv_plane[idx + 1] = v;
+			let o = cx * 8; // 2 px × 4 bytes
+			let r = (row0[o] as i32 + row0[o + 4] as i32 + row1[o] as i32 + row1[o + 4] as i32) >> 2;
+			let g = (row0[o + 1] as i32 + row0[o + 5] as i32 + row1[o + 1] as i32 + row1[o + 5] as i32) >> 2;
+			let b = (row0[o + 2] as i32 + row0[o + 6] as i32 + row1[o + 2] as i32 + row1[o + 6] as i32) >> 2;
+			uv_row[cx * 2] = clamp8(((-38 * r - 74 * g + 112 * b + 128) >> 8) + 128);
+			uv_row[cx * 2 + 1] = clamp8(((112 * r - 94 * g - 18 * b + 128) >> 8) + 128);
 		}
 	}
 }
@@ -631,6 +633,11 @@ struct Stats {
 	downscale_us: u64,
 	hash_us: u64,
 	encode_us: u64,
+	/// Breakdown of `encode_us`: colour conversion, the codec call, output drain.
+	/// Populated by the hardware (Media Foundation) backend; zero for software.
+	convert_us: u64,
+	submit_us: u64,
+	drain_us: u64,
 	send_us: u64,
 	bytes: u64,
 }
@@ -646,6 +653,9 @@ impl Stats {
 			downscale_us: 0,
 			hash_us: 0,
 			encode_us: 0,
+			convert_us: 0,
+			submit_us: 0,
+			drain_us: 0,
 			send_us: 0,
 			bytes: 0,
 		}
@@ -658,6 +668,7 @@ impl Stats {
 		downscale_us: u64,
 		hash_us: u64,
 		encode_us: u64,
+		phases: (u64, u64, u64),
 		send_us: u64,
 		bytes: u64,
 		key: bool,
@@ -671,6 +682,10 @@ impl Stats {
 		self.downscale_us += downscale_us;
 		self.hash_us += hash_us;
 		self.encode_us += encode_us;
+		let (convert_us, submit_us, drain_us) = phases;
+		self.convert_us += convert_us;
+		self.submit_us += submit_us;
+		self.drain_us += drain_us;
 		self.send_us += send_us;
 		self.bytes += bytes;
 	}
@@ -696,13 +711,16 @@ impl Stats {
 		// Per-second telemetry: useful for tuning but too chatty for the default Info
 		// view, so it's logged at Debug (the Logs page filters it out by default).
 		crate::net::debug(&format!(
-			"stream {fps:.0} fps ({}/s sent, {} key) | cap {:.1} down {:.1} hash {:.1} enc {:.1} net {:.1} ms/f | {kib_per_sent:.0} KiB/sent | scale {scale}% {bitrate}kbps",
+			"stream {fps:.0} fps ({}/s sent, {} key) | cap {:.1} down {:.1} hash {:.1} enc {:.1} (conv {:.1} sub {:.1} drn {:.1}) net {:.1} ms/f | {kib_per_sent:.0} KiB/sent | scale {scale}% {bitrate}kbps",
 			self.sent,
 			self.keyframes,
 			ms(self.capture_us),
 			ms(self.downscale_us),
 			ms(self.hash_us),
 			ms(self.encode_us),
+			ms(self.convert_us),
+			ms(self.submit_us),
+			ms(self.drain_us),
 			ms(self.send_us),
 		));
 		*self = Stats::new();

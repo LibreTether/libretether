@@ -474,6 +474,8 @@ fn stream_label(open: &StreamOpen) -> String {
 		StreamOpen::Control => "control".into(),
 		StreamOpen::Session => "session".into(),
 		StreamOpen::Tunnel { port } => format!("tunnel→127.0.0.1:{port}"),
+		StreamOpen::Download => "download".into(),
+		StreamOpen::Upload => "upload".into(),
 	}
 }
 
@@ -634,6 +636,16 @@ async fn handle_stream(
 			debug("session stream closed");
 		}
 		StreamOpen::Tunnel { port } => tunnel(port, send, recv).await,
+		StreamOpen::Download => {
+			debug("download stream opened");
+			crate::transfer::serve_download(send, recv).await;
+			debug("download stream closed");
+		}
+		StreamOpen::Upload => {
+			debug("upload stream opened");
+			crate::transfer::serve_upload(send, recv).await;
+			debug("upload stream closed");
+		}
 		// Handled above (plaintext); unreachable here.
 		StreamOpen::Handshake => {}
 	}

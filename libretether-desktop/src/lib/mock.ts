@@ -11,13 +11,15 @@ import type {
 	ClientDto,
 	ControllerSummary,
 	CreateClientResult,
+	DirListing,
 	ExecResult,
 	LogEntry,
 	PairingStarted,
 	ScreenshotResult,
 	Settings,
 	TenantCredentials,
-	TenantInfo
+	TenantInfo,
+	TransferItem
 } from "./types"
 
 const NOW = Math.floor(Date.now() / 1000)
@@ -200,6 +202,43 @@ function deployScript(name: string): string {
 
 const delay = <T>(value: T): Promise<T> => new Promise((r) => setTimeout(() => r(value), 130))
 
+// A tiny fake filesystem for the transfer browser preview.
+function mockDir(path: string | null): DirListing {
+	const base = path ?? "/home/user"
+	return {
+		entries: [
+			{ kind: "dir", mtime: NOW - 3600, name: "Documents", size: 0 },
+			{ kind: "dir", mtime: NOW - 7200, name: "Downloads", size: 0 },
+			{ kind: "file", mtime: NOW - 120, name: "notes.txt", size: 2048 },
+			{ kind: "file", mtime: NOW - 86400, name: "archive.tar.gz", size: 48 * 1024 * 1024 },
+			{ kind: "symlink", mtime: NOW - 500, name: "latest", size: 12 }
+		],
+		parent: base === "/" ? null : "/",
+		path: base,
+		roots: path === null ? ["/home/user", "/"] : []
+	}
+}
+
+const TRANSFERS: TransferItem[] = [
+	{
+		bytes_done: 48 * 1024 * 1024,
+		client_id: "m2",
+		created_at: NOW - 30,
+		direction: "download",
+		error: null,
+		files_done: 3,
+		id: "t1",
+		is_dir: true,
+		local_path: "/home/user/Downloads",
+		name: "build-artifacts",
+		remote_path: "/var/out/build-artifacts",
+		status: "active",
+		total_bytes: 120 * 1024 * 1024,
+		total_files: 8,
+		updated_at: NOW
+	}
+]
+
 export function mockInvoke(cmd: string, args?: Record<string, unknown>): Promise<unknown> {
 	const id = args?.id as string | undefined
 	const find = (cid?: string) => CLIENTS.find((c) => c.id === cid)
@@ -318,6 +357,29 @@ export function mockInvoke(cmd: string, args?: Record<string, unknown>): Promise
 			settings.rdp_client = (args?.rdpClient as string | null) ?? null
 			settings.terminal = (args?.terminal as string | null) ?? null
 			return delay(undefined)
+		case "browse_remote":
+		case "browse_local":
+			return delay(mockDir((args?.path as string | null) ?? null))
+		case "list_transfers":
+			return delay(TRANSFERS)
+		case "enqueue_transfer":
+			return delay({
+				bytes_done: 0,
+				client_id: (args?.clientId as string) ?? "m1",
+				created_at: NOW,
+				direction: (args?.direction as TransferItem["direction"]) ?? "download",
+				error: null,
+				files_done: 0,
+				id: `t-${NOW}`,
+				is_dir: (args?.isDir as boolean) ?? false,
+				local_path: (args?.localPath as string) ?? "/",
+				name: "queued-item",
+				remote_path: (args?.remotePath as string) ?? "/",
+				status: "queued",
+				total_bytes: 0,
+				total_files: 0,
+				updated_at: NOW
+			} satisfies TransferItem)
 		default:
 			// remove_client, rename_client, start/stop control, connect_rdp/ssh,
 			// send_input, save_text_file, exit_controller, delete_controller …

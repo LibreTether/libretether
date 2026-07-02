@@ -1,6 +1,7 @@
 import {
 	Camera,
 	Eye,
+	FolderSync,
 	Info,
 	MonitorSmartphone,
 	MonitorUp,
@@ -42,6 +43,7 @@ export function MachinesPage({
 	onControl,
 	onWatch,
 	onDetail,
+	onFiles,
 	onAdd,
 	actions,
 	hotkeysEnabled
@@ -52,6 +54,7 @@ export function MachinesPage({
 	onControl: (c: ClientDto) => void
 	onWatch: (c: ClientDto) => void
 	onDetail: (c: ClientDto) => void
+	onFiles: (c: ClientDto) => void
 	onAdd: () => void
 	actions: Actions
 	hotkeysEnabled: boolean
@@ -112,6 +115,7 @@ export function MachinesPage({
 			{ combo: "w", handler: () => selected?.online && onWatch(selected) },
 			{ combo: "s", handler: () => selected?.online && actions.ssh(selected) },
 			{ combo: "r", handler: () => selected?.online && actions.rdp(selected) },
+			{ combo: "f", handler: () => selected?.online && onFiles(selected) },
 			// Details (incl. the security/identity panel) are worth opening even offline.
 			{ combo: "d", handler: () => selected && onDetail(selected) }
 		],
@@ -199,6 +203,7 @@ export function MachinesPage({
 								kind={active.kind}
 								onControl={() => onControl(c)}
 								onDetail={() => onDetail(c)}
+								onFiles={() => onFiles(c)}
 								onSelect={() => setSelectedId(c.id)}
 								onWatch={() => onWatch(c)}
 								selected={c.id === selectedId}
@@ -220,6 +225,7 @@ function MachineRow({
 	onControl,
 	onWatch,
 	onDetail,
+	onFiles,
 	actions
 }: {
 	client: ClientDto
@@ -230,6 +236,7 @@ function MachineRow({
 	onControl: () => void
 	onWatch: () => void
 	onDetail: () => void
+	onFiles: () => void
 	actions: Actions
 }) {
 	const { status } = client
@@ -349,6 +356,16 @@ function MachineRow({
 						variant="outline"
 					>
 						RDP
+					</Button>
+					<Button
+						disabled={offline}
+						icon={<FolderSync className="h-4 w-4" />}
+						onClick={onFiles}
+						size="sm"
+						title="Transfer files (f)"
+						variant="outline"
+					>
+						Files
 					</Button>
 					<div
 						className={cn(

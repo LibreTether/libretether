@@ -157,6 +157,9 @@ An early but capable build. Working today:
   and live quality controls
 - ✅ **Wayland support** via XDG portals (X11 too)
 - ✅ **RDP** and **SSH** one-click connect (SSH needs nothing installed on the client)
+- ✅ **File transfer** — browse the guest's filesystem and download from or upload to it (files or
+  whole folders) over the same encrypted link, with a live progress queue that's cancellable and
+  resumes after a network drop or restart — no SSH/scp needed
 - ✅ **Relay mode** + phone-friendly browser pairing, with **end-to-end encryption** so the relay
   host only ever sees ciphertext, and **automatic peer-to-peer NAT hole-punching** that upgrades
   sessions to a direct path when the network allows

@@ -28,6 +28,7 @@ mod rdp;
 mod service;
 mod session;
 mod ssh_server;
+mod transfer;
 #[cfg(target_os = "linux")]
 mod wayland;
 #[cfg(target_os = "windows")]

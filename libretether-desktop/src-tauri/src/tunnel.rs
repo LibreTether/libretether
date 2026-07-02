@@ -182,7 +182,8 @@ mod tests {
 				listen_port: 0,
 			},
 		);
-		ActiveController::new(profile, ClientStore::load(path).unwrap())
+		let transfers = crate::transfer_queue::TransferQueue::load(path.with_extension("transfers")).unwrap();
+		ActiveController::new(profile, ClientStore::load(path).unwrap(), transfers)
 	}
 
 	fn handle(alive: bool) -> TunnelHandle {
