@@ -182,75 +182,75 @@ impl MediaFoundationEncoder {
 	/// Pull one encoded sample, converting to `(is_key, annexb)`. Handles the async
 	/// MFT's start-of-stream format change: a hardware encoder commonly answers the
 	/// first `ProcessOutput` with `MF_E_TRANSFORM_STREAM_CHANGE` to hand over the real
-	/// output type (and its SPS/PPS). We adopt the new type and retry rather than
-	/// surfacing it as a spurious "encode failed".
+	/// output type (and its SPS/PPS). We adopt the new type and hand control back to
+	/// the event loop rather than surfacing it as a spurious "encode failed".
+	///
+	/// Called only in response to a `METransformHaveOutput` event (see
+	/// [`Self::drain_outputs`]) — on an async MFT `ProcessOutput` is only valid then,
+	/// so this makes exactly one call per event and never retries synchronously.
 	unsafe fn process_output(&mut self) -> Result<Option<(bool, Vec<u8>)>> {
-		// Bound the retries so a misbehaving MFT that keeps renegotiating can't spin
-		// this frame forever.
-		for _ in 0..8 {
-			let stream_info = self.transform.GetOutputStreamInfo(0)?;
+		let stream_info = self.transform.GetOutputStreamInfo(0).context("GetOutputStreamInfo")?;
 
-			// Allocate the output sample unless the MFT provides its own.
-			let provides = stream_info.dwFlags
-				& (MFT_OUTPUT_STREAM_PROVIDES_SAMPLES.0 | MFT_OUTPUT_STREAM_CAN_PROVIDE_SAMPLES.0) as u32
-				!= 0;
-			let sample = if provides {
-				None
-			} else {
-				let s = MFCreateSample()?;
-				let b = MFCreateMemoryBuffer(stream_info.cbSize.max(1))?;
-				s.AddBuffer(&b)?;
-				Some(s)
-			};
+		// Allocate the output sample unless the MFT provides its own.
+		let provides = stream_info.dwFlags
+			& (MFT_OUTPUT_STREAM_PROVIDES_SAMPLES.0 | MFT_OUTPUT_STREAM_CAN_PROVIDE_SAMPLES.0) as u32
+			!= 0;
+		let sample = if provides {
+			None
+		} else {
+			let s = MFCreateSample()?;
+			let b = MFCreateMemoryBuffer(stream_info.cbSize.max(1))?;
+			s.AddBuffer(&b)?;
+			Some(s)
+		};
 
-			let mut buffers = [MFT_OUTPUT_DATA_BUFFER {
-				dwStreamID: 0,
-				pSample: std::mem::ManuallyDrop::new(sample.clone()),
-				dwStatus: 0,
-				pEvents: std::mem::ManuallyDrop::new(None),
-			}];
-			let mut status = 0u32;
-			let result = self.transform.ProcessOutput(0, &mut buffers, &mut status);
+		let mut buffers = [MFT_OUTPUT_DATA_BUFFER {
+			dwStreamID: 0,
+			pSample: std::mem::ManuallyDrop::new(sample.clone()),
+			dwStatus: 0,
+			pEvents: std::mem::ManuallyDrop::new(None),
+		}];
+		let mut status = 0u32;
+		let result = self.transform.ProcessOutput(0, &mut buffers, &mut status);
 
-			// Reclaim the buffer handles we lent, whatever the outcome, so no COM
-			// reference leaks on the need-more-input / stream-change / error paths.
-			let produced = std::mem::ManuallyDrop::into_inner(std::mem::replace(
-				&mut buffers[0].pSample,
-				std::mem::ManuallyDrop::new(None),
-			));
-			let _events = std::mem::ManuallyDrop::into_inner(std::mem::replace(
-				&mut buffers[0].pEvents,
-				std::mem::ManuallyDrop::new(None),
-			));
+		// Reclaim the buffer handles we lent, whatever the outcome, so no COM reference
+		// leaks on the need-more-input / stream-change / error paths.
+		let produced = std::mem::ManuallyDrop::into_inner(std::mem::replace(
+			&mut buffers[0].pSample,
+			std::mem::ManuallyDrop::new(None),
+		));
+		let _events = std::mem::ManuallyDrop::into_inner(std::mem::replace(
+			&mut buffers[0].pEvents,
+			std::mem::ManuallyDrop::new(None),
+		));
 
-			match result {
-				Ok(()) => {}
-				Err(e) if e.code() == MF_E_TRANSFORM_NEED_MORE_INPUT => return Ok(None),
-				// The encoder switched its output type (async hardware MFTs defer the
-				// real type — and its SPS/PPS — to a stream change at start): adopt it
-				// and try again.
-				Err(e) if e.code() == MF_E_TRANSFORM_STREAM_CHANGE => {
-					self.renegotiate_output()?;
-					continue;
-				}
-				Err(e) => return Err(e.into()),
+		match result {
+			Ok(()) => {}
+			Err(e) if e.code() == MF_E_TRANSFORM_NEED_MORE_INPUT => return Ok(None),
+			// The encoder switched its output type (async hardware MFTs defer the real
+			// type — and its SPS/PPS — to a stream change at start): adopt it, then
+			// return and wait for the next HaveOutput. Re-calling ProcessOutput inline
+			// here would return E_UNEXPECTED — an async MFT only accepts it per event.
+			Err(e) if e.code() == MF_E_TRANSFORM_STREAM_CHANGE => {
+				self.renegotiate_output()?;
+				return Ok(None);
 			}
-
-			let produced = produced.ok_or_else(|| anyhow!("ProcessOutput produced no sample"))?;
-			let is_key = produced.GetUINT32(&MFSampleExtension_CleanPoint).unwrap_or(0) == 1;
-			let mut bytes = sample_to_vec(&produced)?;
-
-			// WebCodecs configures from in-band SPS/PPS; MF keeps them out of band, so
-			// prepend the sequence header to every keyframe.
-			if is_key && !self.sequence_header.is_empty() && !starts_with_sps(&bytes) {
-				let mut with_hdr = Vec::with_capacity(self.sequence_header.len() + bytes.len());
-				with_hdr.extend_from_slice(&self.sequence_header);
-				with_hdr.append(&mut bytes);
-				bytes = with_hdr;
-			}
-			return Ok(Some((is_key, bytes)));
+			Err(e) => return Err(anyhow::Error::from(e).context("ProcessOutput")),
 		}
-		bail!("H.264 encoder kept renegotiating its output type; skipping this frame")
+
+		let produced = produced.ok_or_else(|| anyhow!("ProcessOutput produced no sample"))?;
+		let is_key = produced.GetUINT32(&MFSampleExtension_CleanPoint).unwrap_or(0) == 1;
+		let mut bytes = sample_to_vec(&produced)?;
+
+		// WebCodecs configures from in-band SPS/PPS; MF keeps them out of band, so
+		// prepend the sequence header to every keyframe.
+		if is_key && !self.sequence_header.is_empty() && !starts_with_sps(&bytes) {
+			let mut with_hdr = Vec::with_capacity(self.sequence_header.len() + bytes.len());
+			with_hdr.extend_from_slice(&self.sequence_header);
+			with_hdr.append(&mut bytes);
+			bytes = with_hdr;
+		}
+		Ok(Some((is_key, bytes)))
 	}
 
 	/// Adopt the encoder's new output type after `MF_E_TRANSFORM_STREAM_CHANGE`, and
