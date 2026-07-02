@@ -106,11 +106,13 @@ pub fn percent_encode(s: &str) -> String {
 	out
 }
 
-#[cfg(test)]
+// Every test here covers a Linux/macOS-only helper, so the module is gated to
+// those platforms — on Windows it would compile empty and its `use super::*`
+// would trip `-D unused-imports` (caught by the Windows leg of the CI matrix).
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 mod tests {
 	use super::*;
 
-	#[cfg(any(target_os = "linux", target_os = "macos"))]
 	#[test]
 	fn percent_encode_passes_unreserved_and_escapes_the_rest() {
 		assert_eq!(percent_encode("Abc-123_.~"), "Abc-123_.~");
