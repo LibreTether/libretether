@@ -57,9 +57,25 @@ There are two ways to create one:
   ```
 
 **Open registration.** By default only the admin-secret holder can provision. To let anyone who
-can reach the relay mint their *own* tenant (they still can't list or revoke others'), set
-`"open_registration": true` in the config and restart. Provision-only clients then leave the
-admin-secret field blank in the app.
+can reach the relay mint their *own* tenant (they still can't list or revoke others'), enable open
+registration; provision-only clients then leave the admin-secret field blank in the app. Two ways:
+
+- **Env var** (no config editing — best for docker-compose): set
+  `LIBRETETHER_OPEN_REGISTRATION=1`. It overrides the config's stored value at runtime and forces
+  it either way (`1`/`true`/`yes`/`on` = on, anything else = off); it is **not** persisted, so
+  removing it reverts to the config. `libretether-relay info` reflects the effective setting.
+  ```yaml
+  services:
+    relay:
+      image: ghcr.io/libretether/libretether-relay:latest
+      restart: unless-stopped
+      volumes: [libretether:/data]
+      ports: ["47600:47600/udp"]
+      environment:
+        LIBRETETHER_OPEN_REGISTRATION: "1"
+  volumes: { libretether: {} }
+  ```
+- **Config file:** set `"open_registration": true` in `config.json` and restart.
 
 ## With Docker
 

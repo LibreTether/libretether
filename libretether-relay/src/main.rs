@@ -208,6 +208,22 @@ fn resolve_listen_inner(flag: Option<String>, env: Option<String>) -> String {
 		.unwrap_or_else(default_listen)
 }
 
+/// Env var toggling open registration from docker-compose without editing the
+/// config. Like [`LISTEN_ENV`] it's a deployment knob: it overrides the config's
+/// `open_registration` at runtime but is never persisted back, so removing it
+/// reverts to the stored value.
+const OPEN_REGISTRATION_ENV: &str = "LIBRETETHER_OPEN_REGISTRATION";
+
+/// The effective open-registration setting: [`OPEN_REGISTRATION_ENV`] wins when set
+/// (a truthy value enables it, any other non-blank value disables it — so compose can
+/// force it either way), else the config's stored value.
+fn resolve_open_registration(config: bool, env: Option<String>) -> bool {
+	match env.map(|s| s.trim().to_ascii_lowercase()).filter(|s| !s.is_empty()) {
+		Some(v) => matches!(v.as_str(), "1" | "true" | "yes" | "on"),
+		None => config,
+	}
+}
+
 fn config_path(arg: Option<PathBuf>) -> PathBuf {
 	arg.unwrap_or_else(|| {
 		dirs::config_dir()
@@ -688,12 +704,12 @@ async fn main() -> Result<()> {
 }
 
 fn print_credentials(cfg: &ServerConfig, listen: &str) {
+	// Reflect the env override (as `run` would apply it), so `info` matches the
+	// running relay — mirrors how the listen address is resolved from the env here.
+	let open = resolve_open_registration(cfg.open_registration, std::env::var(OPEN_REGISTRATION_ENV).ok());
 	println!("listen:            {listen}");
 	println!("admin secret:      {}", cfg.admin_secret);
-	println!(
-		"open registration: {}",
-		if cfg.open_registration { "on" } else { "off" }
-	);
+	println!("open registration: {}", if open { "on" } else { "off" });
 	println!("tenants:           {}", cfg.tenants.len());
 	println!();
 	println!("Provision a tenant from the app (New controller → Relay → Provision) with the");
@@ -759,11 +775,14 @@ async fn run(cfg: ServerConfig, data_dir: PathBuf, listen_addr: String, config_p
 	// the relay too even under Windows/BSD where `IPV6_V6ONLY` defaults on. See
 	// `tls::server_endpoint`.
 	let endpoint = tls::server_endpoint(cert, key, addr).context("bind relay QUIC listener")?;
+	// The env var overrides the config's stored `open_registration` at runtime (a
+	// deployment knob, never persisted back — same treatment as the listen address).
+	let open_registration = resolve_open_registration(cfg.open_registration, std::env::var(OPEN_REGISTRATION_ENV).ok());
 	logbook::info(&format!("relay listening on udp/{addr}"));
 	logbook::info(&format!(
 		"{} tenant(s) loaded; open registration {}",
 		cfg.tenants.len(),
-		if cfg.open_registration { "on" } else { "off" }
+		if open_registration { "on" } else { "off" }
 	));
 	// Don't echo the secrets on every `run` — they'd persist in the journal /
 	// `docker logs` for the life of the deployment. `libretether-relay info` prints
@@ -772,7 +791,10 @@ async fn run(cfg: ServerConfig, data_dir: PathBuf, listen_addr: String, config_p
 
 	// Build the runtime relay (seeding its tenants from the config) before moving
 	// `cfg.portal` into the portal task — `Relay::new` clones what it needs to persist.
-	let relay = Relay::new(&cfg, config_path);
+	// Apply the env override to the *runtime* setting only; `persist` keeps the config's
+	// stored value, so a provision doesn't bake the env override into the file.
+	let mut relay = Relay::new(&cfg, config_path);
+	relay.open_registration = open_registration;
 
 	// Bring up the browser portal (serves the embedded pairing SPA) when configured —
 	// via the config's `portal` block or env vars (so docker-compose alone can enable
@@ -1960,6 +1982,23 @@ mod tests {
 			resolve_listen_inner(Some("  ".into()), None),
 			format!("[::]:{DEFAULT_PORT}")
 		);
+	}
+
+	#[test]
+	fn resolve_open_registration_lets_env_force_on_or_off() {
+		// No env (or a blank one): the config's stored value stands.
+		assert!(!resolve_open_registration(false, None));
+		assert!(resolve_open_registration(true, None));
+		assert!(!resolve_open_registration(false, Some("   ".into())));
+		// A truthy env forces it on even when the config says off.
+		for v in ["1", "true", "YES", "On"] {
+			assert!(resolve_open_registration(false, Some(v.into())), "{v:?} should enable");
+		}
+		// Any other non-blank env forces it off even when the config says on — so
+		// docker-compose can pin the setting either way.
+		for v in ["0", "false", "off", "nope"] {
+			assert!(!resolve_open_registration(true, Some(v.into())), "{v:?} should disable");
+		}
 	}
 
 	#[tokio::test]
