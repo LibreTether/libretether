@@ -153,11 +153,19 @@ fn ensure_tls_cert() {
 }
 
 #[cfg(target_os = "windows")]
+const TS_KEY: &str = r"System\CurrentControlSet\Control\Terminal Server";
+
+#[cfg(target_os = "windows")]
 fn enable_windows() -> Result<RdpInfo, String> {
-	run_ps(
-		"Set-ItemProperty -Path 'HKLM:\\System\\CurrentControlSet\\Control\\Terminal Server' -Name 'fDenyTSConnections' -Value 0",
-	)?;
-	let _ = run_ps("Enable-NetFirewallRule -DisplayGroup 'Remote Desktop'");
+	ensure_rdp_host_enabled()?;
+
+	// Best-effort: open the Remote Desktop firewall group. Use the canonical,
+	// locale-independent group id — the display name "Remote Desktop" is translated
+	// (e.g. "Área de Trabalho Remota" on pt-BR Windows) so matching by DisplayGroup
+	// silently misses on a localized install. This is also admin-only and may already
+	// be open; a still-blocked firewall surfaces as a refused connection the operator
+	// can fix, not a wrong state we should fail on here.
+	let _ = run_ps("Enable-NetFirewallRule -Group '@FirewallAPI.dll,-28752'");
 
 	Ok(RdpInfo {
 		backend: "windows".to_string(),
@@ -169,6 +177,49 @@ fn enable_windows() -> Result<RdpInfo, String> {
 			"Sign in with this PC's Windows account password when prompted (RDP needs Windows Pro+).".to_string(),
 		),
 	})
+}
+
+/// Clear `fDenyTSConnections` so the built-in RDP host accepts connections.
+///
+/// The value lives under HKLM, so only Administrators may write it. The agent runs
+/// unprivileged by design (per-user autostart, no SYSTEM service — see `service.rs`),
+/// so the installer is the intended place this gets turned on: it self-elevates that
+/// one step under a one-time UAC prompt. Reading the value is fine unprivileged, so
+/// this is idempotent — when it's already cleared (the healthy, installer-enabled
+/// case) we never touch it and never need elevation.
+///
+/// If it *isn't* enabled and we can't write it, we fail closed with an actionable
+/// message (re-run the installer as admin / turn it on in Settings) rather than
+/// surfacing a raw, localized registry `SecurityException` to the operator.
+#[cfg(target_os = "windows")]
+fn ensure_rdp_host_enabled() -> Result<(), String> {
+	use winreg::enums::{HKEY_LOCAL_MACHINE, KEY_READ, KEY_SET_VALUE};
+	use winreg::RegKey;
+
+	let hklm = RegKey::predef(HKEY_LOCAL_MACHINE);
+
+	// Already enabled? A non-admin can read HKLM but can't open it for write, so we
+	// must check this first — otherwise a guest the installer already enabled would
+	// hit an access-denied write and error out despite RDP being on.
+	if let Ok(key) = hklm.open_subkey_with_flags(TS_KEY, KEY_READ) {
+		if key
+			.get_value::<u32, _>("fDenyTSConnections")
+			.map(|v| v == 0)
+			.unwrap_or(false)
+		{
+			return Ok(());
+		}
+	}
+
+	hklm.open_subkey_with_flags(TS_KEY, KEY_SET_VALUE)
+		.and_then(|key| key.set_value("fDenyTSConnections", &0u32))
+		.map_err(|_| {
+			"enabling the Remote Desktop host needs administrator rights, but the LibreTether \
+			 agent runs unprivileged. On this PC, re-run the installer as administrator (or turn \
+			 on Settings → System → Remote Desktop), then retry. Live screen Control/Watch works \
+			 without RDP."
+				.to_string()
+		})
 }
 
 #[cfg(target_os = "windows")]
