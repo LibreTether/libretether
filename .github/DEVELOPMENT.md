@@ -138,7 +138,10 @@ If all of that holds across a few GPUs, flip `DEFAULT_ENCODER_PREF` to `Hardware
   - a **`rust`** matrix (`ubuntu` / `macos` / `windows`) runs `run check:rust` (workspace clippy)
     and `run test`, so the whole workspace — including per-OS code like the Windows Media
     Foundation encoder and the macOS capture path — is compiled and tested on every platform we
-    ship. `run check` runs both locally.
+    ship. `run check` runs both locally. One carve-out: the Windows leg runs `run test:headless`
+    (everything minus the desktop crate) because a Tauri-linked test binary can't start outside a
+    bundled app there (WebView2Loader.dll import → `STATUS_ENTRYPOINT_NOT_FOUND`); desktop tests
+    still compile on Windows and run on the other two legs.
 - **`release.yml`** — on a `chore: release …` commit: builds and attests the agent + relay for
   every platform, publishes the multi-arch relay container, and pins the one-line installers.
 

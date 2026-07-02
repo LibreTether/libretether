@@ -91,6 +91,10 @@
 			"commands": "cargo test --workspace {{ ARGS }}",
 			"description": "Run the whole Rust workspace's tests"
 		},
+		"test:headless": {
+			"commands": "cargo test --workspace --exclude libretether {{ ARGS }}",
+			"description": "Workspace tests minus the desktop crate. The Windows CI leg uses this: a test binary that links the Tauri/webview stack fails to load outside a bundled app there (WebView2Loader.dll import → STATUS_ENTRYPOINT_NOT_FOUND). Desktop tests still run on the Linux/macOS legs, and Windows still compile-checks them via clippy --all-targets"
+		},
 		"update-deps": {
 			"commands": ["pnpm -r update --latest", "cargo update --workspace"],
 			"description": "Update JS dependencies to their latest versions and update Cargo crates"

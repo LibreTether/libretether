@@ -86,5 +86,16 @@ jobs:
         run: run check:rust
 
       - name: Test (Rust workspace)
+        if: runner.os != 'Windows'
         shell: bash
         run: run test
+
+      # On Windows a test binary that links the Tauri/webview stack can't start
+      # outside a bundled app (its WebView2Loader.dll import resolves wrong →
+      # STATUS_ENTRYPOINT_NOT_FOUND before main), so the desktop crate's tests are
+      # excluded here. They still *compile* on Windows (clippy --all-targets above)
+      # and still *run* on the Linux and macOS legs.
+      - name: Test (Rust workspace, minus desktop)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: run test:headless
