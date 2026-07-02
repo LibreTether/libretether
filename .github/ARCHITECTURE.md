@@ -238,4 +238,8 @@ ephemeral keys and both nonces, so every post-handshake stream is AEAD-sealed an
 forwards ciphertext; v9 added **file transfer** — a `ControlRequest::Browse` directory-listing RPC
 and resumable `StreamOpen::Download` / `StreamOpen::Upload` streams (a per-file manifest + chunked
 bytes, with the receiver owning durability via `.part` files so a transfer resumes after a network
-blip or restart).
+blip or restart); v10 made the video encoder a controller-chosen `SessionConfig::encoder` and had
+the agent advertise which encoders it supports; v11 added **adaptive per-chunk zstd compression** to
+the transfer streams — each chunk carries a flag byte marking raw vs compressed, with a per-block
+raw fallback so incompressible data never inflates, and the controller can opt out (a global
+setting, carried to the agent in `DownloadRequest`).

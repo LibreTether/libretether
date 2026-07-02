@@ -132,8 +132,8 @@ export const clientLogs = (id: string, maxLines?: number) => call<LogEntry[]>("c
 
 // ---------------------------------------------------------------- settings
 export const getSettings = () => call<Settings>("get_settings")
-export const setSettings = (rdpClient: string | null, terminal: string | null) =>
-	call<void>("set_settings", { rdpClient, terminal })
+export const setSettings = (rdpClient: string | null, terminal: string | null, compressTransfers: boolean) =>
+	call<void>("set_settings", { compressTransfers, rdpClient, terminal })
 export const saveTextFile = (path: string, contents: string) => call<void>("save_text_file", { contents, path })
 
 // ---------------------------------------------------------------- events

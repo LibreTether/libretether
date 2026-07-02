@@ -201,7 +201,7 @@ const LOGS: LogEntry[] = [
 const SCREENSHOT_PNG =
 	"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
 
-const settings: Settings = { rdp_client: null, terminal: null }
+const settings: Settings = { compress_transfers: true, rdp_client: null, terminal: null }
 
 function deployScript(name: string): string {
 	return `curl -fsSL https://github.com/LibreTether/libretether/releases/latest/download/install-linux.sh | sh -s -- --token tok_${name}_9f2c --controller 100.74.10.1:47600 --controller-key a1b2c3d4e5f6 --tailscale-key tskey-auth-demo`
@@ -372,6 +372,7 @@ export function mockInvoke(cmd: string, args?: Record<string, unknown>): Promise
 		case "set_settings":
 			settings.rdp_client = (args?.rdpClient as string | null) ?? null
 			settings.terminal = (args?.terminal as string | null) ?? null
+			settings.compress_transfers = (args?.compressTransfers as boolean | undefined) ?? true
 			return delay(undefined)
 		case "browse_remote":
 		case "browse_local":

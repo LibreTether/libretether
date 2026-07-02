@@ -128,7 +128,10 @@ async fn drive(
 ) {
 	let item_id = item.id;
 	let client_id = item.client_id;
-	match run(&ctrl, &item, &app).await {
+	// The controller's file-transfer compression opt-out (default on) applies to both
+	// directions: it's sent to the agent for a download, and used locally for an upload.
+	let compress = state.0.settings.lock().unwrap().compress_enabled();
+	match run(&ctrl, &item, &app, compress).await {
 		Ok(()) => {
 			ctrl.mutate_transfers(|q| {
 				q.update(item_id, |t| {
@@ -166,6 +169,7 @@ async fn run(
 	ctrl: &ActiveController,
 	item: &crate::transfer_queue::TransferItem,
 	app: &Option<AppHandle>,
+	compress: bool,
 ) -> Result<(), DriveError> {
 	let link = ctrl
 		.connection(item.client_id)
@@ -179,8 +183,8 @@ async fn run(
 		.await
 		.map_err(|e| DriveError::Interrupted(format!("open stream: {e}")))?;
 	match item.direction {
-		Direction::Download => run_download(ctrl, item, &mut send, &mut recv, app).await,
-		Direction::Upload => run_upload(ctrl, item, &mut send, &mut recv, app).await,
+		Direction::Download => run_download(ctrl, item, &mut send, &mut recv, app, compress).await,
+		Direction::Upload => run_upload(ctrl, item, &mut send, &mut recv, app, compress).await,
 	}
 }
 
@@ -190,11 +194,13 @@ async fn run_download(
 	send: &mut SecureQuicSend,
 	recv: &mut SecureQuicRecv,
 	app: &Option<AppHandle>,
+	compress: bool,
 ) -> Result<(), DriveError> {
 	write_frame(
 		send,
 		&DownloadRequest {
 			path: item.remote_path.clone(),
+			compress,
 		},
 	)
 	.await
@@ -242,6 +248,7 @@ async fn run_upload(
 	send: &mut SecureQuicSend,
 	recv: &mut SecureQuicRecv,
 	app: &Option<AppHandle>,
+	compress: bool,
 ) -> Result<(), DriveError> {
 	// Enumerate the local source on the blocking pool.
 	let source = item.local_path.clone();
@@ -290,7 +297,7 @@ async fn run_upload(
 			mtime: wi.entry.mtime,
 		};
 		write_frame(send, &header).await.map_err(interrupted)?;
-		transfer::send_file(send, recv, &wi.abs, wi.entry.size, |b| prog.report(b))
+		transfer::send_file(send, recv, &wi.abs, wi.entry.size, compress, |b| prog.report(b))
 			.await
 			.map_err(interrupted)?;
 		let done: FileDone = read_frame_capped(recv, MAX_CONTROL_FRAME).await.map_err(interrupted)?;

@@ -116,6 +116,9 @@ pub struct ActiveInfo {
 pub struct SettingsDto {
 	pub rdp_client: Option<String>,
 	pub terminal: Option<String>,
+	/// Whether file transfers compress chunks (adaptive zstd). Resolved to a concrete
+	/// bool for the UI (the stored preference defaults to on when unset).
+	pub compress_transfers: bool,
 }
 
 fn to_dto(client: &Client, online: bool, status: Option<AgentStatus>) -> ClientDto {
@@ -412,6 +415,7 @@ pub async fn get_settings(state: State<'_, AppState>) -> AppResult<SettingsDto> 
 	Ok(SettingsDto {
 		rdp_client: s.rdp_client.clone(),
 		terminal: s.terminal.clone(),
+		compress_transfers: s.compress_enabled(),
 	})
 }
 
@@ -420,6 +424,7 @@ pub async fn set_settings(
 	state: State<'_, AppState>,
 	rdp_client: Option<String>,
 	terminal: Option<String>,
+	compress_transfers: bool,
 ) -> AppResult<()> {
 	// Validate before touching state (and before taking the lock): these settings
 	// are later exec'd, so a compromised webview must not be able to point them at
@@ -431,6 +436,7 @@ pub async fn set_settings(
 		let mut s = state.0.settings.lock().unwrap();
 		s.rdp_client = rdp_client;
 		s.terminal = terminal;
+		s.compress_transfers = Some(compress_transfers);
 	}
 	state.save_settings()
 }
@@ -1549,8 +1555,9 @@ mod tests {
 			SettingsDto {
 				rdp_client: None,
 				terminal: None,
+				compress_transfers: true,
 			},
-			&["rdp_client", "terminal"],
+			&["rdp_client", "terminal", "compress_transfers"],
 		);
 		assert_fields(
 			TailscaleInfo {

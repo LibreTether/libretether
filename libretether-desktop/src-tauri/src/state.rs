@@ -157,9 +157,20 @@ pub struct Settings {
 	/// Preferred terminal launcher for SSH, e.g. "gnome-terminal --". Empty = auto-detect.
 	#[serde(default)]
 	pub terminal: Option<String>,
+	/// Whether file transfers may compress chunks (adaptive zstd). Opt-out: `None`
+	/// (including an older settings.json without the field) means enabled.
+	#[serde(default)]
+	pub compress_transfers: Option<bool>,
 	/// The controller last connected to (so the UI can highlight it).
 	#[serde(default)]
 	pub last_controller: Option<Uuid>,
+}
+
+impl Settings {
+	/// Resolve the file-transfer compression preference (defaults to on).
+	pub fn compress_enabled(&self) -> bool {
+		self.compress_transfers.unwrap_or(true)
+	}
 }
 
 /// A live agent connection.

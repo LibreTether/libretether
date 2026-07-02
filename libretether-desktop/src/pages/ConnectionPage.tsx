@@ -26,11 +26,13 @@ export function ConnectionPage({ active }: { active: ActiveInfo }) {
 	const [rdpMode, setRdpMode] = useState<RdpMode>("auto")
 	const [rdpCustom, setRdpCustom] = useState("")
 	const [terminal, setTerminal] = useState("")
+	const [compress, setCompress] = useState(true)
 
 	useEffect(() => {
 		api.getSettings()
 			.then((s) => {
 				setTerminal(s.terminal ?? "")
+				setCompress(s.compress_transfers)
 				const rc = s.rdp_client ?? ""
 				if (rc === "" || (PRESET_MODES as string[]).includes(rc)) setRdpMode((rc || "auto") as RdpMode)
 				else {
@@ -43,7 +45,7 @@ export function ConnectionPage({ active }: { active: ActiveInfo }) {
 
 	const savePrefs = async () => {
 		const rdpClient = rdpMode === "custom" ? rdpCustom.trim() || null : rdpMode === "auto" ? null : rdpMode
-		const ok = await saveAction.run("Couldn't save", () => api.setSettings(rdpClient, terminal || null))
+		const ok = await saveAction.run("Couldn't save", () => api.setSettings(rdpClient, terminal || null, compress))
 		if (ok) toast.success("Saved", "Host preferences updated.")
 	}
 
@@ -160,6 +162,22 @@ export function ConnectionPage({ active }: { active: ActiveInfo }) {
 								value={terminal}
 							/>
 						</Field>
+
+						<label className="flex items-start gap-2.5">
+							<input
+								checked={compress}
+								className="no-drag mt-0.5 h-4 w-4 shrink-0 accent-[var(--primary)]"
+								onChange={(e) => setCompress(e.target.checked)}
+								type="checkbox"
+							/>
+							<span className="flex flex-col gap-0.5">
+								<span className="text-xs font-semibold text-muted">Compress file transfers</span>
+								<span className="text-[0.72rem] leading-relaxed text-subtle">
+									Adaptive zstd — compresses each chunk when it helps and skips already-compressed
+									files (video, archives, images). Turn off to save CPU on fast local links.
+								</span>
+							</span>
+						</label>
 
 						<div className="flex justify-end">
 							<Button

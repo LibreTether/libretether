@@ -199,6 +199,75 @@ struct VideoProc {
 	out_h: u32,
 }
 
+/// One `encode_present`'s result: the framed message (if the encoder emitted one this
+/// call) plus the GPU-side phase timing for the stats line.
+struct Encoded {
+	frame: Option<OutFrame>,
+	is_key: bool,
+	/// Microseconds: GPU convert (VideoProcessorBlt), codec submit (ProcessInput), and
+	/// output drain (ProcessOutput → CPU bitstream).
+	blt_us: u64,
+	submit_us: u64,
+	drain_us: u64,
+}
+
+/// Rolling per-stage timing for the GPU pipeline, logged ~once a second (Debug) so an
+/// operator sees where the frame budget goes — acquire (present wait) vs GPU convert vs
+/// codec submit vs output drain vs network — mirroring the CPU path's stats line. Note
+/// the GPU convert (`blt`) is only the CPU cost of *issuing* the blt; the actual work
+/// runs on the GPU asynchronously.
+struct GpuStats {
+	window_start: Instant,
+	frames: u32,
+	sent: u32,
+	keyframes: u32,
+	cap_us: u64,
+	blt_us: u64,
+	submit_us: u64,
+	drain_us: u64,
+	send_us: u64,
+	bytes: u64,
+}
+
+impl GpuStats {
+	fn new() -> Self {
+		Self {
+			window_start: Instant::now(),
+			frames: 0,
+			sent: 0,
+			keyframes: 0,
+			cap_us: 0,
+			blt_us: 0,
+			submit_us: 0,
+			drain_us: 0,
+			send_us: 0,
+			bytes: 0,
+		}
+	}
+
+	fn maybe_log(&mut self, scale: u8, bitrate: u32) {
+		let elapsed = self.window_start.elapsed();
+		if elapsed < Duration::from_secs(1) || self.frames == 0 {
+			return;
+		}
+		let n = self.frames as f64;
+		let ms = |total: u64| (total as f64 / n) / 1000.0;
+		let fps = n / elapsed.as_secs_f64();
+		let kib_per_sent = (self.bytes as f64 / self.sent.max(1) as f64) / 1024.0;
+		crate::net::debug(&format!(
+			"stream {fps:.0} fps ({}/s sent, {} key) | cap {:.1} blt {:.1} sub {:.1} drn {:.1} net {:.1} ms/f | {kib_per_sent:.0} KiB/sent | scale {scale}% {bitrate}kbps (gpu zero-copy)",
+			self.sent,
+			self.keyframes,
+			ms(self.cap_us),
+			ms(self.blt_us),
+			ms(self.submit_us),
+			ms(self.drain_us),
+			ms(self.send_us),
+		));
+		*self = GpuStats::new();
+	}
+}
+
 impl Gpu {
 	unsafe fn setup(display: u32, shared: &SharedConfig) -> Result<Self> {
 		ensure_mf_started()?;
@@ -385,12 +454,15 @@ impl Gpu {
 	) -> Result<()> {
 		let mut last_emit: Option<Instant> = None;
 		let mut seq = 0u64;
+		let mut stats = GpuStats::new();
 		loop {
 			if stop.load(Ordering::Relaxed) {
 				break;
 			}
 			let mut info = DXGI_OUTDUPL_FRAME_INFO::default();
 			let mut resource: Option<IDXGIResource> = None;
+			// `cap` — the acquire, which blocks until the desktop presents a new frame.
+			let acquired = Instant::now();
 			match self.duplication.AcquireNextFrame(200, &mut info, &mut resource) {
 				Ok(()) => {}
 				Err(e) if e.code() == DXGI_ERROR_WAIT_TIMEOUT => continue,
@@ -402,40 +474,55 @@ impl Gpu {
 				}
 				Err(e) => return Err(e.into()),
 			}
+			let cap_us = acquired.elapsed().as_micros() as u64;
 
 			let present = info.LastPresentTime != 0;
 			let interval = Duration::from_millis(1000 / shared.max_fps());
 			let due = last_emit.is_none_or(|t| t.elapsed() >= interval);
 			if present && due {
 				if let Some(resource) = resource.as_ref() {
-					let started = Instant::now();
 					match self.encode_present(resource, shared, &mut seq) {
-						Ok(Some(out)) => {
-							let _ = started;
-							if out_tx.blocking_send(out).is_err() {
-								let _ = self.duplication.ReleaseFrame();
-								break;
+						Ok(enc) => {
+							stats.frames += 1;
+							stats.cap_us += cap_us;
+							stats.blt_us += enc.blt_us;
+							stats.submit_us += enc.submit_us;
+							stats.drain_us += enc.drain_us;
+							if let Some(out) = enc.frame {
+								let bytes = out.body.len() as u64;
+								let send_started = Instant::now();
+								let sent_ok = out_tx.blocking_send(out).is_ok();
+								stats.send_us += send_started.elapsed().as_micros() as u64;
+								if !sent_ok {
+									let _ = self.duplication.ReleaseFrame();
+									break;
+								}
+								stats.sent += 1;
+								stats.bytes += bytes;
+								if enc.is_key {
+									stats.keyframes += 1;
+								}
+								last_emit = Some(Instant::now());
 							}
-							last_emit = Some(Instant::now());
 						}
-						Ok(None) => {}
 						Err(e) => crate::net::log(&format!("gpu encode: {e:#}")),
 					}
 				}
 			}
+			stats.maybe_log(shared.scale(), shared.bitrate_kbps());
 			self.duplication.ReleaseFrame()?;
 		}
 		Ok(())
 	}
 
-	/// Convert + encode one duplicated frame, returning an [`OutFrame`] when the
-	/// encoder produced output this call.
+	/// Convert + encode one duplicated frame, returning an [`Encoded`] with the framed
+	/// message (when the encoder produced output this call) and the phase timing.
 	unsafe fn encode_present(
 		&mut self,
 		resource: &IDXGIResource,
 		shared: &SharedConfig,
 		seq: &mut u64,
-	) -> Result<Option<OutFrame>> {
+	) -> Result<Encoded> {
 		let bgra: ID3D11Texture2D = resource.cast()?;
 		let mut src_desc = D3D11_TEXTURE2D_DESC::default();
 		bgra.GetDesc(&mut src_desc);
@@ -459,10 +546,13 @@ impl Gpu {
 				.SetValue(&CODECAPI_AVEncVideoForceKeyFrame, &VARIANT::from(1u32));
 		}
 
-		// GPU convert BGRA→NV12 (+ scale) into the next pool texture.
+		// GPU convert BGRA→NV12 (+ scale) into the next pool texture (`blt`).
+		let t = Instant::now();
 		let nv12 = self.blt_to_nv12(&bgra)?;
+		let blt_us = t.elapsed().as_micros() as u64;
 
-		// Wrap the NV12 texture in an IMFSample (no copy) and feed the encoder.
+		// Submit: wrap the NV12 texture in an IMFSample (no copy) and feed the encoder.
+		let t = Instant::now();
 		let buffer = MFCreateDXGISurfaceBuffer(&ID3D11Texture2D::IID, &nv12, 0, false)?;
 		let sample = MFCreateSample()?;
 		sample.AddBuffer(&buffer)?;
@@ -481,10 +571,21 @@ impl Gpu {
 			}
 			Err(e) => return Err(anyhow::Error::from(e).context("ProcessInput")),
 		}
+		let submit_us = t.elapsed().as_micros() as u64;
+
+		// Drain the encoded output (async — often this frame's arrives on a later call).
+		let t = Instant::now();
 		self.drain(&mut outputs)?;
+		let drain_us = t.elapsed().as_micros() as u64;
 
 		if outputs.is_empty() {
-			return Ok(None);
+			return Ok(Encoded {
+				frame: None,
+				is_key: false,
+				blt_us,
+				submit_us,
+				drain_us,
+			});
 		}
 		let is_key = outputs.iter().any(|(k, _)| *k);
 		let mut au = Vec::new();
@@ -493,13 +594,19 @@ impl Gpu {
 		}
 		*seq += 1;
 		let body = video::frame_message(is_key, *seq, out_w, out_h, &au);
-		Ok(Some(OutFrame {
-			source_width: in_w,
-			source_height: in_h,
-			origin_x: self.origin_x,
-			origin_y: self.origin_y,
-			body,
-		}))
+		Ok(Encoded {
+			frame: Some(OutFrame {
+				source_width: in_w,
+				source_height: in_h,
+				origin_x: self.origin_x,
+				origin_y: self.origin_y,
+				body,
+			}),
+			is_key,
+			blt_us,
+			submit_us,
+			drain_us,
+		})
 	}
 
 	/// Blit BGRA `src` into the next NV12 pool texture, returning that texture.

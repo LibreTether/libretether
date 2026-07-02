@@ -52,8 +52,12 @@ pub const ALPN: &[u8] = b"libretether/1";
 /// [`ControlRequest::Browse`] directory-listing RPC and the
 /// [`StreamOpen::Download`] / [`StreamOpen::Upload`] streams (see [`transfer`]); v10
 /// made the video encoder a controller-chosen [`SessionConfig::encoder`] and had the
-/// agent advertise which encoders it supports ([`AgentStatus::encoders`]).
-pub const PROTOCOL_VERSION: u32 = 10;
+/// agent advertise which encoders it supports ([`AgentStatus::encoders`]); v11 added
+/// adaptive per-chunk **zstd compression** to the file-transfer streams (each chunk is
+/// self-describing — a flag byte marks raw vs compressed, with a per-block raw fallback
+/// so incompressible data never inflates — and [`transfer::DownloadRequest`] carries
+/// the controller's opt-out).
+pub const PROTOCOL_VERSION: u32 = 11;
 
 /// Default UDP port the controller listens on for incoming agents.
 pub const DEFAULT_PORT: u16 = 47600;

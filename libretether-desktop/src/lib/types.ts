@@ -131,6 +131,8 @@ export interface ActiveInfo {
 export interface Settings {
 	rdp_client: string | null
 	terminal: string | null
+	/** Whether file transfers compress chunks (adaptive zstd). Defaults on. */
+	compress_transfers: boolean
 }
 
 /** The RDP-client preference the Connection page picks between. The preset values

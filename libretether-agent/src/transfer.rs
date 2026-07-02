@@ -39,7 +39,8 @@ pub async fn serve_upload(mut send: SecureQuicSend, mut recv: SecureQuicRecv) {
 
 async fn download(send: &mut SecureQuicSend, recv: &mut SecureQuicRecv) -> Result<()> {
 	let req: DownloadRequest = read_frame_capped(recv, MAX_CONTROL_FRAME).await?;
-	crate::net::debug(&format!("download requested: {}", req.path));
+	crate::net::debug(&format!("download requested: {} (compress={})", req.path, req.compress));
+	let compress = req.compress;
 
 	// Resolve + enumerate on the blocking pool; a bad path is reported to the controller
 	// (as an `Err` manifest) rather than silently dropping the stream.
@@ -80,7 +81,7 @@ async fn download(send: &mut SecureQuicSend, recv: &mut SecureQuicRecv) -> Resul
 			mtime: item.entry.mtime,
 		};
 		write_frame(send, &header).await?;
-		transfer::send_file(send, recv, &item.abs, item.entry.size, |_| {}).await?;
+		transfer::send_file(send, recv, &item.abs, item.entry.size, compress, |_| {}).await?;
 	}
 	crate::net::debug(&format!("download complete: {} file(s)", files.len()));
 	Ok(())

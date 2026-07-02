@@ -159,7 +159,8 @@ An early but capable build. Working today:
 - ✅ **RDP** and **SSH** one-click connect (SSH needs nothing installed on the client)
 - ✅ **File transfer** — browse the guest's filesystem and download from or upload to it (files or
   whole folders) over the same encrypted link, with a live progress queue that's cancellable and
-  resumes after a network drop or restart — no SSH/scp needed
+  resumes after a network drop or restart — no SSH/scp needed. Adaptive zstd compression (per chunk,
+  skipping already-compressed files) is on by default and can be turned off under Connection.
 - ✅ **Relay mode** + phone-friendly browser pairing, with **end-to-end encryption** so the relay
   host only ever sees ciphertext, and **automatic peer-to-peer NAT hole-punching** that upgrades
   sessions to a direct path when the network allows

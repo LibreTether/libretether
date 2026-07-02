@@ -71,6 +71,11 @@ pub const CHUNK_SIZE: usize = 512 * 1024;
 pub struct DownloadRequest {
 	/// Absolute source path on the agent host — a file or a directory.
 	pub path: String,
+	/// Whether the agent (the sender for a download) may compress chunks. The
+	/// controller's opt-out — an upload's sender is the controller itself, so it
+	/// consults its setting directly and needs no wire field.
+	#[serde(default)]
+	pub compress: bool,
 }
 
 /// Controller → agent: the first frame after [`StreamOpen::Upload`]. The controller
@@ -311,15 +316,78 @@ async fn resume_decision(target: &Path, part: &Path, meta: &Path, header: &FileH
 	Ok(Resume::Append(0))
 }
 
+// ------------------------------------------------------------- block compression
+
+/// zstd level for transfer chunks. A fast level — disk and network are the usual
+/// bottleneck, not the compressor — with most of the ratio of the higher ones.
+const ZSTD_LEVEL: i32 = 3;
+/// Per-block tag: the chunk payload is raw bytes.
+const BLOCK_RAW: u8 = 0;
+/// Per-block tag: the chunk payload is zstd-compressed.
+const BLOCK_ZSTD: u8 = 1;
+
+/// File extensions whose contents are already compressed or encrypted — zstd buys
+/// ~nothing and just costs CPU, so the sender skips straight to raw blocks for them.
+/// The per-block raw fallback still protects any file that slips through.
+const INCOMPRESSIBLE_EXTS: &[&str] = &[
+	"zip", "gz", "tgz", "xz", "zst", "bz2", "7z", "rar", "lz4", "lzma", "png", "jpg", "jpeg", "gif", "webp", "heic",
+	"avif", "mp4", "m4v", "mkv", "mov", "avi", "webm", "flv", "mp3", "aac", "ogg", "oga", "opus", "flac", "m4a", "wma",
+	"pdf", "docx", "xlsx", "pptx", "odt", "ods", "odp", "apk", "jar", "whl", "deb", "rpm", "dmg", "woff", "woff2",
+];
+
+/// Whether it's worth *attempting* compression on this file (the adaptive part): a
+/// caller opt-in AND an extension that isn't already-compressed. Per-block fallback
+/// handles anything that still turns out incompressible.
+fn worth_attempting(source: &Path, compress: bool) -> bool {
+	compress
+		&& match source.extension().and_then(|e| e.to_str()) {
+			Some(ext) => !INCOMPRESSIBLE_EXTS.contains(&ext.to_ascii_lowercase().as_str()),
+			None => true,
+		}
+}
+
+/// Frame one raw block for the wire: try zstd when `attempt` is set and keep whichever
+/// is smaller, tagged so the receiver knows which it got. Falling back per block means
+/// incompressible data is never inflated beyond a single tag byte.
+fn encode_block(block: &[u8], attempt: bool) -> Vec<u8> {
+	if attempt {
+		if let Ok(comp) = zstd::bulk::compress(block, ZSTD_LEVEL) {
+			if comp.len() < block.len() {
+				let mut out = Vec::with_capacity(1 + comp.len());
+				out.push(BLOCK_ZSTD);
+				out.extend_from_slice(&comp);
+				return out;
+			}
+		}
+	}
+	let mut out = Vec::with_capacity(1 + block.len());
+	out.push(BLOCK_RAW);
+	out.extend_from_slice(block);
+	out
+}
+
+/// Decode one framed block (tag byte + payload) back to raw bytes. A block never
+/// decompresses to more than [`CHUNK_SIZE`], so a larger claim fails closed.
+fn decode_block(framed: &[u8]) -> std::io::Result<Vec<u8>> {
+	let (&tag, payload) = framed.split_first().ok_or_else(|| invalid("empty transfer block"))?;
+	match tag {
+		BLOCK_RAW => Ok(payload.to_vec()),
+		BLOCK_ZSTD => zstd::bulk::decompress(payload, CHUNK_SIZE).map_err(|e| invalid(format!("zstd decompress: {e}"))),
+		other => Err(invalid(format!("unknown transfer block tag {other}"))),
+	}
+}
+
 /// Sender side of one file (used by the agent for a download and the controller for an
 /// upload): read the receiver's [`ResumeReply`], seek `source` to that offset, and
-/// stream the remaining bytes as chunks + a final EOF. `on_progress` is called with the
-/// cumulative bytes sent (including the resumed prefix) after each chunk.
+/// stream the remaining bytes as chunks + a final EOF. Each block is adaptively
+/// compressed (see [`worth_attempting`] / [`encode_block`]) when `compress` is set.
+/// `on_progress` is called with the cumulative *raw* bytes sent (matching the file size).
 pub async fn send_file<S, R>(
 	send: &mut S,
 	recv: &mut R,
 	source: &Path,
 	size: u64,
+	compress: bool,
 	mut on_progress: impl FnMut(u64),
 ) -> std::io::Result<()>
 where
@@ -332,6 +400,7 @@ where
 	if start >= size {
 		return write_eof(send).await;
 	}
+	let attempt = worth_attempting(source, compress);
 	let mut f = tokio::fs::File::open(source).await?;
 	if start > 0 {
 		f.seek(SeekFrom::Start(start)).await?;
@@ -343,7 +412,7 @@ where
 		if n == 0 {
 			break;
 		}
-		write_chunk(send, &buf[..n]).await?;
+		write_chunk(send, &encode_block(&buf[..n], attempt)).await?;
 		sent += n as u64;
 		on_progress(sent);
 	}
@@ -414,9 +483,10 @@ where
 		if chunk.is_empty() {
 			break;
 		}
-		f.write_all(&chunk).await?;
-		written += chunk.len() as u64;
-		since_sync += chunk.len() as u64;
+		let data = decode_block(&chunk)?;
+		f.write_all(&data).await?;
+		written += data.len() as u64;
+		since_sync += data.len() as u64;
 		if since_sync >= SYNC_EVERY {
 			f.sync_data().await?;
 			since_sync = 0;
@@ -751,7 +821,7 @@ mod tests {
 			let (mut ss, mut cr) = tokio::io::duplex(1 << 16); // receiver.send -> sender.recv
 			let src2 = src.clone();
 			let sz = header.size;
-			let sender = tokio::spawn(async move { send_file(&mut cs, &mut cr, &src2, sz, |_| {}).await });
+			let sender = tokio::spawn(async move { send_file(&mut cs, &mut cr, &src2, sz, true, |_| {}).await });
 			let got = receive_file(&mut ss, &mut sr, &target, &header, |_| {}).await.unwrap();
 			sender.await.unwrap().unwrap();
 			assert_eq!(got, data.len() as u64);
@@ -777,7 +847,7 @@ mod tests {
 			let (mut ss, mut cr) = tokio::io::duplex(1 << 16);
 			let src2 = src.clone();
 			let sz = header.size;
-			let sender = tokio::spawn(async move { send_file(&mut cs, &mut cr, &src2, sz, |_| {}).await });
+			let sender = tokio::spawn(async move { send_file(&mut cs, &mut cr, &src2, sz, true, |_| {}).await });
 			let got = receive_file(&mut ss, &mut sr, &target, &header, |_| {}).await.unwrap();
 			sender.await.unwrap().unwrap();
 			assert_eq!(got, data.len() as u64);
@@ -810,7 +880,7 @@ mod tests {
 		let (mut ss, mut cr) = tokio::io::duplex(1 << 16);
 		let src2 = src.clone();
 		let sz = header.size;
-		let sender = tokio::spawn(async move { send_file(&mut cs, &mut cr, &src2, sz, |_| {}).await });
+		let sender = tokio::spawn(async move { send_file(&mut cs, &mut cr, &src2, sz, true, |_| {}).await });
 		let got = receive_file(&mut ss, &mut sr, &target, &header, |_| {}).await.unwrap();
 		sender.await.unwrap().unwrap();
 		assert_eq!(got, data.len() as u64);
@@ -851,7 +921,7 @@ mod tests {
 		let (mut ss, mut cr) = tokio::io::duplex(1 << 16);
 		let src2 = src.clone();
 		let sz = header.size;
-		let sender = tokio::spawn(async move { send_file(&mut cs, &mut cr, &src2, sz, |_| {}).await });
+		let sender = tokio::spawn(async move { send_file(&mut cs, &mut cr, &src2, sz, true, |_| {}).await });
 		let got = receive_file(&mut ss, &mut sr, &target, &header, |_| {}).await.unwrap();
 		sender.await.unwrap().unwrap();
 		assert_eq!(got, good.len() as u64);
@@ -861,6 +931,68 @@ mod tests {
 			"the good final file must be untouched"
 		);
 		assert!(!part_path(&target).exists(), "the stale partial is cleaned up");
+		let _ = std::fs::remove_dir_all(&dir);
+	}
+
+	#[test]
+	fn block_codec_round_trips_and_falls_back() {
+		// Compressible block: gets the zstd tag and actually shrinks.
+		let comp = vec![7u8; 10_000];
+		let framed = encode_block(&comp, true);
+		assert_eq!(framed[0], BLOCK_ZSTD);
+		assert!(framed.len() < comp.len(), "a compressible block shrinks");
+		assert_eq!(decode_block(&framed).unwrap(), comp);
+		// attempt = false → always a raw block.
+		let framed = encode_block(&comp, false);
+		assert_eq!(framed[0], BLOCK_RAW);
+		assert_eq!(decode_block(&framed).unwrap(), comp);
+		// The adaptive gate: opt-out and already-compressed extensions skip the attempt.
+		assert!(worth_attempting(Path::new("a/b.txt"), true));
+		assert!(!worth_attempting(Path::new("a/b.txt"), false));
+		assert!(
+			!worth_attempting(Path::new("a/movie.MP4"), true),
+			"case-insensitive ext match"
+		);
+		assert!(!worth_attempting(Path::new("photo.jpg"), true));
+	}
+
+	/// Full sender↔receiver round trip with compression on, across compressible and
+	/// effectively-incompressible payloads (the latter exercises the per-block raw
+	/// fallback), all reconstructed byte-for-byte.
+	#[tokio::test]
+	async fn compression_round_trips_compressible_and_incompressible() {
+		let dir = tmp("zstd");
+		let zeros = vec![0u8; 300_000];
+		let mixed: Vec<u8> = b"hello world ".iter().copied().cycle().take(300_000).collect();
+		// A pseudo-random, effectively-incompressible buffer with a `.bin` extension (so
+		// compression IS attempted, then falls back to raw per block).
+		let rand: Vec<u8> = (0..120_000u32)
+			.map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8)
+			.collect();
+		for (name, data) in [("zeros.txt", zeros), ("mixed.log", mixed), ("rand.bin", rand)] {
+			let src = dir.join(format!("s-{name}"));
+			let target = dir.join(format!("t-{name}"));
+			std::fs::write(&src, &data).unwrap();
+			let header = FileHeader {
+				index: 0,
+				rel: name.into(),
+				size: data.len() as u64,
+				mtime: Some(1),
+			};
+			let (mut cs, mut sr) = tokio::io::duplex(1 << 16);
+			let (mut ss, mut cr) = tokio::io::duplex(1 << 16);
+			let src2 = src.clone();
+			let sz = header.size;
+			let sender = tokio::spawn(async move { send_file(&mut cs, &mut cr, &src2, sz, true, |_| {}).await });
+			let got = receive_file(&mut ss, &mut sr, &target, &header, |_| {}).await.unwrap();
+			sender.await.unwrap().unwrap();
+			assert_eq!(got, data.len() as u64, "{name} byte count");
+			assert_eq!(
+				std::fs::read(&target).unwrap(),
+				data,
+				"{name} round-trips byte-for-byte"
+			);
+		}
 		let _ = std::fs::remove_dir_all(&dir);
 	}
 }
