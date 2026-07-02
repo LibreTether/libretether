@@ -341,6 +341,7 @@ pub fn supported_encoders() -> Vec<EncoderPref> {
 	static CACHE: OnceLock<Vec<EncoderPref>> = OnceLock::new();
 	CACHE
 		.get_or_init(|| {
+			#[cfg_attr(not(windows), allow(unused_mut))]
 			let mut v = vec![EncoderPref::Software];
 			#[cfg(windows)]
 			{
