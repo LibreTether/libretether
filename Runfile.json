@@ -21,18 +21,21 @@
 			"description": "Build the production desktop controller bundle (alias for `desktop:build`)"
 		},
 		"check": {
+			"commands": ["@check:static", "@check:rust"],
+			"description": "Full workspace gate: everything in check:static + check:rust. CI splits these — check:static once, check:rust per-OS in a matrix — but locally `run check` does both"
+		},
+		"check:rust": {
+			"commands": "cargo clippy --workspace --all-targets -- -D warnings",
+			"description": "OS-dependent gate: clippy the whole Rust workspace (CI runs this on Linux, macOS and Windows so per-OS code — the Windows encoder, macOS capture, etc. — can't rot)"
+		},
+		"check:static": {
 			"commands": [
 				"biome check",
 				"@desktop:typecheck",
 				"cargo fmt --all -- --check",
-				"cargo clippy --workspace --all-targets -- -D warnings",
-				"@check:licenses"
+				"node scripts/check-licenses.mjs"
 			],
-			"description": "Workspace gate: format, lint, type-check, and license-check everything (frontend + Rust workspace)"
-		},
-		"check:licenses": {
-			"commands": "node scripts/check-licenses.mjs",
-			"description": "Verify every Rust + JS dependency license is compatible with the project's AGPL-3.0 license"
+			"description": "OS-independent gate: JS/TS lint, TypeScript type-check, rustfmt check, and license-check (results don't vary by OS, so CI runs this once)"
 		},
 		"clean": {
 			"commands": "rm -rf target node_modules libretether-desktop/node_modules libretether-desktop/dist",

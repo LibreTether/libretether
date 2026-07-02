@@ -10,16 +10,14 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  check:
+  # OS-independent gate (JS/TS lint, type-check, rustfmt, license-check). These
+  # produce the same result on any platform, so run them once on Linux rather than
+  # in the per-OS matrix below.
+  lint:
     name: Lint & type-check
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v6.0.2
-
-      - name: Install system dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev build-essential curl wget file libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev libxcb1-dev libxrandr-dev libxfixes-dev libdbus-1-dev libpipewire-0.3-dev libxkbcommon-dev clang nasm
 
       - uses: actions-rust-lang/setup-rust-toolchain@v1.16.1
 
@@ -47,29 +45,46 @@ jobs:
       - name: Install JS dependencies
         run: pnpm install
 
-      - name: Check (format, lint, type-check)
-        run: run check
+      - name: Static checks (lint, type-check, rustfmt, licenses)
+        run: run check:static
 
-      - name: Test (Rust workspace)
-        run: run test
-
-  # The agent's hardware H.264 path (src/mf_encoder.rs, feature `media-foundation`)
-  # is Windows-only and so never compiled by the Linux `check` job above. Build it
-  # on a Windows runner so it can't silently rot. `OPENH264_NO_ASM=1` skips the nasm
-  # SIMD build — this gate is about the Rust/Media-Foundation code compiling, not
-  # codec throughput.
-  windows-media-foundation:
-    name: Windows hardware-encoder compile-check
-    runs-on: windows-latest
+  # OS-dependent gate: clippy + test the whole Rust workspace on every platform we
+  # ship — agent and relay everywhere, the desktop controller on all three — so
+  # per-OS code (the Windows Media Foundation encoder and DXGI capture, the macOS
+  # capture path, etc.) is compiled and tested on every push and can't silently rot.
+  # Replaces the old Linux-only test run and the standalone Windows compile-check.
+  rust:
+    name: Rust (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-latest, windows-latest]
+    env:
+      # Build OpenH264's C-only kernels (skip the nasm SIMD build): this gate is about
+      # the Rust code compiling and the tests passing, not codec throughput, and it
+      # keeps the non-Linux legs from needing a nasm toolchain.
+      OPENH264_NO_ASM: "1"
     steps:
       - uses: actions/checkout@v6.0.2
 
-      - uses: actions-rust-lang/setup-rust-toolchain@v1.16.1
-        with:
-          components: clippy
+      # The Linux leg compiles the Tauri desktop crate, so it needs the WebKitGTK +
+      # capture/system libs. macOS (WKWebView) and Windows (WebView2) provide their
+      # webview through the system SDK, so they need no extra install here.
+      - name: Install Linux system dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev build-essential curl wget file libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev libxcb1-dev libxrandr-dev libxfixes-dev libdbus-1-dev libpipewire-0.3-dev libxkbcommon-dev clang
 
-      - name: Clippy the Media Foundation encoder
+      - uses: actions-rust-lang/setup-rust-toolchain@v1.16.1
+
+      - uses: Skiley/runfile/.github/actions/setup@master
+
+      - name: Clippy (workspace, all targets)
         shell: bash
-        env:
-          OPENH264_NO_ASM: "1"
-        run: cargo clippy -p libretether-agent --features media-foundation -- -D warnings
+        run: run check:rust
+
+      - name: Test (Rust workspace)
+        shell: bash
+        run: run test

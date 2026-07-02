@@ -300,24 +300,60 @@ pub(crate) trait ScreenEncoder {
 	fn kind(&self) -> &'static str;
 }
 
-/// Pick the best backend for this platform: a hardware Media Foundation encoder on
-/// Windows (when the `media-foundation` feature is built in and a usable encoder
-/// MFT exists), else software OpenH264 everywhere. Both emit the same H.264 wire
-/// format — this is a runtime capability choice, not a protocol fallback, so a
-/// missing hardware encoder degrades to software without a version break.
+/// Env var selecting the encoder backend at runtime (no rebuild): `software`,
+/// `hardware`, or unset/`auto` for [`DEFAULT_ENCODER_PREF`].
+const ENCODER_ENV: &str = "LIBRETETHER_ENCODER";
+
+/// The backend used when [`ENCODER_ENV`] is unset (or `auto`). **Software today**,
+/// while the Windows Media Foundation encoder is runtime-unvalidated: it's compiled
+/// into every Windows agent but only used when explicitly requested with
+/// `LIBRETETHER_ENCODER=hardware`, so an untested `unsafe` codepath can't run on a
+/// production guest by accident. Once it's confirmed on real GPUs, flip this one
+/// constant to [`EncoderPref::Hardware`] and every agent prefers it by default (still
+/// falling back to software on a guest with no usable encoder).
+const DEFAULT_ENCODER_PREF: EncoderPref = EncoderPref::Software;
+
+/// Which H.264 backend to use.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum EncoderPref {
+	/// Software OpenH264 — the cross-platform backend, and the fallback everywhere.
+	Software,
+	/// Prefer the platform's hardware encoder (Media Foundation on Windows); falls
+	/// back to software if it can't initialise or the platform has none.
+	Hardware,
+}
+
+/// Parse [`ENCODER_ENV`]. Unset, `auto`, or anything unrecognised → the current
+/// [`DEFAULT_ENCODER_PREF`], so a typo never silently forces a backend.
+fn encoder_pref_from(value: Option<&str>) -> EncoderPref {
+	match value.map(|s| s.trim().to_ascii_lowercase()).as_deref() {
+		Some("software") | Some("sw") | Some("openh264") => EncoderPref::Software,
+		Some("hardware") | Some("hw") | Some("mf") | Some("media-foundation") => EncoderPref::Hardware,
+		_ => DEFAULT_ENCODER_PREF,
+	}
+}
+
+/// Pick the backend, honouring [`ENCODER_ENV`]. The Windows Media Foundation encoder
+/// is compiled into every Windows agent but only used when explicitly selected (it's
+/// still runtime-unvalidated — see [`crate::mf_encoder`]); everything else uses
+/// software OpenH264. Both emit the same H.264 wire format, so this is a runtime
+/// capability choice, not a protocol fallback, and a hardware encoder that won't
+/// initialise degrades to software without a version break.
 fn build_encoder(width: usize, height: usize, bitrate_kbps: u32, fps: u8) -> anyhow::Result<Box<dyn ScreenEncoder>> {
-	#[cfg(all(windows, feature = "media-foundation"))]
-	{
+	if encoder_pref_from(std::env::var(ENCODER_ENV).ok().as_deref()) == EncoderPref::Hardware {
+		#[cfg(windows)]
 		match crate::mf_encoder::MediaFoundationEncoder::new(width, height, bitrate_kbps, fps) {
 			// `run` announces the chosen backend via `kind()`; here we only note the
-			// notable case where hardware was compiled in but couldn't be used.
+			// notable case where hardware was asked for but couldn't be used.
 			Ok(enc) => return Ok(Box::new(enc)),
-			Err(e) => {
-				crate::net::log(&format!(
-					"h264: Media Foundation unavailable ({e:#}); falling back to software OpenH264"
-				));
-			}
+			Err(e) => crate::net::log(&format!(
+				"h264: Media Foundation unavailable ({e:#}); falling back to software OpenH264"
+			)),
 		}
+		#[cfg(not(windows))]
+		crate::net::log(
+			"h264: a hardware encoder was requested but none is available on this platform yet; using software OpenH264",
+		);
 	}
 	Ok(Box::new(OpenH264Encoder::new(width, height, bitrate_kbps, fps)?))
 }
@@ -496,6 +532,67 @@ fn clamp8(v: i32) -> u8 {
 	v.clamp(0, 255) as u8
 }
 
+/// Convert tightly-packed RGBA into `dst` as **NV12** (BT.601 limited range): a
+/// full-res Y plane followed by a half-res plane of interleaved U/V. NV12 is I420
+/// with the two chroma planes interleaved, so this stays in step with [`rgba_to_i420`]
+/// byte for byte (the test locks that in). Used by the Windows Media Foundation
+/// encoder, whose MFTs want NV12 input; kept here (not in the Windows-only
+/// `mf_encoder`) so it's compiled and tested on every platform. `w`/`h` must be even.
+// Only the Windows `mf_encoder` (and the tests) call this, so it's unused on other
+// build configs — that's expected, not dead code.
+#[allow(dead_code)]
+pub(crate) fn rgba_to_nv12(rgba: &[u8], w: usize, h: usize, dst: &mut [u8]) {
+	let (y_plane, uv_plane) = dst.split_at_mut(w * h);
+	for row in 0..h {
+		let base = row * w * 4;
+		let yrow = &mut y_plane[row * w..row * w + w];
+		for (x, y) in yrow.iter_mut().enumerate() {
+			let p = base + x * 4;
+			let (r, g, b) = (rgba[p] as i32, rgba[p + 1] as i32, rgba[p + 2] as i32);
+			*y = clamp8(((66 * r + 129 * g + 25 * b + 128) >> 8) + 16);
+		}
+	}
+	let cw = w / 2;
+	for cy in 0..h / 2 {
+		for cx in 0..cw {
+			let (x0, y0) = (cx * 2, cy * 2);
+			let (mut r, mut g, mut b) = (0i32, 0i32, 0i32);
+			for dy in 0..2 {
+				let rb = (y0 + dy) * w * 4;
+				for dx in 0..2 {
+					let p = rb + (x0 + dx) * 4;
+					r += rgba[p] as i32;
+					g += rgba[p + 1] as i32;
+					b += rgba[p + 2] as i32;
+				}
+			}
+			r >>= 2;
+			g >>= 2;
+			b >>= 2;
+			let u = clamp8(((-38 * r - 74 * g + 112 * b + 128) >> 8) + 128);
+			let v = clamp8(((112 * r - 94 * g - 18 * b + 128) >> 8) + 128);
+			// Interleaved: each chroma row is 2·cw bytes (U,V,U,V,…), so `w` per row.
+			let idx = cy * w + cx * 2;
+			uv_plane[idx] = u;
+			uv_plane[idx + 1] = v;
+		}
+	}
+}
+
+/// Cheap check: does the Annex-B access unit *start* with an SPS NAL (type 7)? Media
+/// Foundation keeps SPS/PPS out of band, so the encoder re-injects them on each
+/// keyframe unless they're already there; this guards against double-prepending.
+/// Only the first few bytes are inspected — a leading SPS follows a 3- or 4-byte
+/// start code.
+// As with `rgba_to_nv12`, only the Windows encoder and the tests use this.
+#[allow(dead_code)]
+pub(crate) fn starts_with_sps(au: &[u8]) -> bool {
+	au.windows(3)
+		.take(8)
+		.enumerate()
+		.any(|(i, w)| w == [0, 0, 1] && au.get(i + 3).is_some_and(|b| b & 0x1f == 7))
+}
+
 /// FNV-1a over the frame, parallelized in blocks. Used only to detect a frame
 /// identical to the last one (skip the encode), so the order-independent block
 /// fold is fine — any pixel change flips the result.
@@ -645,6 +742,76 @@ mod tests {
 		assert_eq!(yuv.data.len(), 8 + 2 + 2);
 		// White → Y near 235 (limited-range peak).
 		assert!(yuv.data[0] > 230, "white luma should be near 235, got {}", yuv.data[0]);
+	}
+
+	/// A colourful gradient so every U/V pair differs — a solid image would hide a
+	/// U/V transposition or interleave bug.
+	fn gradient(w: u32, h: u32) -> RgbaImage {
+		RgbaImage::from_fn(w, h, |x, y| {
+			image::Rgba([(x * 17) as u8, (y * 29) as u8, (x * y * 3) as u8, 255])
+		})
+	}
+
+	// NV12 must be exactly I420 with the two chroma planes interleaved. Deriving both
+	// from the same input and comparing locks the Windows encoder's colour conversion
+	// to the already-tested I420 path — catching a swapped U/V or a bad stride, which
+	// would otherwise only surface as wrong colours on a real Windows guest.
+	#[test]
+	fn nv12_is_i420_with_interleaved_chroma() {
+		let (w, h) = (8usize, 6usize);
+		let img = gradient(w as u32, h as u32);
+
+		let mut i420 = I420::new(w, h);
+		rgba_to_i420(img.as_raw(), w, h, &mut i420);
+		let (cw, ch) = (w / 2, h / 2);
+		let (y_i, uv_i) = i420.data.split_at(w * h);
+		let (u_i, v_i) = uv_i.split_at(cw * ch);
+
+		let mut nv12 = vec![0u8; w * h + 2 * cw * ch];
+		rgba_to_nv12(img.as_raw(), w, h, &mut nv12);
+		let (y_n, uv_n) = nv12.split_at(w * h);
+
+		assert_eq!(y_n, y_i, "Y planes must be identical");
+		for cy in 0..ch {
+			for cx in 0..cw {
+				assert_eq!(uv_n[cy * w + cx * 2], u_i[cy * cw + cx], "U at ({cx},{cy})");
+				assert_eq!(uv_n[cy * w + cx * 2 + 1], v_i[cy * cw + cx], "V at ({cx},{cy})");
+			}
+		}
+	}
+
+	#[test]
+	fn starts_with_sps_detects_only_a_leading_sps() {
+		// 4-byte start code + SPS (NAL type 7).
+		assert!(starts_with_sps(&[0, 0, 0, 1, 0x67, 0x42]));
+		// 3-byte start code + SPS.
+		assert!(starts_with_sps(&[0, 0, 1, 0x67]));
+		// Leading P-slice (NAL type 1) — no SPS.
+		assert!(!starts_with_sps(&[0, 0, 0, 1, 0x41, 0x9a]));
+		// Empty / too short never matches.
+		assert!(!starts_with_sps(&[]));
+		assert!(!starts_with_sps(&[0, 0, 1]));
+	}
+
+	#[test]
+	fn encoder_pref_parses_and_defaults_to_software() {
+		// Unset / `auto` / anything unrecognised → the current default, never a silent
+		// forced backend. The default stays software while the hardware path is
+		// unvalidated — this assertion is the guard on that.
+		assert_eq!(
+			DEFAULT_ENCODER_PREF,
+			EncoderPref::Software,
+			"hardware must stay opt-in until validated"
+		);
+		assert_eq!(encoder_pref_from(None), DEFAULT_ENCODER_PREF);
+		assert_eq!(encoder_pref_from(Some("auto")), DEFAULT_ENCODER_PREF);
+		assert_eq!(encoder_pref_from(Some("gpu")), DEFAULT_ENCODER_PREF);
+		for sw in ["software", "SW", " OpenH264 "] {
+			assert_eq!(encoder_pref_from(Some(sw)), EncoderPref::Software, "{sw:?}");
+		}
+		for hw in ["hardware", "hw", "mf", "Media-Foundation"] {
+			assert_eq!(encoder_pref_from(Some(hw)), EncoderPref::Hardware, "{hw:?}");
+		}
 	}
 
 	#[test]

@@ -9,14 +9,6 @@ license = "AGPL-3.0-only"
 name = "libretether-agent"
 path = "src/main.rs"
 
-[features]
-# Hardware H.264 on Windows via a Media Foundation encoder MFT, used in preference
-# to software OpenH264 when a usable encoder exists (falls back automatically).
-# OFF by default: the backend (src/mf_encoder.rs) is an async-MFT implementation
-# that must be compiled and validated on Windows before it's turned on in a
-# release build — enabling this on a non-Windows target is a no-op.
-media-foundation = []
-
 [dependencies]
 libretether-protocol = { path = "../libretether-protocol" }
 libretether-common = { path = "../libretether-common" }
@@ -71,9 +63,9 @@ features = [
 	"Win32_Graphics_Direct3D11",
 	"Win32_Graphics_Dxgi",
 	"Win32_Graphics_Dxgi_Common",
-	# Media Foundation H.264 encoder MFT (feature = "media-foundation"). Bindings
-	# are cheap to generate and only referenced behind that feature, so they're
-	# listed unconditionally on the Windows target.
+	# Media Foundation H.264 encoder MFT (src/mf_encoder.rs). Always compiled on the
+	# Windows target; the encoder is selected at runtime, off by default until the
+	# hardware path is validated (LIBRETETHER_ENCODER=hardware to opt in).
 	"Win32_Media_MediaFoundation",
 	"Win32_System_Com",
 	"Win32_System_Ole",

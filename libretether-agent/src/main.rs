@@ -16,7 +16,7 @@ mod encode;
 mod handlers;
 mod host;
 mod input;
-#[cfg(all(target_os = "windows", feature = "media-foundation"))]
+#[cfg(target_os = "windows")]
 mod mf_encoder;
 mod net;
 #[cfg(target_os = "linux")]

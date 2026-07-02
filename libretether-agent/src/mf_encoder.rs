@@ -2,16 +2,26 @@
 //!
 //! **Status: compiles clean, runtime-unvalidated.** Type-checked against `windows`
 //! 0.59's Media Foundation bindings for the Windows target (clippy `-D warnings`),
-//! and the CI `windows-media-foundation` job rebuilds it on `windows-latest` on
-//! every push so it can't rot. It has **not** yet been run against a real hardware
-//! encoder, so it stays behind the off-by-default `media-foundation` Cargo feature
-//! until a runtime smoke test on a Windows GPU confirms it. It's only reached when
-//! [`crate::encode::build_encoder`] selects it, and if
+//! and the Windows leg of the CI `rust` matrix rebuilds and tests it on
+//! `windows-latest` on every push so it can't rot. It has **not** yet been run
+//! against a real hardware encoder. It's compiled
+//! into **every** Windows agent but **off by default at runtime**: the encoder is
+//! only selected when `LIBRETETHER_ENCODER=hardware` is set (see
+//! [`crate::encode::build_encoder`] / `DEFAULT_ENCODER_PREF`), so this untested
+//! `unsafe` COM path can't run on a production guest by accident. If
 //! [`MediaFoundationEncoder::new`] returns `Err` the encoder falls back to software
-//! OpenH264 — so a wrong-at-runtime path degrades safely rather than breaking the
-//! session. The parts to scrutinise in that runtime pass: the async-MFT event loop,
-//! in-band SPS/PPS insertion, `ICodecAPI` rate-control values, and whether the
-//! chosen MFT wants D3D-backed (vs system-memory) input.
+//! OpenH264, so even an explicit opt-in degrades safely rather than breaking the
+//! session. Once it's confirmed on real GPUs, flipping the one `DEFAULT_ENCODER_PREF`
+//! constant turns it on by default.
+//!
+//! To **validate on a Windows guest**, run any agent built for Windows with
+//! `LIBRETETHER_ENCODER=hardware` and A/B it against `=software`; no special build or
+//! feature flag is needed. See `.github/DEVELOPMENT.md` for the full recipe and what
+//! to observe. The parts to scrutinise in that pass: the async-MFT event loop (this
+//! drives the transform by *polling* its event queue and feeding one sample per call
+//! rather than the strict wait-for-`METransformNeedInput` model — the first thing to
+//! confirm on real hardware), in-band SPS/PPS insertion, `ICodecAPI` rate-control
+//! values, and whether the chosen MFT wants D3D-backed (vs system-memory) input.
 //!
 //! ## Scope
 //! This consumes a **system-memory NV12 frame** (converted from the captured RGBA)
@@ -37,7 +47,7 @@ use windows::Win32::Media::MediaFoundation::*;
 use windows::Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED};
 use windows::Win32::System::Variant::VARIANT;
 
-use crate::encode::ScreenEncoder;
+use crate::encode::{rgba_to_nv12, starts_with_sps, ScreenEncoder};
 
 /// Process-wide MF/COM init. MFStartup is refcounted, but doing it once for the
 /// agent's lifetime is simplest and matches how the capture thread lives.
@@ -379,57 +389,4 @@ unsafe fn sample_to_vec(sample: &IMFSample) -> Result<Vec<u8>> {
 	let out = std::slice::from_raw_parts(ptr, len as usize).to_vec();
 	buffer.Unlock()?;
 	Ok(out)
-}
-
-/// Cheap check: does the access unit already start with an Annex-B SPS (type 7)?
-fn starts_with_sps(au: &[u8]) -> bool {
-	au.windows(3)
-		.take(8)
-		.enumerate()
-		.any(|(i, w)| w == [0, 0, 1] && au.get(i + 3).is_some_and(|b| b & 0x1f == 7))
-}
-
-/// RGBA → NV12 (BT.601 limited range): full-res Y plane, then an interleaved UV
-/// plane at half resolution. `w`/`h` must be even. Kept in step with the I420
-/// conversion in `encode.rs` (NV12 is I420 with U/V interleaved).
-fn rgba_to_nv12(rgba: &[u8], w: usize, h: usize, dst: &mut [u8]) {
-	let (y_plane, uv_plane) = dst.split_at_mut(w * h);
-	for row in 0..h {
-		let base = row * w * 4;
-		let yrow = &mut y_plane[row * w..row * w + w];
-		for (x, y) in yrow.iter_mut().enumerate() {
-			let p = base + x * 4;
-			let (r, g, b) = (rgba[p] as i32, rgba[p + 1] as i32, rgba[p + 2] as i32);
-			*y = clamp8(((66 * r + 129 * g + 25 * b + 128) >> 8) + 16);
-		}
-	}
-	let cw = w / 2;
-	for cy in 0..h / 2 {
-		for cx in 0..cw {
-			let (x0, y0) = (cx * 2, cy * 2);
-			let (mut r, mut g, mut b) = (0i32, 0i32, 0i32);
-			for dy in 0..2 {
-				let rb = (y0 + dy) * w * 4;
-				for dx in 0..2 {
-					let p = rb + (x0 + dx) * 4;
-					r += rgba[p] as i32;
-					g += rgba[p + 1] as i32;
-					b += rgba[p + 2] as i32;
-				}
-			}
-			r >>= 2;
-			g >>= 2;
-			b >>= 2;
-			let u = clamp8(((-38 * r - 74 * g + 112 * b + 128) >> 8) + 128);
-			let v = clamp8(((112 * r - 94 * g - 18 * b + 128) >> 8) + 128);
-			let idx = cy * w + cx * 2;
-			uv_plane[idx] = u;
-			uv_plane[idx + 1] = v;
-		}
-	}
-}
-
-#[inline]
-fn clamp8(v: i32) -> u8 {
-	v.clamp(0, 255) as u8
 }

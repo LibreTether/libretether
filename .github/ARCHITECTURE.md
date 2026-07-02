@@ -105,9 +105,10 @@ emit the same H.264 wire format; the choice is a runtime capability, not a proto
 - **OpenH264 (software)** — the cross-platform default and universal fallback. Baseline profile
   (widest WebCodecs decode support, including WebKitGTK), bitrate-based rate control, tuned for
   low-latency screen content.
-- **Media Foundation (hardware, Windows)** — an async-MFT backend behind the off-by-default
-  `media-foundation` build feature. Compile-verified; pending runtime validation before it's
-  enabled in releases.
+- **Media Foundation (hardware, Windows)** — an async-MFT backend, compiled into every Windows
+  agent but **off by default at runtime** (selected only with `LIBRETETHER_ENCODER=hardware`)
+  while it's pending runtime validation on real hardware. Compile-verified in CI; one constant
+  (`DEFAULT_ENCODER_PREF`) flips it on by default once validated.
 - **Planned:** VAAPI/NVENC on Linux and VideoToolbox on macOS (see the README's *Planned next
   steps*).
 
