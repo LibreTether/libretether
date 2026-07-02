@@ -3068,7 +3068,7 @@ dependencies = [
 
 [[package]]
 name = "libretether"
-version = "0.30.0"
+version = "0.30.1"
 dependencies = [
  "base64 0.22.1",
  "dirs",
@@ -3092,7 +3092,7 @@ dependencies = [
 
 [[package]]
 name = "libretether-agent"
-version = "0.30.0"
+version = "0.30.1"
 dependencies = [
  "anyhow",
  "ashpd",
@@ -3122,14 +3122,14 @@ dependencies = [
 
 [[package]]
 name = "libretether-common"
-version = "0.30.0"
+version = "0.30.1"
 dependencies = [
  "tokio",
 ]
 
 [[package]]
 name = "libretether-protocol"
-version = "0.30.0"
+version = "0.30.1"
 dependencies = [
  "base64 0.22.1",
  "chacha20poly1305",
@@ -3152,7 +3152,7 @@ dependencies = [
 
 [[package]]
 name = "libretether-relay"
-version = "0.30.0"
+version = "0.30.1"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
