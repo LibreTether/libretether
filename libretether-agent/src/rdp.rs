@@ -159,6 +159,12 @@ const TS_KEY: &str = r"System\CurrentControlSet\Control\Terminal Server";
 fn enable_windows() -> Result<RdpInfo, String> {
 	ensure_rdp_host_enabled()?;
 
+	// Bring up the Remote Desktop Services listener. Starting a system service needs
+	// admin — which the agent usually lacks — so this is best-effort; the verify step
+	// below turns "enabled but nothing listening" into a clear error instead of a
+	// false success.
+	let _ = run_ps("Start-Service -Name TermService");
+
 	// Best-effort: open the Remote Desktop firewall group. Use the canonical,
 	// locale-independent group id — the display name "Remote Desktop" is translated
 	// (e.g. "Área de Trabalho Remota" on pt-BR Windows) so matching by DisplayGroup
@@ -166,6 +172,17 @@ fn enable_windows() -> Result<RdpInfo, String> {
 	// be open; a still-blocked firewall surfaces as a refused connection the operator
 	// can fix, not a wrong state we should fail on here.
 	let _ = run_ps("Enable-NetFirewallRule -Group '@FirewallAPI.dll,-28752'");
+
+	// `fDenyTSConnections = 0` does NOT guarantee an RDP server is actually listening:
+	// Windows Home has no RDP host at all, and on Pro the listener may not be bound
+	// until TermService (re)starts. The controller then tunnels to this machine's own
+	// 127.0.0.1:3389 — loopback, so not firewall-gated — and a missing listener shows
+	// up as a bare "connection refused" (os error 10061) in the RDP viewer, long after
+	// we'd already claimed success. Verify the port accepts before reporting enabled,
+	// and otherwise fail closed with an actionable, edition-aware reason.
+	if !rdp_port_listening() {
+		return Err(rdp_unavailable_reason());
+	}
 
 	Ok(RdpInfo {
 		backend: "windows".to_string(),
@@ -177,6 +194,56 @@ fn enable_windows() -> Result<RdpInfo, String> {
 			"Sign in with this PC's Windows account password when prompted (RDP needs Windows Pro+).".to_string(),
 		),
 	})
+}
+
+/// Does something accept TCP on the local RDP port yet? The RDP-Tcp listener can take
+/// a moment to bind after TermService starts, so retry briefly (a *refused* connect
+/// returns immediately, so this mostly costs the sleeps, ~3s worst case) before
+/// concluding there's no RDP server.
+#[cfg(target_os = "windows")]
+fn rdp_port_listening() -> bool {
+	use std::net::{Ipv4Addr, SocketAddr, TcpStream};
+	use std::time::Duration;
+
+	let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, RDP_PORT));
+	for attempt in 0..6 {
+		if TcpStream::connect_timeout(&addr, Duration::from_millis(500)).is_ok() {
+			return true;
+		}
+		if attempt < 5 {
+			std::thread::sleep(Duration::from_millis(500));
+		}
+	}
+	false
+}
+
+/// Why isn't the RDP host listening? Windows Home simply has no Remote Desktop server,
+/// which we can tell apart from a stopped-service situation via the edition id (Home
+/// SKUs are the "Core*" family) so the operator gets the right next step.
+#[cfg(target_os = "windows")]
+fn rdp_unavailable_reason() -> String {
+	use winreg::enums::{HKEY_LOCAL_MACHINE, KEY_READ};
+	use winreg::RegKey;
+
+	let is_home = RegKey::predef(HKEY_LOCAL_MACHINE)
+		.open_subkey_with_flags(r"SOFTWARE\Microsoft\Windows NT\CurrentVersion", KEY_READ)
+		.and_then(|k| k.get_value::<String, _>("EditionID"))
+		.map(|e| e.to_ascii_lowercase().starts_with("core"))
+		.unwrap_or(false);
+
+	if is_home {
+		"Remote Desktop was enabled, but this Windows edition (Home) has no RDP host — nothing \
+		 listens on port 3389, so the connection is refused. Use LibreTether's live screen \
+		 Control/Watch instead, or upgrade the guest to Windows Pro."
+			.to_string()
+	} else {
+		"Remote Desktop is enabled but nothing is listening on port 3389 (connection refused). \
+		 The Remote Desktop Services (TermService) couldn't be started — the agent runs \
+		 unprivileged and can't start a system service. Re-run the installer as administrator, \
+		 start 'Remote Desktop Services' on the PC, or reboot it. Live screen Control/Watch \
+		 works without RDP."
+			.to_string()
+	}
 }
 
 /// Clear `fDenyTSConnections` so the built-in RDP host accepts connections.
