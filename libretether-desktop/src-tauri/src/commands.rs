@@ -9,8 +9,8 @@ use libretether_protocol::relay::{
 	self, AdminRequest, AdminResponse, RelayRequest, RelayRole, TenantCredentials, TenantInfo,
 };
 use libretether_protocol::{
-	tls, AgentStatus, ControlRequest, ControlResponse, DirListing, ExecResult, InputEvent, ScreenshotResult,
-	SessionConfig, DEFAULT_PORT, PROTOCOL_VERSION,
+	tls, AgentStatus, ControlRequest, ControlResponse, DirListing, EncoderPref, ExecResult, InputEvent,
+	ScreenshotResult, SessionConfig, DEFAULT_PORT, PROTOCOL_VERSION,
 };
 use serde::Serialize;
 use tauri::{Emitter, State};
@@ -57,6 +57,9 @@ pub struct ClientDto {
 	/// against. `None` until the machine has enrolled. The UI shows it (and a short
 	/// fingerprint derived from it) on the machine's security panel.
 	pub public_key: Option<String>,
+	/// The encoder this controller has configured this machine to use (persisted on the
+	/// controller, sent to the agent at each session start). `Auto` by default.
+	pub encoder: EncoderPref,
 }
 
 #[derive(Serialize)]
@@ -126,6 +129,7 @@ fn to_dto(client: &Client, online: bool, status: Option<AgentStatus>) -> ClientD
 		last_seen: client.last_seen,
 		status,
 		public_key: client.public_key.clone(),
+		encoder: client.encoder,
 	}
 }
 
@@ -762,15 +766,38 @@ pub async fn start_control(
 ) -> AppResult<()> {
 	let state = state.inner().clone();
 	let (ctrl, id) = active_and_id(&state, &id)?;
+	// The encoder is controller-persisted per machine, not part of the quality config
+	// the UI sends — inject the stored choice so the agent gets it at session start.
+	let mut config = config;
+	config.encoder = ctrl
+		.store
+		.lock()
+		.unwrap()
+		.get(id)
+		.map(|c| c.encoder)
+		.unwrap_or_default();
 	session::start(&state, ctrl, id, config.sanitized(), frames);
 	Ok(())
 }
 
-/// Change the live session's quality/fps/scale without restarting it.
+/// Change the live session's quality/fps/scale without restarting it. The encoder is
+/// not changed here — a change to it restarts the session (see `set_client_encoder`).
 #[tauri::command]
 pub async fn configure_control(state: State<'_, AppState>, id: String, config: SessionConfig) -> AppResult<()> {
 	let ctrl = state.inner().require_active()?;
 	session::configure(&ctrl, parse_id(&id)?, config.sanitized())
+}
+
+/// Set which encoder a machine should use. Persisted on the controller and sent to the
+/// agent at the next session start (nothing is stored on the agent). Returns whether it
+/// actually changed, so the UI can restart a live session only when needed.
+#[tauri::command]
+pub async fn set_client_encoder(state: State<'_, AppState>, id: String, encoder: EncoderPref) -> AppResult<bool> {
+	let state = state.inner();
+	let (ctrl, id) = active_and_id(state, &id)?;
+	let changed = ctrl.mutate_store(|s| s.set_encoder(id, encoder))?;
+	state.notify_changed();
+	Ok(changed)
 }
 
 #[tauri::command]
@@ -1341,7 +1368,7 @@ mod tests {
 	// you rename/add/remove a field here, this fails until `types.ts` is updated to
 	// match — turning a silent runtime `undefined` into a failed `cargo test`.
 
-	use libretether_protocol::{HostInfo, MouseButton, SessionConfig};
+	use libretether_protocol::{EncoderPref, HostInfo, MouseButton, SessionConfig};
 	use serde::Serialize;
 
 	/// Assert that `value` serializes to a JSON object with exactly `expected` keys.
@@ -1373,6 +1400,7 @@ mod tests {
 			boot_time_secs: None,
 			displays: 1,
 			tailscale_ip: None,
+			encoders: vec![EncoderPref::Software],
 		}
 	}
 
@@ -1389,6 +1417,7 @@ mod tests {
 				"boot_time_secs",
 				"displays",
 				"tailscale_ip",
+				"encoders",
 			],
 		);
 		assert_fields(
@@ -1418,8 +1447,9 @@ mod tests {
 				max_fps: 30,
 				scale: 100,
 				auto: false,
+				encoder: EncoderPref::Auto,
 			},
-			&["display", "bitrate_kbps", "max_fps", "scale", "auto"],
+			&["display", "bitrate_kbps", "max_fps", "scale", "auto", "encoder"],
 		);
 	}
 
@@ -1435,6 +1465,7 @@ mod tests {
 			last_seen: None,
 			status: None,
 			public_key: None,
+			encoder: EncoderPref::Auto,
 		};
 		assert_fields(
 			&client,
@@ -1448,6 +1479,7 @@ mod tests {
 				"last_seen",
 				"status",
 				"public_key",
+				"encoder",
 			],
 		);
 		assert_fields(
@@ -1469,6 +1501,7 @@ mod tests {
 					last_seen: None,
 					status: None,
 					public_key: None,
+					encoder: EncoderPref::Auto,
 				},
 				code: "AB12-CD34".into(),
 				portal_url: "https://relay.example.com".into(),
@@ -1701,6 +1734,10 @@ mod tests {
 		assert_eq!(serde_json::to_value(ClientOs::Linux).unwrap(), "linux");
 		assert_eq!(serde_json::to_value(ClientOs::Macos).unwrap(), "macos");
 		assert_eq!(serde_json::to_value(ClientOs::Windows).unwrap(), "windows");
+		assert_eq!(serde_json::to_value(EncoderPref::Auto).unwrap(), "auto");
+		assert_eq!(serde_json::to_value(EncoderPref::Software).unwrap(), "software");
+		assert_eq!(serde_json::to_value(EncoderPref::Hardware).unwrap(), "hardware");
+		assert_eq!(serde_json::to_value(EncoderPref::Gpu).unwrap(), "gpu");
 	}
 
 	#[test]

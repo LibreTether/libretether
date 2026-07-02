@@ -50,8 +50,10 @@ pub const ALPN: &[u8] = b"libretether/1";
 /// both nonces), so every post-handshake stream is AEAD-sealed end-to-end and a
 /// relay only ever forwards ciphertext (see [`e2e`]); v9 added file transfer — the
 /// [`ControlRequest::Browse`] directory-listing RPC and the
-/// [`StreamOpen::Download`] / [`StreamOpen::Upload`] streams (see [`transfer`]).
-pub const PROTOCOL_VERSION: u32 = 9;
+/// [`StreamOpen::Download`] / [`StreamOpen::Upload`] streams (see [`transfer`]); v10
+/// made the video encoder a controller-chosen [`SessionConfig::encoder`] and had the
+/// agent advertise which encoders it supports ([`AgentStatus::encoders`]).
+pub const PROTOCOL_VERSION: u32 = 10;
 
 /// Default UDP port the controller listens on for incoming agents.
 pub const DEFAULT_PORT: u16 = 47600;
@@ -387,6 +389,12 @@ pub struct AgentStatus {
 	/// The agent's tailnet IPv4, when on Tailscale — used as the address the
 	/// controller dials for RDP/SSH.
 	pub tailscale_ip: Option<String>,
+	/// The concrete encoders this agent can run (never includes `Auto`, which is
+	/// always selectable). Software everywhere; `Hardware`/`Gpu` only where the
+	/// platform + GPU support them. The controller's Configure UI grays out anything
+	/// not listed here.
+	#[serde(default)]
+	pub encoders: Vec<EncoderPref>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -408,6 +416,29 @@ pub struct ScreenshotResult {
 
 // ---------------------------------------------------------------- live session
 
+/// Which H.264 encoder the agent should use for a session. Chosen by the controller
+/// and sent in [`SessionConfig`]; nothing is persisted on the agent. The agent still
+/// falls back (a requested hardware/GPU encoder that can't initialise drops to the
+/// next-best) and reports the encoder it actually used back via
+/// [`SessionServer::Meta`]. The controller only offers choices the agent advertises
+/// as supported in [`AgentStatus::encoders`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EncoderPref {
+	/// Let the agent pick — currently software everywhere, until the hardware paths are
+	/// validated enough to be a safe default.
+	#[default]
+	Auto,
+	/// Software OpenH264 — cross-platform, and the universal fallback.
+	Software,
+	/// The platform hardware encoder with CPU-side colour conversion (Media Foundation
+	/// on Windows).
+	Hardware,
+	/// The zero-copy GPU path (Windows: DXGI → GPU convert → Media Foundation, all on
+	/// one device). Falls back to `Hardware`/`Software` if the GPU can't do it.
+	Gpu,
+}
+
 /// Quality/format knobs for a live screen-control session. Can be set at
 /// [`SessionClient::Start`] and changed live with [`SessionClient::Configure`].
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -428,6 +459,12 @@ pub struct SessionConfig {
 	/// congested link), restoring it as conditions clear — "reduce quality to keep
 	/// it smooth" without the controller babysitting it.
 	pub auto: bool,
+	/// Which encoder the agent should use (see [`EncoderPref`]). Applied at
+	/// [`SessionClient::Start`]; a change to it restarts the session (the controller
+	/// tears down and reconnects) rather than reconfiguring live, since the GPU path is
+	/// a different capture+encode pipeline.
+	#[serde(default)]
+	pub encoder: EncoderPref,
 }
 
 /// Bitrate clamp bounds (kbps): floor keeps a usable picture, ceiling caps a
@@ -445,6 +482,7 @@ impl SessionConfig {
 			max_fps: self.max_fps.clamp(1, 60),
 			scale: self.scale.clamp(10, 100),
 			auto: self.auto,
+			encoder: self.encoder,
 		}
 	}
 }
@@ -457,6 +495,7 @@ impl Default for SessionConfig {
 			max_fps: 30,
 			scale: 100,
 			auto: false,
+			encoder: EncoderPref::Auto,
 		}
 	}
 }

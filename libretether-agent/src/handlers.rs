@@ -142,6 +142,8 @@ fn status() -> AgentStatus {
 		boot_time_secs: host::boot_time_secs(),
 		displays: capture::display_count(),
 		tailscale_ip: host::tailscale_ip(),
+		// So the controller's Configure UI only offers encoders this machine can run.
+		encoders: crate::encode::supported_encoders(),
 	}
 }
 

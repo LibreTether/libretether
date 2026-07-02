@@ -34,6 +34,7 @@ function status(over: Partial<AgentStatus["host"]> & Partial<AgentStatus>): Agen
 		arch: over.arch ?? "x86_64",
 		boot_time_secs: null,
 		displays: over.displays ?? 1,
+		encoders: over.encoders ?? ["software"],
 		host: {
 			arch: over.arch ?? "x86_64",
 			hostname: over.hostname ?? "host",
@@ -49,6 +50,7 @@ function status(over: Partial<AgentStatus["host"]> & Partial<AgentStatus>): Agen
 const CLIENTS: ClientDto[] = [
 	{
 		created_at: NOW - 40 * 86400,
+		encoder: "auto",
 		enrolled: true,
 		id: "m1",
 		last_seen: NOW - 4,
@@ -68,6 +70,7 @@ const CLIENTS: ClientDto[] = [
 	},
 	{
 		created_at: NOW - 9 * 86400,
+		encoder: "auto",
 		enrolled: true,
 		id: "m2",
 		last_seen: NOW - 2,
@@ -86,6 +89,7 @@ const CLIENTS: ClientDto[] = [
 	},
 	{
 		created_at: NOW - 5 * 86400,
+		encoder: "auto",
 		enrolled: true,
 		id: "m3",
 		last_seen: NOW - 2,
@@ -95,6 +99,7 @@ const CLIENTS: ClientDto[] = [
 		public_key: "Pz5rT8wQ2mC4vB7nX1kL9sA0dY6eH3jF5uG8oI2bN4xW=",
 		status: status({
 			displays: 3,
+			encoders: ["software", "hardware", "gpu"],
 			hostname: "DESKTOP-7F2K",
 			os: "Windows 11 Pro",
 			tailscale_ip: "100.74.10.9",
@@ -104,6 +109,7 @@ const CLIENTS: ClientDto[] = [
 	},
 	{
 		created_at: NOW - 60 * 86400,
+		encoder: "auto",
 		enrolled: true,
 		id: "m4",
 		last_seen: NOW - 3 * 3600,
@@ -115,6 +121,7 @@ const CLIENTS: ClientDto[] = [
 	},
 	{
 		created_at: NOW - 200,
+		encoder: "auto",
 		enrolled: false,
 		id: "m5",
 		last_seen: null,
@@ -265,6 +272,7 @@ export function mockInvoke(cmd: string, args?: Record<string, unknown>): Promise
 			const result: CreateClientResult = {
 				client: {
 					created_at: NOW,
+					encoder: "auto",
 					enrolled: false,
 					id: `new-${name}`,
 					last_seen: null,
@@ -288,6 +296,7 @@ export function mockInvoke(cmd: string, args?: Record<string, unknown>): Promise
 			return delay({
 				client: {
 					created_at: NOW,
+					encoder: "auto",
 					enrolled: false,
 					id: `pair-${name}`,
 					last_seen: null,
@@ -310,6 +319,13 @@ export function mockInvoke(cmd: string, args?: Record<string, unknown>): Promise
 			} satisfies ExecResult)
 		case "client_screenshot":
 			return delay({ display: 0, height: 1, png_base64: SCREENSHOT_PNG, width: 1 } satisfies ScreenshotResult)
+		case "set_client_encoder": {
+			const c = find(id)
+			const next = args?.encoder as ClientDto["encoder"]
+			const changed = !!c && c.encoder !== next
+			if (c && next) c.encoder = next
+			return delay(changed)
+		}
 		case "get_controller_logs":
 			return delay(LOGS)
 		case "client_logs":

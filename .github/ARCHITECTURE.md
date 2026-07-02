@@ -107,10 +107,15 @@ emit the same H.264 wire format; the choice is a runtime capability, not a proto
 - **OpenH264 (software)** — the cross-platform default and universal fallback. Baseline profile
   (widest WebCodecs decode support, including WebKitGTK), bitrate-based rate control, tuned for
   low-latency screen content.
-- **Media Foundation (hardware, Windows)** — an async-MFT backend, compiled into every Windows
-  agent but **off by default at runtime** (selected only with `LIBRETETHER_ENCODER=hardware`)
-  while it's pending runtime validation on real hardware. Compile-verified in CI; one constant
-  (`DEFAULT_ENCODER_PREF`) flips it on by default once validated.
+- **Media Foundation (hardware, Windows)** — an async-MFT backend with CPU-side colour
+  conversion, plus a **GPU zero-copy** variant (`wincap_hw.rs`: DXGI → GPU BGRA→NV12 → the encoder
+  on one D3D11 device, no readback). Both compiled into every Windows agent but **never the
+  default at runtime** while pending validation on real hardware. Which encoder a session uses is
+  **chosen by the controller per machine** and sent in `SessionConfig.encoder`; the agent
+  advertises the ones it can run in `AgentStatus.encoders` (nothing is persisted agent-side), falls
+  back if a requested one can't start, and reports the actual encoder back in `SessionServer::Meta`.
+  Compile-verified in CI; making a hardware path the `Auto` default is a one-line change in
+  `build_encoder` once validated.
 - **Planned:** VAAPI/NVENC on Linux and VideoToolbox on macOS (see the README's *Planned next
   steps*).
 

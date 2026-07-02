@@ -829,6 +829,7 @@ mod tests {
 				boot_time_secs: None,
 				displays: 1,
 				tailscale_ip: None,
+				encoders: Vec::new(),
 			};
 			write_frame(&mut s_send, &ControlResponse::Status(status))
 				.await

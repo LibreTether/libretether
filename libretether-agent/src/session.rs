@@ -96,12 +96,12 @@ async fn x11_session(cfg: SessionConfig, mut send: SecureQuicSend, mut recv: Sec
 	let (raw_tx, raw_rx) = std::sync::mpsc::sync_channel::<RawFrame>(1);
 	let (out_tx, mut out_rx) = tokio::sync::mpsc::channel::<OutFrame>(2);
 
-	// Windows GPU zero-copy path (opt-in via LIBRETETHER_ENCODER=gpu): DXGI → GPU
-	// BGRA→NV12 → Media Foundation encode, all on one device, emitting OutFrames
-	// directly. It owns capture *and* encode; falls back to the CPU pipeline below if
-	// it isn't requested or can't be set up.
+	// Windows GPU zero-copy path: DXGI → GPU BGRA→NV12 → Media Foundation encode, all
+	// on one device, emitting OutFrames directly. Selected when the controller chose
+	// the `Gpu` encoder for this session; it owns capture *and* encode, and falls back
+	// to the CPU pipeline below if it can't be set up.
 	#[cfg(target_os = "windows")]
-	let hw = if crate::wincap_hw::requested() {
+	let hw = if matches!(cfg.encoder, libretether_protocol::EncoderPref::Gpu) {
 		crate::wincap_hw::try_spawn(cfg.display, shared.clone(), stop.clone(), out_tx.clone())
 	} else {
 		None

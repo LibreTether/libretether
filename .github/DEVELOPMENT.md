@@ -67,13 +67,23 @@ Releases build the agent + relay for `linux-x86_64`, `linux-aarch64`, `macos-uni
 `windows-x86_64` (see `.github/workflows/release.yml`). aarch64 uses no x86 asm, so `nasm` is
 only needed on the x86_64 targets.
 
-### Windows hardware encoder (Media Foundation)
+### Windows hardware encoders (Media Foundation)
 
-`libretether-agent/src/mf_encoder.rs` is a Windows-only H.264 backend. It's **always compiled**
-on the Windows target but **off by default at runtime** — selected only when
-`LIBRETETHER_ENCODER=hardware` is set — because it hasn't yet been validated against a real
-hardware encoder (see the module docs). The single `DEFAULT_ENCODER_PREF` constant in `encode.rs`
-is what makes it opt-in; flip it to `Hardware` once validated and it becomes the default.
+Two Windows-only H.264 backends ship in every Windows agent, both **runtime-unvalidated** and so
+never the default:
+
+- `libretether-agent/src/mf_encoder.rs` — the **Hardware** encoder: Media Foundation with CPU-side
+  colour conversion.
+- `libretether-agent/src/wincap_hw.rs` — the **GPU** (zero-copy) path: DXGI → GPU BGRA→NV12 →
+  Media Foundation, all on one D3D11 device, with no pixel readback.
+
+Which encoder a session uses is **chosen by the controller, per machine** — the *Encoder* section
+of a machine's detail drawer — and sent to the agent in `SessionConfig.encoder`; nothing is
+persisted on the agent. The agent advertises which of `software`/`hardware`/`gpu` it can actually
+run in `AgentStatus.encoders` (probed once), and the UI disables the rest. `Auto` means the agent
+picks, which is **software** until the hardware paths are validated (see `build_encoder` in
+`encode.rs`). A requested encoder that can't initialise falls back, and the agent reports the one it
+actually used back via `SessionServer::Meta`.
 
 Because it's `#[cfg(windows)]`, the Linux runner never compiles it — the Windows leg of the CI
 `rust` matrix (`.github/workflows/ci.yml`) clippies and tests the whole workspace on
@@ -97,38 +107,34 @@ Media Foundation COM plumbing is Windows-only and unit-test-free.
 
 #### Validating it on a real Windows guest
 
-The MFT path can't be exercised in CI (no GPU, no runtime), so it needs a manual pass on a
-Windows box with a hardware H.264 encoder (any recent Intel/AMD/NVIDIA GPU). Because the code
-ships in every Windows agent, **any** Windows build works — no special feature flag — and you
-drive backend selection at runtime with the **`LIBRETETHER_ENCODER`** env var:
+The MFT / GPU paths can't be exercised in CI (no GPU, no runtime), so they need a manual pass on a
+Windows box with a hardware H.264 encoder (any recent Intel/AMD/NVIDIA GPU). Because the code ships
+in every Windows agent, **any** Windows build works — no feature flag. You pick the encoder from the
+controller, which sends it to the agent per session:
 
-- `LIBRETETHER_ENCODER=hardware` — use Media Foundation (falls back to software, loudly, if it
-  can't initialise).
-- `LIBRETETHER_ENCODER=software` — force OpenH264 (the A/B baseline / a kill switch).
-- unset / `auto` — the current default, which is **software** until this is validated.
-
-1. **Run a Windows agent** with the env var set (a released build, or a local one):
-   ```powershell
-   $env:LIBRETETHER_ENCODER = "hardware"
-   .\libretether-agent.exe run --config <path>   # or set it for the installed service
-   ```
-2. **Start a live session** from the controller and confirm the header shows
-   **`Media Foundation (hardware)`** as the encoder (it comes from `ScreenEncoder::kind()`
-   via `SessionServer::Meta`). The agent also logs `h264 encoder: Media Foundation (hardware)`
+1. **Pick the encoder in the app**: open the machine → its detail drawer → **Encoder**, and choose
+   **Hardware** (or **GPU**). Choices the machine doesn't advertise as supported are disabled.
+2. **Start a live session** and confirm the header shows **`Media Foundation (hardware)`** (or
+   `… (GPU zero-copy)`) as the encoder — it comes from `ScreenEncoder::kind()` /
+   `SharedConfig::report_encoder` via `SessionServer::Meta`. The agent also logs `h264 encoder: …`
    once per session on the Logs page.
 3. **Watch the picture**: it must be correct (no green/pink tint = NV12 colour is right; no
    corruption/blockiness = the access units and in-band SPS/PPS are right) and must survive
    quality changes, resizes, and the periodic keyframes (which force an IDR via `ICodecAPI`).
 4. **Check the win**: the per-second stats line (Debug level in the Logs page) reports
-   `enc N.N ms/f`. Toggle `LIBRETETHER_ENCODER` between `hardware` and `software`, reconnect,
-   and compare — the hardware `enc` figure should be markedly lower and CPU usage should
-   drop. (Note this still does the DXGI→CPU readback and the CPU NV12 conversion; it moves the
-   *encode* to the GPU, not yet the whole pipeline — see the module docs.)
-5. **Confirm graceful fallback**: on a guest with *no* usable encoder MFT the session must
-   still work on OpenH264, with a `Media Foundation unavailable … falling back` log line.
+   `enc N.N (conv … sub … drn …) ms/f`. Switch the encoder between **Hardware**/**GPU** and
+   **Software** in the Configure section — a change restarts the session automatically — and
+   compare; the hardware/GPU `enc` figure should be markedly lower and CPU usage should drop. (The
+   **Hardware** encoder still does the DXGI→CPU readback and the CPU NV12 conversion — it moves only
+   the *encode* to the GPU; the **GPU** path removes the readback and conversion too.)
+5. **Confirm graceful fallback**: on a guest with *no* usable encoder the requested Hardware/GPU
+   encoder must fall back to OpenH264 (with a `Media Foundation unavailable … falling back` /
+   `GPU zero-copy path unavailable …` log line), and the session header must show the encoder that
+   actually ran.
 
-If all of that holds across a few GPUs, flip `DEFAULT_ENCODER_PREF` to `Hardware` in `encode.rs`
-(so it's on by default) and drop the README/ARCHITECTURE "pending validation" notes.
+When that holds across a few GPUs, make `Auto` prefer the hardware path in `build_encoder`
+(`encode.rs`) so it becomes the default, and drop the README/ARCHITECTURE "pending validation"
+notes.
 
 ## CI
 

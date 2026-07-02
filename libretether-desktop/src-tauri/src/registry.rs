@@ -4,6 +4,7 @@ use std::path::PathBuf;
 
 pub use libretether_common::now_secs;
 use libretether_protocol::crypto;
+use libretether_protocol::EncoderPref;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -29,6 +30,13 @@ pub struct Client {
 	/// One-time enrollment token, cleared after first successful enrollment.
 	pub enrollment_token: Option<String>,
 	pub last_seen: Option<u64>,
+	/// The video encoder this controller has configured this machine to use, sent to
+	/// the agent at each session start (nothing is persisted on the agent). `Auto` by
+	/// default — the agent picks. Only choices the agent advertises as supported are
+	/// offered by the UI. `#[serde(default)]` so machines saved before this migrate to
+	/// `Auto`.
+	#[serde(default)]
+	pub encoder: EncoderPref,
 }
 
 impl Client {
@@ -42,6 +50,7 @@ impl Client {
 			public_key: None,
 			enrollment_token: Some(new_token()),
 			last_seen: None,
+			encoder: EncoderPref::Auto,
 		}
 	}
 }
@@ -110,6 +119,16 @@ impl ClientStore {
 		let client = self.clients.iter_mut().find(|c| c.id == id).ok_or(AppError::NotFound)?;
 		client.name = name;
 		Ok(())
+	}
+
+	/// Set the encoder this controller wants the machine to use (sent at each session
+	/// start). Returns whether it changed, so the caller can decide to restart a live
+	/// session.
+	pub fn set_encoder(&mut self, id: Uuid, encoder: EncoderPref) -> AppResult<bool> {
+		let client = self.clients.iter_mut().find(|c| c.id == id).ok_or(AppError::NotFound)?;
+		let changed = client.encoder != encoder;
+		client.encoder = encoder;
+		Ok(changed)
 	}
 
 	/// Regenerate the one-time enrollment token (e.g. to re-deploy a client).

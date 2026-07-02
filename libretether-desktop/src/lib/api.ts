@@ -9,6 +9,7 @@ import type {
 	ControllerSummary,
 	CreateClientResult,
 	DirListing,
+	EncoderPref,
 	ExecResult,
 	InputEvent,
 	LogEntry,
@@ -76,6 +77,10 @@ export const sendInput = (id: string, event: InputEvent) => call<void>("send_inp
 export const stopControl = (id: string) => call<void>("stop_control", { id })
 export const connectRdp = (id: string) => call<void>("connect_rdp", { id })
 export const connectSsh = (id: string) => call<void>("connect_ssh", { id })
+/** Persist which encoder a machine should use (sent to the agent at the next session
+ *  start). Resolves to whether it changed — the UI restarts a live session if so. */
+export const setClientEncoder = (id: string, encoder: EncoderPref) =>
+	call<boolean>("set_client_encoder", { encoder, id })
 
 // ---------------------------------------------------------------- file transfer
 /** List a directory on a connected agent (remote pane). `path === null` seeds the

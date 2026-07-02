@@ -20,7 +20,14 @@ export interface AgentStatus {
 	boot_time_secs: number | null
 	displays: number
 	tailscale_ip: string | null
+	/** The encoders this agent can actually run (never includes "auto"). The Configure
+	 *  UI grays out anything not listed. */
+	encoders: EncoderPref[]
 }
+
+/** Which H.264 encoder the agent should use. Mirrors the Rust `EncoderPref` (serde
+ *  snake_case). `auto` = let the agent pick; the others are explicit. */
+export type EncoderPref = "auto" | "software" | "hardware" | "gpu"
 
 export interface ClientDto {
 	id: string
@@ -35,6 +42,9 @@ export interface ClientDto {
 	 *  identity, and what every connection's signature is checked against. `null`
 	 *  until the machine enrolls. */
 	public_key: string | null
+	/** The encoder this controller has configured this machine to use (persisted on
+	 *  the controller, sent to the agent at session start). */
+	encoder: EncoderPref
 }
 
 export interface CreateClientResult {
@@ -165,6 +175,9 @@ export interface SessionConfig {
 	scale: number
 	/** Adaptive mode: the agent lowers `scale` automatically when it can't keep up. */
 	auto: boolean
+	/** The encoder the agent should use. Optional here — the backend injects the
+	 *  machine's persisted choice at `start_control`, so the UI doesn't set it. */
+	encoder?: EncoderPref
 }
 
 // ---------------------------------------------------------------- logs

@@ -22,7 +22,7 @@ use std::time::{Duration, Instant};
 use image::imageops::{self, FilterType};
 use image::RgbaImage;
 use libretether_protocol::video;
-use libretether_protocol::SessionConfig;
+use libretether_protocol::{EncoderPref, SessionConfig};
 use openh264::encoder::{
 	BitRate, Encoder, EncoderConfig, FrameRate, FrameType, Profile, RateControlMode, UsageType, VuiConfig,
 };
@@ -46,6 +46,10 @@ pub struct SharedConfig {
 	max_fps: AtomicU8,
 	auto: AtomicBool,
 	force_key: AtomicBool,
+	/// The encoder the controller chose for this session (see [`EncoderPref`]). Fixed
+	/// for the session's life — a change restarts the session rather than reconfiguring
+	/// live — so it's a plain value, not an atomic.
+	encoder: EncoderPref,
 	/// The actual capture backend, reported by whichever capture thread wins (DXGI
 	/// vs GDI on Windows, xcap elsewhere, PipeWire on Wayland), and the actual video
 	/// encoder, reported by the encode thread. Set once, read by the session's Meta
@@ -63,6 +67,7 @@ impl SharedConfig {
 			auto: AtomicBool::new(cfg.auto),
 			// The first frame of a session is always a full keyframe.
 			force_key: AtomicBool::new(true),
+			encoder: cfg.encoder,
 			capture_backend: OnceLock::new(),
 			encoder_backend: OnceLock::new(),
 		})
@@ -111,6 +116,11 @@ impl SharedConfig {
 
 	fn auto(&self) -> bool {
 		self.auto.load(Ordering::Relaxed)
+	}
+
+	/// The encoder the controller chose for this session.
+	pub fn encoder_pref(&self) -> EncoderPref {
+		self.encoder
 	}
 
 	/// Frame interval target, clamped to a sane range (the capture threads use this).
@@ -193,7 +203,7 @@ pub fn run(
 		let downscale_us = prep_started.elapsed().as_micros() as u64;
 
 		if enc.is_none() || built != (bitrate, fps, cw, ch) {
-			match build_encoder(cw as usize, ch as usize, bitrate, fps) {
+			match build_encoder(shared.encoder_pref(), cw as usize, ch as usize, bitrate, fps) {
 				Ok(e) => {
 					let kind = e.kind();
 					if announced != Some(kind) {
@@ -322,47 +332,44 @@ pub(crate) trait ScreenEncoder {
 	}
 }
 
-/// Env var selecting the encoder backend at runtime (no rebuild): `software`,
-/// `hardware`, or unset/`auto` for [`DEFAULT_ENCODER_PREF`].
-const ENCODER_ENV: &str = "LIBRETETHER_ENCODER";
-
-/// The backend used when [`ENCODER_ENV`] is unset (or `auto`). **Software today**,
-/// while the Windows Media Foundation encoder is runtime-unvalidated: it's compiled
-/// into every Windows agent but only used when explicitly requested with
-/// `LIBRETETHER_ENCODER=hardware`, so an untested `unsafe` codepath can't run on a
-/// production guest by accident. Once it's confirmed on real GPUs, flip this one
-/// constant to [`EncoderPref::Hardware`] and every agent prefers it by default (still
-/// falling back to software on a guest with no usable encoder).
-const DEFAULT_ENCODER_PREF: EncoderPref = EncoderPref::Software;
-
-/// Which H.264 backend to use.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum EncoderPref {
-	/// Software OpenH264 — the cross-platform backend, and the fallback everywhere.
-	Software,
-	/// Prefer the platform's hardware encoder (Media Foundation on Windows); falls
-	/// back to software if it can't initialise or the platform has none.
-	Hardware,
+/// The encoders this agent can actually run, advertised to the controller (which
+/// grays out anything not listed). `Auto` is never included — it's always selectable
+/// and means "let the agent pick". Software is universal; the Windows hardware / GPU
+/// paths are probed once and included only when the machine can do them. Cached, since
+/// probing creates a Media Foundation transform / D3D device.
+pub fn supported_encoders() -> Vec<EncoderPref> {
+	static CACHE: OnceLock<Vec<EncoderPref>> = OnceLock::new();
+	CACHE
+		.get_or_init(|| {
+			let mut v = vec![EncoderPref::Software];
+			#[cfg(windows)]
+			{
+				if crate::mf_encoder::hardware_available() {
+					v.push(EncoderPref::Hardware);
+				}
+				if crate::wincap_hw::available() {
+					v.push(EncoderPref::Gpu);
+				}
+			}
+			v
+		})
+		.clone()
 }
 
-/// Parse [`ENCODER_ENV`]. Unset, `auto`, or anything unrecognised → the current
-/// [`DEFAULT_ENCODER_PREF`], so a typo never silently forces a backend.
-fn encoder_pref_from(value: Option<&str>) -> EncoderPref {
-	match value.map(|s| s.trim().to_ascii_lowercase()).as_deref() {
-		Some("software") | Some("sw") | Some("openh264") => EncoderPref::Software,
-		Some("hardware") | Some("hw") | Some("mf") | Some("media-foundation") => EncoderPref::Hardware,
-		_ => DEFAULT_ENCODER_PREF,
-	}
-}
-
-/// Pick the backend, honouring [`ENCODER_ENV`]. The Windows Media Foundation encoder
-/// is compiled into every Windows agent but only used when explicitly selected (it's
-/// still runtime-unvalidated — see [`crate::mf_encoder`]); everything else uses
-/// software OpenH264. Both emit the same H.264 wire format, so this is a runtime
-/// capability choice, not a protocol fallback, and a hardware encoder that won't
-/// initialise degrades to software without a version break.
-fn build_encoder(width: usize, height: usize, bitrate_kbps: u32, fps: u8) -> anyhow::Result<Box<dyn ScreenEncoder>> {
-	if encoder_pref_from(std::env::var(ENCODER_ENV).ok().as_deref()) == EncoderPref::Hardware {
+/// Build the CPU-pipeline encoder for `pref`. `Hardware` (and a `Gpu` request that
+/// fell back to the CPU pipeline) try the platform hardware encoder first, dropping to
+/// software if it won't initialise; `Software`/`Auto` use OpenH264 directly. Both emit
+/// the same H.264 wire format, so this is a runtime capability choice — a hardware
+/// encoder that won't start degrades to software without a version break. The GPU
+/// zero-copy path is handled separately (see [`crate::session`] / `wincap_hw`).
+fn build_encoder(
+	pref: EncoderPref,
+	width: usize,
+	height: usize,
+	bitrate_kbps: u32,
+	fps: u8,
+) -> anyhow::Result<Box<dyn ScreenEncoder>> {
+	if matches!(pref, EncoderPref::Hardware | EncoderPref::Gpu) {
 		#[cfg(windows)]
 		match crate::mf_encoder::MediaFoundationEncoder::new(width, height, bitrate_kbps, fps) {
 			// `run` announces the chosen backend via `kind()`; here we only note the
@@ -843,24 +850,12 @@ mod tests {
 	}
 
 	#[test]
-	fn encoder_pref_parses_and_defaults_to_software() {
-		// Unset / `auto` / anything unrecognised → the current default, never a silent
-		// forced backend. The default stays software while the hardware path is
-		// unvalidated — this assertion is the guard on that.
-		assert_eq!(
-			DEFAULT_ENCODER_PREF,
-			EncoderPref::Software,
-			"hardware must stay opt-in until validated"
-		);
-		assert_eq!(encoder_pref_from(None), DEFAULT_ENCODER_PREF);
-		assert_eq!(encoder_pref_from(Some("auto")), DEFAULT_ENCODER_PREF);
-		assert_eq!(encoder_pref_from(Some("gpu")), DEFAULT_ENCODER_PREF);
-		for sw in ["software", "SW", " OpenH264 "] {
-			assert_eq!(encoder_pref_from(Some(sw)), EncoderPref::Software, "{sw:?}");
-		}
-		for hw in ["hardware", "hw", "mf", "Media-Foundation"] {
-			assert_eq!(encoder_pref_from(Some(hw)), EncoderPref::Hardware, "{hw:?}");
-		}
+	fn supported_encoders_always_includes_software() {
+		// Software is the universal backend; the platform-specific ones are probed. On
+		// this (non-Windows CI) build the list is exactly software, and never `Auto`.
+		let v = supported_encoders();
+		assert!(v.contains(&EncoderPref::Software));
+		assert!(!v.contains(&EncoderPref::Auto), "Auto is implicit, never advertised");
 	}
 
 	#[test]

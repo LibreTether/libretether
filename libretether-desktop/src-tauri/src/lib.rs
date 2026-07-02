@@ -77,6 +77,7 @@ pub fn run() {
 			commands::client_screenshot,
 			commands::start_control,
 			commands::configure_control,
+			commands::set_client_encoder,
 			commands::send_input,
 			commands::stop_control,
 			commands::connect_rdp,

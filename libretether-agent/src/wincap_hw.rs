@@ -1,4 +1,4 @@
-//! Zero-copy Windows hardware capture + encode (opt-in: `LIBRETETHER_ENCODER=gpu`).
+//! Zero-copy Windows hardware capture + encode (the controller's `Gpu` encoder).
 //!
 //! Keeps the frame on the GPU end to end. DXGI Desktop Duplication hands us a BGRA
 //! D3D11 texture; a **video processor** converts (and downscales) it to NV12 on the
@@ -16,7 +16,7 @@
 //! **Status: written but runtime-unvalidated** — like the CPU MF encoder was. It
 //! compiles against the Windows API surface; the on-GPU behaviour (view/format
 //! negotiation, the async encoder's texture lifetime) needs validation on real
-//! hardware. Until then it only runs when explicitly requested.
+//! hardware. Until then it only runs when the controller selects the `Gpu` encoder.
 
 use std::mem::ManuallyDrop;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -68,12 +68,53 @@ use crate::mf_encoder::{
 /// texture it's still reading — a small ring gives it room while we blt the next.
 const NV12_POOL: usize = 4;
 
-/// Whether the zero-copy GPU path was explicitly requested.
-pub fn requested() -> bool {
-	matches!(
-		std::env::var("LIBRETETHER_ENCODER").ok().as_deref().map(str::trim),
-		Some("gpu") | Some("hardware-gpu") | Some("zerocopy")
-	)
+/// Whether the zero-copy GPU path can be set up on this machine (cached): a D3D11
+/// device with video support, a video device, a BGRA→NV12-capable video processor,
+/// and a Media Foundation H.264 encoder. Advertised to the controller as the `Gpu`
+/// encoder capability. The real per-session setup still falls back if something fails.
+pub(crate) fn available() -> bool {
+	static OK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+	*OK.get_or_init(|| unsafe { probe().is_ok() })
+}
+
+/// Lightweight probe for [`available`]: create the device + video device + a video
+/// processor enumerator (no duplication, no encoder streaming) and confirm an H.264
+/// MFT exists.
+unsafe fn probe() -> Result<()> {
+	ensure_mf_started()?;
+	let mut device: Option<ID3D11Device> = None;
+	D3D11CreateDevice(
+		None,
+		D3D_DRIVER_TYPE_HARDWARE,
+		HMODULE::default(),
+		D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_VIDEO_SUPPORT,
+		None,
+		D3D11_SDK_VERSION,
+		Some(&mut device),
+		None,
+		None,
+	)?;
+	let device = device.ok_or_else(|| anyhow!("no device"))?;
+	let vdevice: ID3D11VideoDevice = device.cast()?;
+	let content = D3D11_VIDEO_PROCESSOR_CONTENT_DESC {
+		InputFrameFormat: D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE,
+		InputFrameRate: DXGI_RATIONAL {
+			Numerator: 60,
+			Denominator: 1,
+		},
+		InputWidth: 640,
+		InputHeight: 480,
+		OutputFrameRate: DXGI_RATIONAL {
+			Numerator: 60,
+			Denominator: 1,
+		},
+		OutputWidth: 640,
+		OutputHeight: 480,
+		Usage: D3D11_VIDEO_USAGE_PLAYBACK_NORMAL,
+	};
+	let _enumerator = vdevice.CreateVideoProcessorEnumerator(&content)?;
+	create_h264_encoder()?;
+	Ok(())
 }
 
 /// Try to bring up the zero-copy pipeline and, on success, spawn its capture+encode

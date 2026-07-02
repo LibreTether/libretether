@@ -43,6 +43,9 @@ function Shell({ active, onExit }: { active: ActiveInfo; onExit: () => void }) {
 	// The live-session overlay, or null. `watch` opens it read-only: it receives the
 	// stream but forwards no input (see ControlOverlay's `readOnly`).
 	const [controlSession, setControlSession] = useState<{ id: string; watch: boolean } | null>(null)
+	// Bumped to force the live-session overlay to remount (tear down + restart the
+	// stream) — e.g. after the machine's encoder is changed.
+	const [controlNonce, setControlNonce] = useState(0)
 	const [detailId, setDetailId] = useState<string | null>(null)
 	const [transferId, setTransferId] = useState<string | null>(null)
 	const [transfersOpen, setTransfersOpen] = useState(false)
@@ -266,7 +269,15 @@ function Shell({ active, onExit }: { active: ActiveInfo; onExit: () => void }) {
 			<ShortcutsOverlay onClose={() => setShortcutsOpen(false)} open={shortcutsOpen} />
 			<AddMachineDrawer active={active} onClose={() => setAddOpen(false)} onCreated={reload} open={addOpen} />
 			{detail && (
-				<DetailDrawer active={active} client={detail} key={detail.id} onClose={() => setDetailId(null)} open />
+				<DetailDrawer
+					active={active}
+					client={detail}
+					controlling={controlSession?.id === detail.id}
+					key={detail.id}
+					onClose={() => setDetailId(null)}
+					onRestartSession={() => setControlNonce((n) => n + 1)}
+					open
+				/>
 			)}
 			{deploy && (
 				<Drawer
@@ -288,6 +299,7 @@ function Shell({ active, onExit }: { active: ActiveInfo; onExit: () => void }) {
 			{control && (
 				<ControlOverlay
 					client={control}
+					key={`${control.id}:${controlNonce}`}
 					onClose={() => setControlSession(null)}
 					readOnly={controlSession?.watch}
 				/>

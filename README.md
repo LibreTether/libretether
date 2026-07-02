@@ -174,10 +174,12 @@ path in progress; see below.
 ## Planned next steps
 
 - **Hardware video encoding on Windows (Media Foundation).** Finish the GPU H.264 path on
-  Windows guests. A Media Foundation encoder backend is written and ships in every Windows agent,
-  but it needs runtime validation on real hardware before it's switched on by default — today it's
-  off unless `LIBRETETHER_ENCODER=hardware` is set, with software OpenH264 as the automatic
-  fallback.
+  Windows guests. Two Media Foundation backends are written and ship in every Windows agent — a
+  hardware encoder with CPU colour conversion, and a **GPU zero-copy** path (DXGI → GPU convert →
+  encode on one device) — but they need runtime validation on real hardware before either becomes
+  the default. You already choose the encoder **per machine from the controller** (Machine →
+  Configure → Encoder), which grays out anything the guest doesn't support; software OpenH264 stays
+  the automatic fallback and the session header shows the encoder actually in use.
 
 - **Hardware video encoding on Linux (VAAPI & NVENC).** Offload H.264 encoding to the GPU on
   Linux guests — VAAPI for Intel/AMD, NVENC for NVIDIA — to cut CPU cost and unlock higher

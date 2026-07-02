@@ -5,18 +5,20 @@
 //! and the Windows leg of the CI `rust` matrix rebuilds and tests it on
 //! `windows-latest` on every push so it can't rot. It has **not** yet been run
 //! against a real hardware encoder. It's compiled
-//! into **every** Windows agent but **off by default at runtime**: the encoder is
-//! only selected when `LIBRETETHER_ENCODER=hardware` is set (see
-//! [`crate::encode::build_encoder`] / `DEFAULT_ENCODER_PREF`), so this untested
-//! `unsafe` COM path can't run on a production guest by accident. If
+//! into **every** Windows agent but **never the default at runtime**: it's used only
+//! when the controller selects the `Hardware` encoder for a session (see
+//! [`crate::encode::build_encoder`] and [`libretether_protocol::EncoderPref`]), so this
+//! untested `unsafe` COM path can't run on a production guest by accident. If
 //! [`MediaFoundationEncoder::new`] returns `Err` the encoder falls back to software
-//! OpenH264, so even an explicit opt-in degrades safely rather than breaking the
-//! session. Once it's confirmed on real GPUs, flipping the one `DEFAULT_ENCODER_PREF`
-//! constant turns it on by default.
+//! OpenH264, so even an explicit choice degrades safely rather than breaking the
+//! session. Once it's confirmed on real GPUs, making `Auto` prefer it in
+//! `build_encoder` turns it on by default.
 //!
-//! To **validate on a Windows guest**, run any agent built for Windows with
-//! `LIBRETETHER_ENCODER=hardware` and A/B it against `=software`; no special build or
-//! feature flag is needed. See `.github/DEVELOPMENT.md` for the full recipe and what
+//! To **validate on a Windows guest**, run any agent built for Windows and pick the
+//! `Hardware` encoder for that machine from the controller (its Configure section),
+//! A/B'ing against `Software`; no special build or feature flag is needed (the agent
+//! advertises the encoders it can run — see [`hardware_available`]). See
+//! `.github/DEVELOPMENT.md` for the full recipe and what
 //! to observe. The parts to scrutinise in that pass: the async-MFT event loop (this
 //! drives the transform by *polling* its event queue and feeding one sample per call
 //! rather than the strict wait-for-`METransformNeedInput` model — the first thing to
@@ -49,6 +51,14 @@ use windows::Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED};
 use windows::Win32::System::Variant::VARIANT;
 
 use crate::encode::{rgba_to_nv12, starts_with_sps, ScreenEncoder};
+
+/// Whether a Media Foundation H.264 encoder MFT can be created on this machine
+/// (cached — creating one is not free). Advertised to the controller as the
+/// `Hardware` encoder capability.
+pub(crate) fn hardware_available() -> bool {
+	static OK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+	*OK.get_or_init(|| unsafe { ensure_mf_started().is_ok() && create_h264_encoder().is_ok() })
+}
 
 /// Process-wide MF/COM init. MFStartup is refcounted, but doing it once for the
 /// agent's lifetime is simplest and matches how the capture thread lives.
