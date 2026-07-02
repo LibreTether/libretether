@@ -95,10 +95,31 @@ async fn x11_session(cfg: SessionConfig, mut send: SecureQuicSend, mut recv: Sec
 	// Single-slot capture→encode hop (newest wins) and a small encode→write hop.
 	let (raw_tx, raw_rx) = std::sync::mpsc::sync_channel::<RawFrame>(1);
 	let (out_tx, mut out_rx) = tokio::sync::mpsc::channel::<OutFrame>(2);
-	let capture = spawn_capture(cfg.display, shared.clone(), stop.clone(), raw_tx);
-	let encoder = {
-		let shared = shared.clone();
-		std::thread::spawn(move || encode::run(raw_rx, out_tx, shared))
+
+	// Windows GPU zero-copy path (opt-in via LIBRETETHER_ENCODER=gpu): DXGI → GPU
+	// BGRA→NV12 → Media Foundation encode, all on one device, emitting OutFrames
+	// directly. It owns capture *and* encode; falls back to the CPU pipeline below if
+	// it isn't requested or can't be set up.
+	#[cfg(target_os = "windows")]
+	let hw = if crate::wincap_hw::requested() {
+		crate::wincap_hw::try_spawn(cfg.display, shared.clone(), stop.clone(), out_tx.clone())
+	} else {
+		None
+	};
+	#[cfg(not(target_os = "windows"))]
+	let hw: Option<std::thread::JoinHandle<()>> = None;
+
+	// The CPU pipeline (capture thread + encode thread) — used unless the GPU path took
+	// over. `capture`/`encoder` are `None` in that case.
+	let (capture, encoder) = if hw.is_some() {
+		(None, None)
+	} else {
+		let capture = spawn_capture(cfg.display, shared.clone(), stop.clone(), raw_tx);
+		let encoder = {
+			let shared = shared.clone();
+			Some(std::thread::spawn(move || encode::run(raw_rx, out_tx, shared)))
+		};
+		(Some(capture), encoder)
 	};
 
 	let reader = {
@@ -169,8 +190,15 @@ async fn x11_session(cfg: SessionConfig, mut send: SecureQuicSend, mut recv: Sec
 	reader.abort();
 	let _ = injector.send(InjectCmd::Stop);
 	let _ = injector_thread.join();
-	let _ = capture.join();
-	let _ = encoder.join();
+	if let Some(capture) = capture {
+		let _ = capture.join();
+	}
+	if let Some(encoder) = encoder {
+		let _ = encoder.join();
+	}
+	if let Some(hw) = hw {
+		let _ = hw.join();
+	}
 	Ok(())
 }
 

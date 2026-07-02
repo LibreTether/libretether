@@ -97,15 +97,15 @@ impl SharedConfig {
 		self.force_key.store(true, Ordering::Relaxed);
 	}
 
-	fn take_force_key(&self) -> bool {
+	pub fn take_force_key(&self) -> bool {
 		self.force_key.swap(false, Ordering::Relaxed)
 	}
 
-	fn bitrate_kbps(&self) -> u32 {
+	pub fn bitrate_kbps(&self) -> u32 {
 		self.bitrate_kbps.load(Ordering::Relaxed)
 	}
 
-	fn scale(&self) -> u8 {
+	pub fn scale(&self) -> u8 {
 		self.scale.load(Ordering::Relaxed)
 	}
 
@@ -131,6 +131,11 @@ pub struct RawFrame {
 	/// Microseconds the producing thread spent obtaining this frame — fed into the
 	/// per-stage stats so capture cost is visible alongside encode/network.
 	pub capture_us: u64,
+	/// The producer guarantees this frame differs from the one before it, so the
+	/// encoder can skip its whole-frame dedup hash. Set by DXGI capture (which only
+	/// wakes on an actual desktop present); the polling GDI/xcap backends leave it
+	/// false so the hash still catches an unchanged poll.
+	pub pre_deduped: bool,
 }
 
 /// An encoded frame ready to write to the session stream.
@@ -210,10 +215,16 @@ pub fn run(
 		// Static-frame gate: an identical frame emits nothing, holding an idle
 		// screen at zero bandwidth and skipping the encode. A forced keyframe or a
 		// dimension change always re-encodes.
-		let hash_started = Instant::now();
-		let hash = frame_hash(scaled.as_raw());
-		let hash_us = hash_started.elapsed().as_micros() as u64;
-		if !force_key && last_hash == Some(hash) && last_dims == (cw, ch) {
+		// Producers that only emit changed frames (DXGI) mark them `pre_deduped`, so we
+		// skip the whole-frame hash entirely there; the polling backends still hash.
+		let (hash, hash_us) = if raw.pre_deduped {
+			(None, 0)
+		} else {
+			let hash_started = Instant::now();
+			let h = frame_hash(scaled.as_raw());
+			(Some(h), hash_started.elapsed().as_micros() as u64)
+		};
+		if !force_key && hash.is_some() && hash == last_hash && last_dims == (cw, ch) {
 			stats.record_skip(&raw, downscale_us, hash_us);
 			stats.maybe_log(eff_scale, bitrate);
 			continue;
@@ -226,7 +237,7 @@ pub fn run(
 		let encode_us = enc_started.elapsed().as_micros() as u64;
 		// Sub-phase breakdown of that encode (convert/codec/drain), for the stats line.
 		let phases = encoder.last_phases();
-		last_hash = Some(hash);
+		last_hash = hash;
 		last_dims = (cw, ch);
 
 		let (is_key, au) = match result {
@@ -376,6 +387,10 @@ struct OpenH264Encoder {
 	yuv: I420,
 	width: usize,
 	height: usize,
+	/// Sub-phase timing (µs) of the last `encode`: (convert, encode, 0). Software has
+	/// no separate drain stage, so the third slot is always zero. See
+	/// [`ScreenEncoder::last_phases`].
+	last_phases: (u64, u64, u64),
 }
 
 impl OpenH264Encoder {
@@ -399,7 +414,10 @@ impl OpenH264Encoder {
 			// warns); set explicitly to keep the logs clean.
 			.adaptive_quantization(false)
 			.background_detection(false)
-			.num_threads(1);
+			// Slice-parallel encode across a few cores instead of one. Capped: more
+			// slices cost a little compression efficiency, and colour conversion (rayon)
+			// and capture also want cores. 1 on a single-core guest.
+			.num_threads(encode_threads());
 		let enc = Encoder::with_api_config(OpenH264API::from_source(), config)
 			.map_err(|e| anyhow::anyhow!("openh264 init: {e}"))?;
 		Ok(Self {
@@ -407,6 +425,7 @@ impl OpenH264Encoder {
 			yuv: I420::new(width, height),
 			width,
 			height,
+			last_phases: (0, 0, 0),
 		})
 	}
 }
@@ -422,12 +441,18 @@ impl ScreenEncoder for OpenH264Encoder {
 			self.enc.force_intra_frame();
 		}
 		// RGBA → I420 (BT.601 limited range; signalled via the encoder's VUI).
+		let t = Instant::now();
 		rgba_to_i420(rgba, w, h, &mut self.yuv);
+		let convert_us = t.elapsed().as_micros() as u64;
 		let slices = self.yuv.as_slices();
+		let t = Instant::now();
 		let bs = self
 			.enc
 			.encode(&slices)
 			.map_err(|e| anyhow::anyhow!("openh264 encode: {e}"))?;
+		let encode_us = t.elapsed().as_micros() as u64;
+		// (convert, encode, drain): software has no separate drain stage.
+		self.last_phases = (convert_us, encode_us, 0);
 		let au = bs.to_vec();
 		if au.is_empty() {
 			return Ok(None);
@@ -437,6 +462,10 @@ impl ScreenEncoder for OpenH264Encoder {
 
 	fn kind(&self) -> &'static str {
 		"OpenH264 (software)"
+	}
+
+	fn last_phases(&self) -> (u64, u64, u64) {
+		self.last_phases
 	}
 }
 
@@ -501,41 +530,41 @@ fn rgba_to_i420(rgba: &[u8], w: usize, h: usize, dst: &mut I420) {
 	let (y_plane, uv) = dst.data.split_at_mut(w * h);
 	let (u_plane, v_plane) = uv.split_at_mut(cw * ch);
 
-	y_plane.par_chunks_mut(w).enumerate().for_each(|(row, yrow)| {
-		let base = row * w * 4;
-		for (x, y) in yrow.iter_mut().enumerate() {
-			let p = base + x * 4;
-			let (r, g, b) = (rgba[p] as i32, rgba[p + 1] as i32, rgba[p + 2] as i32);
+	y_plane.par_chunks_exact_mut(w).enumerate().for_each(|(row, yrow)| {
+		// Slice the row once so the per-pixel reads are bounds-check-free.
+		let row_rgba = &rgba[row * w * 4..(row + 1) * w * 4];
+		for (px, y) in row_rgba.chunks_exact(4).zip(yrow.iter_mut()) {
+			let (r, g, b) = (px[0] as i32, px[1] as i32, px[2] as i32);
 			*y = clamp8(((66 * r + 129 * g + 25 * b + 128) >> 8) + 16);
 		}
 	});
 
 	let _ = ch;
 	u_plane
-		.par_chunks_mut(cw)
-		.zip(v_plane.par_chunks_mut(cw))
+		.par_chunks_exact_mut(cw)
+		.zip(v_plane.par_chunks_exact_mut(cw))
 		.enumerate()
 		.for_each(|(crow, (urow, vrow))| {
 			let y0 = crow * 2;
+			// Slice the two source rows once so the 2×2 block reads stay within bounds.
+			let row0 = &rgba[y0 * w * 4..(y0 + 1) * w * 4];
+			let row1 = &rgba[(y0 + 1) * w * 4..(y0 + 2) * w * 4];
 			for cx in 0..cw {
-				let x0 = cx * 2;
-				let (mut r, mut g, mut b) = (0i32, 0i32, 0i32);
-				for dy in 0..2 {
-					let row_base = (y0 + dy) * w * 4;
-					for dx in 0..2 {
-						let p = row_base + (x0 + dx) * 4;
-						r += rgba[p] as i32;
-						g += rgba[p + 1] as i32;
-						b += rgba[p + 2] as i32;
-					}
-				}
-				r >>= 2;
-				g >>= 2;
-				b >>= 2;
+				let o = cx * 8; // 2 px × 4 bytes
+				let r = (row0[o] as i32 + row0[o + 4] as i32 + row1[o] as i32 + row1[o + 4] as i32) >> 2;
+				let g = (row0[o + 1] as i32 + row0[o + 5] as i32 + row1[o + 1] as i32 + row1[o + 5] as i32) >> 2;
+				let b = (row0[o + 2] as i32 + row0[o + 6] as i32 + row1[o + 2] as i32 + row1[o + 6] as i32) >> 2;
 				urow[cx] = clamp8(((-38 * r - 74 * g + 112 * b + 128) >> 8) + 128);
 				vrow[cx] = clamp8(((112 * r - 94 * g - 18 * b + 128) >> 8) + 128);
 			}
 		});
+}
+
+/// OpenH264 encode thread count: a few cores (slice-parallel), capped at 4 so the
+/// per-slice compression cost stays small and colour conversion (rayon) plus capture
+/// keep cores. Falls back to 1 on a single-core guest or if the count is unknown.
+fn encode_threads() -> u16 {
+	std::thread::available_parallelism().map_or(1, |n| n.get().min(4)) as u16
 }
 
 #[inline]
@@ -554,20 +583,22 @@ fn clamp8(v: i32) -> u8 {
 #[allow(dead_code)]
 pub(crate) fn rgba_to_nv12(rgba: &[u8], w: usize, h: usize, dst: &mut [u8]) {
 	let (y_plane, uv_plane) = dst.split_at_mut(w * h);
-	// Y plane: iterate row/pixel slices with `chunks_exact` so the bounds checks are
-	// elided and the inner loop autovectorizes — this pass is ~w·h iterations and was
-	// the dominant CPU cost of the encode path. Same BT.601 integer math as before.
-	for (row_rgba, row_y) in rgba.chunks_exact(w * 4).zip(y_plane.chunks_exact_mut(w)) {
-		for (px, y) in row_rgba.chunks_exact(4).zip(row_y.iter_mut()) {
-			let (r, g, b) = (px[0] as i32, px[1] as i32, px[2] as i32);
-			*y = clamp8(((66 * r + 129 * g + 25 * b + 128) >> 8) + 16);
-		}
-	}
-	// Chroma (NV12 interleaved U,V): one 2×2 box-average per output pair. Each chroma
-	// row is `w` bytes (w/2 U + w/2 V). Slice the two source rows once so the block
-	// reads stay within fixed-length subslices.
+	// Y plane: one row per rayon task, `chunks_exact` inside to elide bounds checks and
+	// vectorize. This matches `rgba_to_i420` — the hardware NV12 path shouldn't be
+	// single-threaded while the software I420 path fans out across cores.
+	rgba.par_chunks_exact(w * 4)
+		.zip(y_plane.par_chunks_exact_mut(w))
+		.for_each(|(row_rgba, row_y)| {
+			for (px, y) in row_rgba.chunks_exact(4).zip(row_y.iter_mut()) {
+				let (r, g, b) = (px[0] as i32, px[1] as i32, px[2] as i32);
+				*y = clamp8(((66 * r + 129 * g + 25 * b + 128) >> 8) + 16);
+			}
+		});
+	// Chroma (NV12 interleaved U,V): one 2×2 box-average per output pair, one chroma
+	// row per task. Each chroma row is `w` bytes (w/2 U + w/2 V); slice the two source
+	// rows once so the block reads stay within fixed-length subslices.
 	let cw = w / 2;
-	for (cy, uv_row) in uv_plane.chunks_exact_mut(w).enumerate() {
+	uv_plane.par_chunks_exact_mut(w).enumerate().for_each(|(cy, uv_row)| {
 		let row0 = &rgba[(cy * 2) * w * 4..(cy * 2 + 1) * w * 4];
 		let row1 = &rgba[(cy * 2 + 1) * w * 4..(cy * 2 + 2) * w * 4];
 		for cx in 0..cw {
@@ -578,7 +609,7 @@ pub(crate) fn rgba_to_nv12(rgba: &[u8], w: usize, h: usize, dst: &mut [u8]) {
 			uv_row[cx * 2] = clamp8(((-38 * r - 74 * g + 112 * b + 128) >> 8) + 128);
 			uv_row[cx * 2 + 1] = clamp8(((112 * r - 94 * g - 18 * b + 128) >> 8) + 128);
 		}
-	}
+	});
 }
 
 /// Cheap check: does the Annex-B access unit *start* with an SPS NAL (type 7)? Media

@@ -120,6 +120,8 @@ fn run(
 					// On Wayland the compositor pushes frames, so "capture" cost here is
 					// the packed-buffer→RGBA conversion (the PipeWire wait isn't ours).
 					capture_us: convert_started.elapsed().as_micros() as u64,
+					// The portal can re-deliver an unchanged buffer, so keep the dedup hash.
+					pre_deduped: false,
 				};
 				match user_data.tx.try_send(raw) {
 					Ok(()) => user_data.last_emit = Some(Instant::now()),

@@ -104,6 +104,8 @@ pub fn poll_loop(display: u32, shared: Arc<SharedConfig>, stop: Arc<AtomicBool>,
 					origin_y: cap.origin_y,
 					rgba: cap.image,
 					capture_us: started.elapsed().as_micros() as u64,
+					// Polling capture can return an unchanged frame, so keep the dedup hash.
+					pre_deduped: false,
 				};
 				match tx.try_send(raw) {
 					// Encoder busy — drop this frame, the next capture is fresher.

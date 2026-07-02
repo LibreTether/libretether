@@ -54,7 +54,7 @@ use crate::encode::{rgba_to_nv12, starts_with_sps, ScreenEncoder};
 /// agent's lifetime is simplest and matches how the capture thread lives.
 static MF_INIT: Once = Once::new();
 
-fn ensure_mf_started() -> Result<()> {
+pub(crate) fn ensure_mf_started() -> Result<()> {
 	let mut result = Ok(());
 	MF_INIT.call_once(|| {
 		unsafe {
@@ -299,12 +299,23 @@ impl ScreenEncoder for MediaFoundationEncoder {
 			let convert_us = t.elapsed().as_micros() as u64;
 			self.frame_index += 1;
 
-			// Submit: feed one input to the codec.
+			// Submit: feed one input to the codec. An async MFT often rejects input with
+			// MF_E_NOTACCEPTING until its ready output is drained — so rather than dropping
+			// the frame on the spot (which was costing us roughly half the frames), drain
+			// the pending output to free the pipeline and retry the feed once. Only if it
+			// still won't accept do we drop this frame's input (staying real-time); any
+			// output already drained is still returned below.
+			let mut outputs = Vec::new();
 			let t = Instant::now();
 			match self.transform.ProcessInput(0, &sample, 0) {
 				Ok(()) => {}
 				Err(e) if e.code() == MF_E_NOTACCEPTING => {
-					// Encoder is backed up; drain and drop this frame (stay real-time).
+					self.drain_outputs(&mut outputs)?;
+					match self.transform.ProcessInput(0, &sample, 0) {
+						Ok(()) => {}
+						Err(e) if e.code() == MF_E_NOTACCEPTING => {} // still full — drop this input
+						Err(e) => bail!("ProcessInput failed: {e}"),
+					}
 				}
 				Err(e) => bail!("ProcessInput failed: {e}"),
 			}
@@ -313,7 +324,6 @@ impl ScreenEncoder for MediaFoundationEncoder {
 			// Drain: collect whatever the encoder has ready (async — often this frame's
 			// output arrives on a later call).
 			let t = Instant::now();
-			let mut outputs = Vec::new();
 			self.drain_outputs(&mut outputs)?;
 			let drain_us = t.elapsed().as_micros() as u64;
 			self.last_phases = (convert_us, submit_us, drain_us);
@@ -357,7 +367,7 @@ impl Drop for MediaFoundationEncoder {
 /// Enumerate video H.264 encoders, preferring a hardware MFT, and activate the
 /// first one. Falls back to any (software) encoder if no hardware MFT is present —
 /// though in that case the caller would do just as well with OpenH264.
-unsafe fn create_h264_encoder() -> Result<IMFTransform> {
+pub(crate) unsafe fn create_h264_encoder() -> Result<IMFTransform> {
 	let output_info = MFT_REGISTER_TYPE_INFO {
 		guidMajorType: MFMediaType_Video,
 		guidSubtype: MFVideoFormat_H264,
@@ -396,7 +406,7 @@ unsafe fn create_h264_encoder() -> Result<IMFTransform> {
 }
 
 /// Build the H.264 output media type (subtype, bitrate, frame size, rate, profile).
-unsafe fn build_output_type(w: u32, h: u32, bitrate_kbps: u32, fps: u32) -> Result<IMFMediaType> {
+pub(crate) unsafe fn build_output_type(w: u32, h: u32, bitrate_kbps: u32, fps: u32) -> Result<IMFMediaType> {
 	let t = MFCreateMediaType()?;
 	t.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)?;
 	t.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_H264)?;
@@ -411,7 +421,7 @@ unsafe fn build_output_type(w: u32, h: u32, bitrate_kbps: u32, fps: u32) -> Resu
 }
 
 /// Build the NV12 input media type matching the output geometry.
-unsafe fn build_input_type(w: u32, h: u32, fps: u32) -> Result<IMFMediaType> {
+pub(crate) unsafe fn build_input_type(w: u32, h: u32, fps: u32) -> Result<IMFMediaType> {
 	let t = MFCreateMediaType()?;
 	t.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)?;
 	t.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_NV12)?;
@@ -423,7 +433,7 @@ unsafe fn build_input_type(w: u32, h: u32, fps: u32) -> Result<IMFMediaType> {
 }
 
 /// Read the encoder's out-of-band SPS/PPS (`MF_MT_MPEG_SEQUENCE_HEADER`), if any.
-unsafe fn read_sequence_header(transform: &IMFTransform) -> Result<Vec<u8>> {
+pub(crate) unsafe fn read_sequence_header(transform: &IMFTransform) -> Result<Vec<u8>> {
 	let out_type = transform.GetOutputCurrentType(0)?;
 	let size = out_type.GetBlobSize(&MF_MT_MPEG_SEQUENCE_HEADER)?;
 	if size == 0 {
@@ -435,19 +445,19 @@ unsafe fn read_sequence_header(transform: &IMFTransform) -> Result<Vec<u8>> {
 }
 
 /// `MF_MT_FRAME_SIZE` packs width/height into the high/low halves of a u64 attribute.
-unsafe fn set_frame_size(t: &IMFMediaType, w: u32, h: u32) -> Result<()> {
+pub(crate) unsafe fn set_frame_size(t: &IMFMediaType, w: u32, h: u32) -> Result<()> {
 	t.SetUINT64(&MF_MT_FRAME_SIZE, ((w as u64) << 32) | h as u64)?;
 	Ok(())
 }
 
 /// A ratio attribute (numerator:denominator) is likewise packed into a u64.
-unsafe fn set_ratio(t: &IMFMediaType, key: &GUID, num: u32, den: u32) -> Result<()> {
+pub(crate) unsafe fn set_ratio(t: &IMFMediaType, key: &GUID, num: u32, den: u32) -> Result<()> {
 	t.SetUINT64(key, ((num as u64) << 32) | den as u64)?;
 	Ok(())
 }
 
 /// Copy an `IMFSample`'s single contiguous buffer into a `Vec`.
-unsafe fn sample_to_vec(sample: &IMFSample) -> Result<Vec<u8>> {
+pub(crate) unsafe fn sample_to_vec(sample: &IMFSample) -> Result<Vec<u8>> {
 	let buffer = sample.ConvertToContiguousBuffer()?;
 	let mut ptr = std::ptr::null_mut::<u8>();
 	let mut len = 0u32;

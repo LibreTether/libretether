@@ -75,8 +75,13 @@ pub async fn write_message<W: AsyncWrite + Unpin>(w: &mut W, body: &[u8]) -> std
 	if body.len() as u64 > MAX_FRAME as u64 {
 		return Err(invalid(format!("session message too large: {} bytes", body.len())));
 	}
-	w.write_all(&(body.len() as u32).to_be_bytes()).await?;
-	w.write_all(body).await?;
+	// One buffer, one write: the 4-byte length prefix rides with the body instead of
+	// becoming its own tiny AEAD record on the secured stream (two `write_all`s seal
+	// two ChaCha20 records per frame — a wasteful extra ~40 bytes + encrypt each frame).
+	let mut buf = Vec::with_capacity(4 + body.len());
+	buf.extend_from_slice(&(body.len() as u32).to_be_bytes());
+	buf.extend_from_slice(body);
+	w.write_all(&buf).await?;
 	w.flush().await?;
 	Ok(())
 }
