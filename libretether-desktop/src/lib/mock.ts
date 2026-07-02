@@ -15,7 +15,9 @@ import type {
 	LogEntry,
 	PairingStarted,
 	ScreenshotResult,
-	Settings
+	Settings,
+	TenantCredentials,
+	TenantInfo
 } from "./types"
 
 const NOW = Math.floor(Date.now() / 1000)
@@ -298,6 +300,20 @@ export function mockInvoke(cmd: string, args?: Record<string, unknown>): Promise
 					ts_secs: NOW - 40
 				}
 			] satisfies LogEntry[])
+		case "provision_relay_tenant":
+			return delay({
+				agent_secret: "agent-mock-secret-000000",
+				name: (args?.name as string) ?? "tenant",
+				owner_secret: "owner-mock-secret-000000",
+				tenant_id: "tnt_mock01"
+			} satisfies TenantCredentials)
+		case "list_relay_tenants":
+			return delay([
+				{ agents_online: 2, controller_online: true, name: "team-a", tenant_id: "tnt_mock01" },
+				{ agents_online: 0, controller_online: false, name: "team-b", tenant_id: "tnt_mock02" }
+			] satisfies TenantInfo[])
+		case "revoke_relay_tenant":
+			return delay(true)
 		case "set_settings":
 			settings.rdp_client = (args?.rdpClient as string | null) ?? null
 			settings.terminal = (args?.terminal as string | null) ?? null

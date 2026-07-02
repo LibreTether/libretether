@@ -2,11 +2,14 @@
 //! commands operate on saved profiles; everything else operates on the single
 //! currently-active controller (and errors if none is connected).
 
+use libretether_protocol::crypto::Identity;
 use libretether_protocol::frame::write_frame;
 use libretether_protocol::pairing::{controller_pair, PairBundle, PairingCode};
-use libretether_protocol::relay::RelayRequest;
+use libretether_protocol::relay::{
+	self, AdminRequest, AdminResponse, RelayRequest, RelayRole, TenantCredentials, TenantInfo,
+};
 use libretether_protocol::{
-	AgentStatus, ControlRequest, ControlResponse, ExecResult, InputEvent, ScreenshotResult, SessionConfig,
+	tls, AgentStatus, ControlRequest, ControlResponse, ExecResult, InputEvent, ScreenshotResult, SessionConfig,
 	DEFAULT_PORT, PROTOCOL_VERSION,
 };
 use serde::Serialize;
@@ -614,6 +617,84 @@ async fn run_controller_pairing(
 fn portal_url_for(relay_addr: &str) -> String {
 	let host = relay_addr.rsplit_once(':').map_or(relay_addr, |(h, _)| h);
 	format!("https://{host}")
+}
+
+// ------------------------------------------------------ multi-tenant provisioning
+
+/// Dial a relay and complete the admin handshake, so the caller can issue
+/// [`AdminRequest`]s. `admin_secret` is the relay's admin secret; an empty string is
+/// sent as-is for a relay with open registration (which admits it provision-only).
+/// The [`Endpoint`] is returned alongside the connection so the caller keeps it alive
+/// for the request's duration (dropping it would tear the connection down).
+async fn admin_connect(address: &str, admin_secret: &str) -> AppResult<(quinn::Endpoint, quinn::Connection)> {
+	let addr = tls::resolve(address)
+		.await
+		.map_err(|e| AppError::msg(format!("resolving {address}: {e}")))?;
+	let endpoint = tls::client_endpoint(addr).map_err(|e| AppError::msg(format!("bind endpoint: {e}")))?;
+	let conn = endpoint
+		.connect(addr, "libretether.local")
+		.map_err(|e| AppError::msg(e.to_string()))?
+		.await
+		.map_err(|e| AppError::msg(format!("connecting to relay: {e}")))?;
+	// The admin handshake needs an identity to sign the key-ownership challenge, but an
+	// admin has no persistent routing key — an ephemeral one is fine.
+	relay::client_handshake(&conn, RelayRole::Admin, admin_secret, &Identity::generate())
+		.await
+		.map_err(|e| AppError::msg(format!("relay admin handshake: {e}")))?;
+	Ok((endpoint, conn))
+}
+
+/// Send one [`AdminRequest`] over a freshly-dialled admin connection and return the
+/// relay's [`AdminResponse`], mapping an `Error` reply to an [`AppError`].
+async fn admin_do(address: &str, admin_secret: &str, req: AdminRequest) -> AppResult<AdminResponse> {
+	let (_endpoint, conn) = admin_connect(address, admin_secret).await?;
+	let resp = relay::admin_request(&conn, &req)
+		.await
+		.map_err(|e| AppError::msg(format!("relay admin request: {e}")))?;
+	Ok(resp)
+}
+
+/// Provision a new tenant on the relay at `address`, returning its freshly-generated
+/// owner + agent secrets. `admin_secret` authorises the request (or is left empty for
+/// a relay with open registration). The controller is then created with the returned
+/// secrets — the relay identifies the tenant by the owner secret it presents.
+#[tauri::command]
+pub async fn provision_relay_tenant(
+	address: String,
+	admin_secret: String,
+	name: String,
+) -> AppResult<TenantCredentials> {
+	let name = name.trim().to_string();
+	if name.is_empty() {
+		return Err(AppError::msg("Name the tenant"));
+	}
+	match admin_do(&address, &admin_secret, AdminRequest::Provision { name }).await? {
+		AdminResponse::Provisioned(creds) => Ok(creds),
+		AdminResponse::Error { message } => Err(AppError::msg(message)),
+		_ => Err(AppError::msg("unexpected response from relay")),
+	}
+}
+
+/// List the relay's tenants (ids + names + live status, no secrets). Requires the
+/// admin secret — a relay rejects this for an open-registration-only client.
+#[tauri::command]
+pub async fn list_relay_tenants(address: String, admin_secret: String) -> AppResult<Vec<TenantInfo>> {
+	match admin_do(&address, &admin_secret, AdminRequest::List).await? {
+		AdminResponse::Tenants { tenants } => Ok(tenants),
+		AdminResponse::Error { message } => Err(AppError::msg(message)),
+		_ => Err(AppError::msg("unexpected response from relay")),
+	}
+}
+
+/// Revoke a tenant on the relay, disconnecting its controller and agents. Returns
+/// whether a tenant with that id existed. Requires the admin secret.
+#[tauri::command]
+pub async fn revoke_relay_tenant(address: String, admin_secret: String, tenant_id: String) -> AppResult<bool> {
+	match admin_do(&address, &admin_secret, AdminRequest::Revoke { tenant_id }).await? {
+		AdminResponse::Revoked { existed, .. } => Ok(existed),
+		AdminResponse::Error { message } => Err(AppError::msg(message)),
+		_ => Err(AppError::msg("unexpected response from relay")),
+	}
 }
 
 // ---------------------------------------------------------------- live control

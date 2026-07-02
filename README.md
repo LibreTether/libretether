@@ -160,6 +160,9 @@ An early but capable build. Working today:
 - ✅ **Relay mode** + phone-friendly browser pairing, with **end-to-end encryption** so the relay
   host only ever sees ciphertext, and **automatic peer-to-peer NAT hole-punching** that upgrades
   sessions to a direct path when the network allows
+- ✅ **Multi-tenant relay** — one relay host serves many independent controllers, each with its
+  own owner/agent secrets and isolated routing; provision a tenant from the app (or the
+  `libretether-relay tenant` CLI) so teams share a relay without seeing each other's machines
 - ✅ In-app **Logs** — live controller activity plus on-demand agent logs
 
 Video encoding is currently software H.264 (OpenH264) on all platforms, with a hardware Windows
@@ -180,10 +183,6 @@ path in progress; see below.
 - **Hardware video encoding on macOS.** A VideoToolbox encoder backend for hardware H.264 on
   macOS guests, slotting into the same encoder abstraction as the Windows Media Foundation path,
   again with OpenH264 as the fallback.
-
-- **Multi-tenant relay.** Let a single `libretether-relay` host serve several independent
-  controllers, each with its own owner/agent secrets and isolated routing — so multiple people
-  or teams can share one relay without ever seeing each other's machines.
 
 - **Cloudflare connectivity.** A connection mode built on Cloudflare (e.g. Tunnel) as an
   alternative to Tailscale, giving users already in the Cloudflare ecosystem reachability without

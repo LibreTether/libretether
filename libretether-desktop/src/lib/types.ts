@@ -77,6 +77,23 @@ export type ControllerKind =
 
 export type ControllerType = ControllerKind["type"]
 
+/** A tenant's freshly-minted credentials, returned by `provisionRelayTenant`.
+ *  Field names are snake_case to match the Rust `TenantCredentials` serde shape. */
+export interface TenantCredentials {
+	tenant_id: string
+	name: string
+	owner_secret: string
+	agent_secret: string
+}
+
+/** A relay tenant's public status (no secrets), from `listRelayTenants`. */
+export interface TenantInfo {
+	tenant_id: string
+	name: string
+	controller_online: boolean
+	agents_online: number
+}
+
 export interface ControllerSummary {
 	id: string
 	name: string

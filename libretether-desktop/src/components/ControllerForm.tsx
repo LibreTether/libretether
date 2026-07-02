@@ -12,6 +12,15 @@ const DEFAULT_PORT = 47600
 // Order the type picker explicitly (the metadata map's key order is incidental).
 const TYPE_OPTIONS: ControllerType[] = ["tailscale", "direct", "relay"]
 
+// A relay is multi-tenant: a controller either provisions a fresh tenant (minting
+// its own owner/agent secrets with the relay's admin secret) or reuses an existing
+// tenant's secrets (e.g. to add a second device to the same tenant).
+type RelayTenantMode = "provision" | "existing"
+const RELAY_MODE_OPTIONS = [
+	{ label: "Provision a new tenant", value: "provision" as const },
+	{ label: "Use existing tenant secrets", value: "existing" as const }
+]
+
 export function ControllerForm({
 	existing,
 	onClose,
@@ -34,6 +43,12 @@ export function ControllerForm({
 	const [relayAddr, setRelayAddr] = useState(k?.type === "relay" ? k.address : "")
 	const [relayOwner, setRelayOwner] = useState(k?.type === "relay" ? k.owner_secret : "")
 	const [relayAgent, setRelayAgent] = useState(k?.type === "relay" ? k.agent_secret : "")
+	// How this controller gets its tenant on the relay: mint a fresh one with the
+	// relay's admin secret, or paste an existing tenant's owner/agent secrets. New
+	// controllers default to provisioning; an existing relay controller already has
+	// secrets, so default it to "existing".
+	const [relayMode, setRelayMode] = useState<RelayTenantMode>(k?.type === "relay" ? "existing" : "provision")
+	const [relayAdmin, setRelayAdmin] = useState("")
 
 	const buildKind = (): ControllerKind => {
 		const listen_port = Number.parseInt(port, 10) || DEFAULT_PORT
@@ -64,14 +79,37 @@ export function ControllerForm({
 			toast.error("Tailscale controllers require an auth key")
 			return
 		}
-		if (type === "relay" && (!relayAddr.trim() || !relayOwner.trim() || !relayAgent.trim())) {
-			toast.error("Relay needs an address, owner secret and agent secret")
-			return
+		if (type === "relay") {
+			if (!relayAddr.trim()) {
+				toast.error("Relay needs an address")
+				return
+			}
+			if (relayMode === "existing" && (!relayOwner.trim() || !relayAgent.trim())) {
+				toast.error("Enter the tenant's owner secret and agent secret")
+				return
+			}
 		}
-		const ok = await saveAction.run("Couldn't save controller", async () => {
-			if (existing) await api.updateController(existing.id, name.trim(), buildKind())
-			else await api.createController(name.trim(), buildKind())
-		})
+		const provisioning = type === "relay" && relayMode === "provision"
+		const ok = await saveAction.run(
+			provisioning ? "Couldn't provision the tenant" : "Couldn't save controller",
+			async () => {
+				let kind = buildKind()
+				// Provision mode: mint a fresh tenant on the relay first, then save the
+				// controller with the returned secrets (the relay identifies the tenant by
+				// the owner secret this controller presents).
+				if (provisioning) {
+					const creds = await api.provisionRelayTenant(relayAddr.trim(), relayAdmin.trim(), name.trim())
+					kind = {
+						address: relayAddr.trim(),
+						agent_secret: creds.agent_secret,
+						owner_secret: creds.owner_secret,
+						type: "relay"
+					}
+				}
+				if (existing) await api.updateController(existing.id, name.trim(), kind)
+				else await api.createController(name.trim(), kind)
+			}
+		)
 		if (ok) onSaved()
 	}
 
@@ -83,7 +121,11 @@ export function ControllerForm({
 						Cancel
 					</Button>
 					<Button loading={saveAction.busy} onClick={save} variant="primary">
-						{existing ? "Save changes" : "Create controller"}
+						{existing
+							? "Save changes"
+							: type === "relay" && relayMode === "provision"
+								? "Provision & create"
+								: "Create controller"}
 					</Button>
 				</>
 			}
@@ -163,27 +205,54 @@ export function ControllerForm({
 							/>
 						</Field>
 						<Field
-							hint="From `libretether-relay info` — authenticates this controller as the owner."
-							label="Owner secret"
+							hint="A relay is multi-tenant: provision your own tenant, or reuse an existing tenant's secrets (e.g. to add another device)."
+							label="Tenant"
 						>
-							<Input
-								className="font-mono"
-								onChange={(e) => setRelayOwner(e.target.value)}
-								type="password"
-								value={relayOwner}
+							<Combobox<RelayTenantMode>
+								onChange={setRelayMode}
+								options={RELAY_MODE_OPTIONS}
+								value={relayMode}
 							/>
 						</Field>
-						<Field
-							hint="From `libretether-relay info` — embedded in this controller's deploy scripts."
-							label="Agent secret"
-						>
-							<Input
-								className="font-mono"
-								onChange={(e) => setRelayAgent(e.target.value)}
-								type="password"
-								value={relayAgent}
-							/>
-						</Field>
+						{relayMode === "provision" ? (
+							<Field
+								hint="From `libretether-relay info`. Leave blank only if the relay allows open registration."
+								label="Admin secret"
+							>
+								<Input
+									className="font-mono"
+									onChange={(e) => setRelayAdmin(e.target.value)}
+									placeholder="admin secret"
+									type="password"
+									value={relayAdmin}
+								/>
+							</Field>
+						) : (
+							<>
+								<Field
+									hint="Your tenant's owner secret — authenticates this controller as the owner."
+									label="Owner secret"
+								>
+									<Input
+										className="font-mono"
+										onChange={(e) => setRelayOwner(e.target.value)}
+										type="password"
+										value={relayOwner}
+									/>
+								</Field>
+								<Field
+									hint="Your tenant's agent secret — embedded in this controller's deploy scripts."
+									label="Agent secret"
+								>
+									<Input
+										className="font-mono"
+										onChange={(e) => setRelayAgent(e.target.value)}
+										type="password"
+										value={relayAgent}
+									/>
+								</Field>
+							</>
+						)}
 					</>
 				)}
 			</div>

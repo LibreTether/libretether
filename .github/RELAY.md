@@ -9,7 +9,13 @@ egress — and the relay carries only the hard-NAT minority. Use it for fleets w
 exposed. For the security model and how the punch works, see
 [ARCHITECTURE.md](ARCHITECTURE.md#security-model).
 
-Authentication is layered: two relay **secrets** gate access to the relay, and the agent still
+A relay is **multi-tenant**: one host can serve several independent controllers, each with its
+own **owner secret** (its controller) and **agent secret** (its agents) and its own isolated
+routing — so multiple people or teams can share one relay without ever seeing each other's
+machines. Provisioning a tenant is gated by the relay's single **admin secret** (or open to
+anyone, if the operator enables open registration). See [Tenants](#tenants) below.
+
+Authentication is layered: a tenant's two secrets gate access to that tenant, and the agent still
 proves its identity to the controller end-to-end with Ed25519. The session is also **end-to-end
 encrypted** — the controller and agent agree an application-layer key bound to their pinned
 identities, so the relay only ever forwards **ciphertext** and never sees your screen, input,
@@ -20,34 +26,58 @@ service, but it is not trusted with the contents of a session.
 
 1. On a cloud host with a public IP, get `libretether-relay` (grab
    `libretether-relay-linux-x86_64` from a release, or `run relay:build`) and run it. First run
-   generates a config and prints an **owner secret** and an **agent secret**:
+   generates a config and mints a single **admin secret** (which gates provisioning tenants):
    ```bash
    libretether-relay run
-   libretether-relay info       # reprint the listen address + the two secrets
+   libretether-relay info       # reprint the listen address + the admin secret + a tenant summary
    ```
 2. In the app's launch screen: **New controller → Relay**, name it, enter the relay's
-   `host:port` and the two secrets, then **Connect**. The controller dials the relay instead of
-   listening.
-3. Add machines as usual — their deploy scripts enrol against the relay (no Tailscale, no
-   exposure). Open **UDP 47600** on the host's firewall (QUIC is UDP).
+   `host:port`, keep **Tenant → Provision a new tenant**, paste the **admin secret**, then
+   **Provision & create**. The app mints a tenant on the relay (its own owner + agent secrets)
+   and saves this controller with them; **Connect** dials the relay instead of listening.
+3. Add machines as usual — their deploy scripts embed *this tenant's* agent secret and enrol
+   against the relay (no Tailscale, no exposure). Open **UDP 47600** on the host's firewall
+   (QUIC is UDP).
+
+## Tenants
+
+Each tenant is fully isolated: a controller only ever sees the agents that dialed in under its
+own tenant's agent secret, and the relay's Logs view a controller pulls is scoped to its tenant.
+There are two ways to create one:
+
+- **From the app (a running relay).** *New controller → Relay → Provision a new tenant*, with the
+  admin secret. The tenant is minted live and persisted to the relay's config. To add a **second
+  device** to a tenant you already own, choose *Use existing tenant secrets* instead and paste
+  that tenant's owner + agent secrets (from when it was provisioned).
+- **From the shell.** Operate directly on the config (takes effect on the relay's next restart):
+  ```bash
+  libretether-relay tenant add --name "Team A"   # prints the tenant id + owner/agent secrets
+  libretether-relay tenant list                  # ids + names, no secrets
+  libretether-relay tenant rm <tenant-id>
+  ```
+
+**Open registration.** By default only the admin-secret holder can provision. To let anyone who
+can reach the relay mint their *own* tenant (they still can't list or revoke others'), set
+`"open_registration": true` in the config and restart. Provision-only clients then leave the
+admin-secret field blank in the app.
 
 ## With Docker
 
 A multi-arch image (`linux/amd64`, `linux/arm64`) is published to GHCR on every release:
 
 ```bash
-# Generate config + print the secrets (one-time), then run the relay.
+# Generate config + print the admin secret (one-time), then run the relay.
 docker run --rm -v libretether:/data ghcr.io/libretether/libretether-relay:latest info
 docker run -d --name libretether-relay -p 47600:47600/udp \
   -v libretether:/data --restart unless-stopped \
   ghcr.io/libretether/libretether-relay:latest
 ```
 
-The named volume (`/data`) keeps the generated config — the owner/agent secrets and the TLS
-cert — stable across restarts. Build it yourself with `run relay:docker:build` (or
-`docker build -t libretether-relay .`).
+The named volume (`/data`) keeps the generated config — the admin secret, every tenant's
+owner/agent secrets, and the TLS cert — stable across restarts. Build it yourself with
+`run relay:docker:build` (or `docker build -t libretether-relay .`).
 
-To reprint the secrets from an **already-running** container, pass `--config` explicitly
+To reprint the admin secret from an **already-running** container, pass `--config` explicitly
 (`docker exec` bypasses the entrypoint that normally supplies it):
 
 ```bash

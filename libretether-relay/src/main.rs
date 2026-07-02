@@ -1,10 +1,19 @@
 //! LibreTether relay (`libretether-relay`).
 //!
-//! Run this on a public cloud host. The controller and the agents all dial out
-//! to it; it authenticates each side (owner secret vs agent secret), tracks
-//! agents by Ed25519 public key, and pipes streams between the controller and
-//! the addressed agent. It never inspects stream contents — the LibreTether handshake,
-//! control RPCs, live session and TCP tunnels are all end-to-end.
+//! Run this on a public cloud host. It is **multi-tenant**: it holds a set of
+//! independent tenants, each with its own owner secret (its controller) and agent
+//! secret (its agents). The controller and the agents all dial out to it; the
+//! secret each presents identifies its tenant, and the relay tracks that tenant's
+//! agents by Ed25519 public key and pipes streams between the tenant's controller
+//! and the addressed agent. Routing is isolated per tenant — a controller only ever
+//! sees the agents that dialed in under its own agent secret. It never inspects
+//! stream contents: the LibreTether handshake, control RPCs, live session and TCP
+//! tunnels are all end-to-end.
+//!
+//! Tenants are minted over an admin channel gated by the relay's **admin secret**
+//! (or open to any client when `open_registration` is set): a client provisions a
+//! tenant and receives its freshly-generated owner/agent secrets. Tenants persist in
+//! the on-disk config so they survive restarts.
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
@@ -21,7 +30,8 @@ use libretether_common::{pipe_bidirectional, shutdown_signal};
 use libretether_protocol::crypto::{self, random_alnum};
 use libretether_protocol::frame::{read_frame_capped, write_frame, MAX_CONTROL_FRAME};
 use libretether_protocol::relay::{
-	PunchResponse, RelayAck, RelayChallenge, RelayEvent, RelayHello, RelayProof, RelayRequest, RelayRole, RelaySignal,
+	AdminRequest, AdminResponse, PunchResponse, RelayAck, RelayChallenge, RelayEvent, RelayHello, RelayProof,
+	RelayRequest, RelayRole, RelaySignal, TenantCredentials, TenantInfo,
 };
 use libretether_protocol::{secret, tls, DEFAULT_PORT};
 use quinn::{RecvStream, SendStream};
@@ -78,11 +88,50 @@ const PAIRING_TTL: Duration = Duration::from_secs(300);
 const MAX_PENDING_PAIRINGS: usize = 64;
 /// How often the relay sweeps expired pairing slots.
 const PAIRING_SWEEP_INTERVAL: Duration = Duration::from_secs(30);
+/// Hard ceiling on provisioned tenants, so a compromised admin secret (or an
+/// abusive open-registration client) can't grow the persisted config without bound.
+/// Far above any realistic shared relay.
+const MAX_TENANTS: usize = 512;
+/// Length of a generated tenant id and of the owner/agent/admin secrets.
+const SECRET_LEN: usize = 24;
+const TENANT_ID_LEN: usize = 12;
+
+/// A provisioned tenant as it lives on disk: its id, label, and the owner/agent
+/// secrets that identify its controller and its agents. Persisted in the relay
+/// config so tenants survive restarts.
+#[derive(Clone, Serialize, Deserialize)]
+struct TenantRecord {
+	id: String,
+	name: String,
+	owner_secret: String,
+	agent_secret: String,
+}
+
+impl TenantRecord {
+	/// Mint a fresh tenant with random id + secrets.
+	fn generate(name: String) -> Self {
+		Self {
+			id: random_alnum(TENANT_ID_LEN),
+			name,
+			owner_secret: random_alnum(SECRET_LEN),
+			agent_secret: random_alnum(SECRET_LEN),
+		}
+	}
+}
 
 #[derive(Serialize, Deserialize)]
 struct ServerConfig {
-	owner_secret: String,
-	agent_secret: String,
+	/// Gates the admin/provisioning channel. Held by the relay operator; whoever
+	/// has it can mint, list and revoke tenants.
+	admin_secret: String,
+	/// When true, any client may provision a tenant without the admin secret (it can
+	/// still only provision — listing and revoking always require the admin secret).
+	#[serde(default)]
+	open_registration: bool,
+	/// The provisioned tenants, each with its own owner/agent secrets and isolated
+	/// routing. Empty on a fresh relay until the first tenant is provisioned.
+	#[serde(default)]
+	tenants: Vec<TenantRecord>,
 	cert_der: String,
 	key_der: String,
 	/// Optional browser portal (serves the embedded SPA so a new machine can pair
@@ -96,8 +145,9 @@ impl ServerConfig {
 	fn generate() -> Self {
 		let (cert_der, key_der) = tls::self_signed();
 		Self {
-			owner_secret: random_alnum(24),
-			agent_secret: random_alnum(24),
+			admin_secret: random_alnum(SECRET_LEN),
+			open_registration: false,
+			tenants: Vec::new(),
 			cert_der: B64.encode(cert_der),
 			key_der: B64.encode(key_der),
 			portal: None,
@@ -108,13 +158,23 @@ impl ServerConfig {
 		Ok((B64.decode(&self.cert_der)?, B64.decode(&self.key_der)?))
 	}
 
-	/// Refuse to operate with a blank secret. An empty `owner_secret`/`agent_secret`
-	/// would make `ct_eq("", "")` true, i.e. authenticate any peer presenting an
-	/// empty secret — a fail-open we reject outright (a freshly generated config is
-	/// always valid; this only catches a hand-edited/truncated one).
+	/// Refuse to operate with a blank secret. An empty `admin_secret` — or a tenant
+	/// with an empty owner/agent secret — would make `ct_eq("", "")` true, i.e.
+	/// authenticate any peer presenting an empty secret, a fail-open we reject
+	/// outright. A freshly generated config is always valid; this only catches a
+	/// hand-edited/truncated one.
 	fn validate(&self) -> Result<()> {
-		if self.owner_secret.trim().is_empty() || self.agent_secret.trim().is_empty() {
-			anyhow::bail!("has a blank owner/agent secret — delete it to regenerate, or restore the secrets");
+		if self.admin_secret.trim().is_empty() {
+			anyhow::bail!("has a blank admin secret — delete it to regenerate, or restore the secret");
+		}
+		for t in &self.tenants {
+			if t.owner_secret.trim().is_empty() || t.agent_secret.trim().is_empty() {
+				anyhow::bail!(
+					"tenant {} ({}) has a blank owner/agent secret — remove it from the config and re-provision",
+					t.id,
+					t.name
+				);
+			}
 		}
 		Ok(())
 	}
@@ -212,8 +272,6 @@ struct ControllerSession {
 	conn: quinn::Connection,
 }
 
-type ControllerSlot = Arc<Mutex<Option<ControllerSession>>>;
-
 /// A controller's parked pairing slot: the relay-side halves of the stream the
 /// controller opened with [`RelayRequest::OpenPairing`], held until a `Pairing`
 /// peer joins with the matching nameplate (then piped together) or the slot
@@ -232,19 +290,55 @@ struct AgentHandle {
 	signals: UnboundedSender<RelaySignal>,
 }
 
-#[derive(Clone, Default)]
-struct Relay {
-	agents: Arc<Mutex<HashMap<String, AgentHandle>>>,
-	controller: ControllerSlot,
-	/// Open pairing slots keyed by nameplate (see [`crate::Pending`]). The relay only
-	/// matches by nameplate and pipes the two streams; it never sees the PAKE password
-	/// or the enrollment bundle that flow over the pipe.
-	pairings: Arc<Mutex<HashMap<String, Pending>>>,
-	/// Per-source-IP fixed-window connection counters for rate limiting.
-	limiter: Arc<Mutex<HashMap<IpAddr, (u32, Instant)>>>,
+/// One tenant's live routing state: the credentials that identify it, plus the
+/// controller slot, agent map and log ring that are isolated from every other
+/// tenant. Shared as an `Arc` between the tenant's connection tasks. Pairing slots
+/// are *not* here — they're global on [`Relay`], because a pairing pipes the
+/// controller's own parked stream (which already belongs to the right tenant).
+struct Tenant {
+	id: String,
+	name: String,
+	owner_secret: String,
+	agent_secret: String,
+	agents: Mutex<HashMap<String, AgentHandle>>,
+	controller: Mutex<Option<ControllerSession>>,
+	/// This tenant's own log ring; only its controller can fetch it.
+	log: logbook::Log,
 }
 
-impl Relay {
+impl Tenant {
+	fn from_record(rec: &TenantRecord) -> Arc<Self> {
+		Arc::new(Self {
+			id: rec.id.clone(),
+			name: rec.name.clone(),
+			owner_secret: rec.owner_secret.clone(),
+			agent_secret: rec.agent_secret.clone(),
+			agents: Mutex::new(HashMap::new()),
+			controller: Mutex::new(None),
+			log: logbook::Log::new(tenant_tag(&rec.id, &rec.name)),
+		})
+	}
+
+	/// The durable record for this tenant (persisted to the config on mutation).
+	fn record(&self) -> TenantRecord {
+		TenantRecord {
+			id: self.id.clone(),
+			name: self.name.clone(),
+			owner_secret: self.owner_secret.clone(),
+			agent_secret: self.agent_secret.clone(),
+		}
+	}
+
+	/// This tenant's public status (no secrets) for an admin `List`.
+	fn info(&self) -> TenantInfo {
+		TenantInfo {
+			tenant_id: self.id.clone(),
+			name: self.name.clone(),
+			controller_online: self.controller.lock().unwrap().is_some(),
+			agents_online: self.agents.lock().unwrap().len(),
+		}
+	}
+
 	fn agent(&self, public_key: &str) -> Option<quinn::Connection> {
 		self.agents.lock().unwrap().get(public_key).map(|h| h.conn.clone())
 	}
@@ -268,10 +362,189 @@ impl Relay {
 		}
 	}
 
+	/// Notify this tenant's controller (if connected) of a presence event.
 	fn notify(&self, event: RelayEvent) {
 		if let Some(session) = self.controller.lock().unwrap().as_ref() {
 			let _ = session.events.send(event);
 		}
+	}
+}
+
+/// A short stderr/label tag for a tenant: its name plus a key8-style id prefix, so
+/// `docker logs` attributes a per-tenant line and two same-named tenants stay
+/// distinguishable.
+fn tenant_tag(id: &str, name: &str) -> String {
+	format!("{name}·{}", id.chars().take(6).collect::<String>())
+}
+
+/// Everything needed to rewrite the on-disk config when the tenant set changes:
+/// the config path and the config fields the relay doesn't otherwise mutate at
+/// runtime. Held behind an `Arc` on [`Relay`].
+struct Persist {
+	path: PathBuf,
+	admin_secret: String,
+	open_registration: bool,
+	cert_der: String,
+	key_der: String,
+	portal: Option<portal::PortalConfig>,
+}
+
+impl Persist {
+	/// Rewrite the config with `tenants` as the current set. Owner-only perms, like
+	/// the initial write — the file holds every tenant's secrets and the TLS key.
+	fn save(&self, tenants: Vec<TenantRecord>) -> Result<()> {
+		let cfg = ServerConfig {
+			admin_secret: self.admin_secret.clone(),
+			open_registration: self.open_registration,
+			tenants,
+			cert_der: self.cert_der.clone(),
+			key_der: self.key_der.clone(),
+			portal: self.portal.clone(),
+		};
+		secret::write_str(&self.path, &serde_json::to_string_pretty(&cfg)?)?;
+		Ok(())
+	}
+}
+
+#[derive(Clone)]
+struct Relay {
+	/// Tenants keyed by tenant id. The credentials in each are used to resolve which
+	/// tenant a connecting controller/agent belongs to (see `authenticate`).
+	tenants: Arc<Mutex<HashMap<String, Arc<Tenant>>>>,
+	/// Open pairing slots keyed by nameplate (see [`crate::Pending`]). Global, not
+	/// per-tenant: a pairing pipes the controller's own parked stream, so the tenant
+	/// association is already carried by that stream. The relay only matches by
+	/// nameplate and pipes the two streams; it never sees the PAKE password or the
+	/// enrollment bundle that flow over the pipe.
+	pairings: Arc<Mutex<HashMap<String, Pending>>>,
+	/// Per-source-IP fixed-window connection counters for rate limiting.
+	limiter: Arc<Mutex<HashMap<IpAddr, (u32, Instant)>>>,
+	/// The relay admin secret, gating the provisioning channel.
+	admin_secret: Arc<String>,
+	/// Whether any client may provision a tenant without the admin secret.
+	open_registration: bool,
+	/// Config-persistence handle, used when the tenant set changes.
+	persist: Arc<Persist>,
+}
+
+impl Relay {
+	/// Build the runtime relay from a loaded config and the path to persist back to.
+	fn new(cfg: &ServerConfig, config_path: PathBuf) -> Self {
+		let tenants = cfg
+			.tenants
+			.iter()
+			.map(|rec| (rec.id.clone(), Tenant::from_record(rec)))
+			.collect();
+		Self {
+			tenants: Arc::new(Mutex::new(tenants)),
+			pairings: Arc::new(Mutex::new(HashMap::new())),
+			limiter: Arc::new(Mutex::new(HashMap::new())),
+			admin_secret: Arc::new(cfg.admin_secret.clone()),
+			open_registration: cfg.open_registration,
+			persist: Arc::new(Persist {
+				path: config_path,
+				admin_secret: cfg.admin_secret.clone(),
+				open_registration: cfg.open_registration,
+				cert_der: cfg.cert_der.clone(),
+				key_der: cfg.key_der.clone(),
+				portal: cfg.portal.clone(),
+			}),
+		}
+	}
+
+	/// Resolve the tenant whose owner secret matches (constant-time per tenant), or
+	/// `None` if no tenant claims it. Iterating and `ct_eq`-ing each keeps the
+	/// byte-level timing resistance of the single-tenant path; a match only reveals
+	/// *which* tenant matched, which the connecting controller already knows.
+	fn tenant_by_owner(&self, secret: &str) -> Option<Arc<Tenant>> {
+		self.tenants
+			.lock()
+			.unwrap()
+			.values()
+			.find(|t| crypto::ct_eq(secret, &t.owner_secret))
+			.cloned()
+	}
+
+	/// Resolve the tenant whose agent secret matches (see [`Relay::tenant_by_owner`]).
+	fn tenant_by_agent(&self, secret: &str) -> Option<Arc<Tenant>> {
+		self.tenants
+			.lock()
+			.unwrap()
+			.values()
+			.find(|t| crypto::ct_eq(secret, &t.agent_secret))
+			.cloned()
+	}
+
+	/// Whether the presented secret is the admin secret (constant-time).
+	fn is_admin_secret(&self, secret: &str) -> bool {
+		crypto::ct_eq(secret, &self.admin_secret)
+	}
+
+	/// Public status of every tenant, for an admin `List` (never includes secrets).
+	fn tenant_infos(&self) -> Vec<TenantInfo> {
+		self.tenants.lock().unwrap().values().map(|t| t.info()).collect()
+	}
+
+	/// Mint a new tenant, register it live, and persist the updated set. Returns the
+	/// tenant's freshly-generated credentials, or an error string (blank name / at
+	/// capacity / persistence failure — with the in-memory insert rolled back so
+	/// memory and disk stay consistent).
+	fn provision(&self, name: String) -> std::result::Result<TenantCredentials, String> {
+		let name = name.trim();
+		if name.is_empty() {
+			return Err("tenant name must not be blank".into());
+		}
+		let mut rec = TenantRecord::generate(name.to_string());
+		// Hold the tenants lock across the (small, sync) config write so concurrent
+		// provisions/revokes can't interleave into a lost update on disk.
+		let mut tenants = self.tenants.lock().unwrap();
+		if tenants.len() >= MAX_TENANTS {
+			return Err(format!("relay at tenant capacity ({MAX_TENANTS})"));
+		}
+		// A random 12-char id practically never collides, but never overwrite a live
+		// tenant if it somehow does.
+		while tenants.contains_key(&rec.id) {
+			rec.id = random_alnum(TENANT_ID_LEN);
+		}
+		let creds = TenantCredentials {
+			tenant_id: rec.id.clone(),
+			name: rec.name.clone(),
+			owner_secret: rec.owner_secret.clone(),
+			agent_secret: rec.agent_secret.clone(),
+		};
+		tenants.insert(rec.id.clone(), Tenant::from_record(&rec));
+		let snapshot = tenants.values().map(|t| t.record()).collect();
+		if let Err(e) = self.persist.save(snapshot) {
+			tenants.remove(&rec.id);
+			return Err(format!("persisting tenant: {e:#}"));
+		}
+		Ok(creds)
+	}
+
+	/// Remove a tenant, persist the change, and disconnect its controller + agents so
+	/// the revoke takes effect immediately. `Ok(false)` if no tenant had that id.
+	fn revoke(&self, id: &str) -> std::result::Result<bool, String> {
+		let tenant = {
+			let mut tenants = self.tenants.lock().unwrap();
+			let Some(tenant) = tenants.remove(id) else {
+				return Ok(false);
+			};
+			let snapshot = tenants.values().map(|t| t.record()).collect();
+			if let Err(e) = self.persist.save(snapshot) {
+				// Roll back so a failed write can't drop the tenant from disk on the next
+				// restart while we've already removed it from memory.
+				tenants.insert(id.to_string(), tenant);
+				return Err(format!("persisting revoke: {e:#}"));
+			}
+			tenant
+		};
+		if let Some(session) = tenant.controller.lock().unwrap().take() {
+			session.conn.close(0u32.into(), b"tenant revoked");
+		}
+		for (_, handle) in tenant.agents.lock().unwrap().drain() {
+			handle.conn.close(0u32.into(), b"tenant revoked");
+		}
+		Ok(true)
 	}
 
 	/// Fixed-window per-IP rate check: returns false once a source exceeds
@@ -360,8 +633,30 @@ enum Command {
 		#[arg(long)]
 		listen: Option<String>,
 	},
-	/// Print the listen address and the owner/agent secrets.
+	/// Print the listen address, the admin secret, and a tenant summary.
 	Info,
+	/// Manage tenants directly in the config. Intended for a stopped relay or for
+	/// scripting; a *running* relay only picks up on-disk tenant changes at its next
+	/// restart. For live changes, provision from the app's admin channel instead.
+	#[command(subcommand)]
+	Tenant(TenantCmd),
+}
+
+#[derive(Subcommand)]
+enum TenantCmd {
+	/// Provision a new tenant and print its owner/agent secrets.
+	Add {
+		/// A human label for the tenant (e.g. a team or person).
+		#[arg(long)]
+		name: String,
+	},
+	/// List provisioned tenants (ids + names, no secrets).
+	List,
+	/// Remove a tenant by id.
+	Rm {
+		/// The tenant id (from `tenant list`).
+		id: String,
+	},
 }
 
 #[tokio::main]
@@ -377,6 +672,7 @@ async fn main() -> Result<()> {
 			print_credentials(&load(&path)?, &resolve_listen(None));
 			Ok(())
 		}
+		Command::Tenant(cmd) => run_tenant_cmd(&path, cmd),
 		Command::Run { listen } => {
 			let cfg = load_or_create(&path)?;
 			let listen_addr = resolve_listen(listen);
@@ -386,21 +682,77 @@ async fn main() -> Result<()> {
 				.parent()
 				.map(Path::to_path_buf)
 				.unwrap_or_else(|| PathBuf::from("."));
-			run(cfg, data_dir, listen_addr).await
+			run(cfg, data_dir, listen_addr, path).await
 		}
 	}
 }
 
 fn print_credentials(cfg: &ServerConfig, listen: &str) {
-	println!("listen:       {listen}");
-	println!("owner secret: {}", cfg.owner_secret);
-	println!("agent secret: {}", cfg.agent_secret);
+	println!("listen:            {listen}");
+	println!("admin secret:      {}", cfg.admin_secret);
+	println!(
+		"open registration: {}",
+		if cfg.open_registration { "on" } else { "off" }
+	);
+	println!("tenants:           {}", cfg.tenants.len());
 	println!();
-	println!("Point the controller at this host with the owner secret, and");
-	println!("deploy clients with the agent secret.");
+	println!("Provision a tenant from the app (New controller → Relay → Provision) with the");
+	println!("admin secret, or run `libretether-relay tenant add --name <name>`. Each tenant");
+	println!("gets its own owner secret (its controller) and agent secret (its deploy scripts).");
 }
 
-async fn run(cfg: ServerConfig, data_dir: PathBuf, listen_addr: String) -> Result<()> {
+/// Handle the on-disk `tenant` subcommands. These mutate `config.json`; a running
+/// relay only sees the change on its next restart (documented on the subcommand).
+fn run_tenant_cmd(path: &PathBuf, cmd: TenantCmd) -> Result<()> {
+	match cmd {
+		TenantCmd::List => {
+			let cfg = load(path)?;
+			if cfg.tenants.is_empty() {
+				println!("no tenants provisioned");
+			} else {
+				for t in &cfg.tenants {
+					println!("{}  {}", t.id, t.name);
+				}
+			}
+			Ok(())
+		}
+		TenantCmd::Add { name } => {
+			let name = name.trim();
+			if name.is_empty() {
+				anyhow::bail!("tenant name must not be blank");
+			}
+			// `load_or_create` so `tenant add` also bootstraps a brand-new relay's config.
+			let mut cfg = load_or_create(path)?;
+			if cfg.tenants.len() >= MAX_TENANTS {
+				anyhow::bail!("relay at tenant capacity ({MAX_TENANTS})");
+			}
+			let rec = TenantRecord::generate(name.to_string());
+			let (id, owner, agent) = (rec.id.clone(), rec.owner_secret.clone(), rec.agent_secret.clone());
+			cfg.tenants.push(rec);
+			secret::write_str(path, &serde_json::to_string_pretty(&cfg)?)?;
+			println!("tenant id:    {id}");
+			println!("name:         {name}");
+			println!("owner secret: {owner}");
+			println!("agent secret: {agent}");
+			println!();
+			println!("A running relay picks this up on its next restart.");
+			Ok(())
+		}
+		TenantCmd::Rm { id } => {
+			let mut cfg = load(path)?;
+			let before = cfg.tenants.len();
+			cfg.tenants.retain(|t| t.id != id);
+			if cfg.tenants.len() == before {
+				anyhow::bail!("no tenant with id {id}");
+			}
+			secret::write_str(path, &serde_json::to_string_pretty(&cfg)?)?;
+			println!("removed tenant {id}");
+			Ok(())
+		}
+	}
+}
+
+async fn run(cfg: ServerConfig, data_dir: PathBuf, listen_addr: String, config_path: PathBuf) -> Result<()> {
 	let (cert, key) = cfg.cert_key()?;
 	let addr: SocketAddr = listen_addr.parse().context("invalid listen address")?;
 	// Dual-stack when the listen address is `[::]` (the default), so IPv4 peers reach
@@ -408,10 +760,19 @@ async fn run(cfg: ServerConfig, data_dir: PathBuf, listen_addr: String) -> Resul
 	// `tls::server_endpoint`.
 	let endpoint = tls::server_endpoint(cert, key, addr).context("bind relay QUIC listener")?;
 	logbook::info(&format!("relay listening on udp/{addr}"));
+	logbook::info(&format!(
+		"{} tenant(s) loaded; open registration {}",
+		cfg.tenants.len(),
+		if cfg.open_registration { "on" } else { "off" }
+	));
 	// Don't echo the secrets on every `run` — they'd persist in the journal /
 	// `docker logs` for the life of the deployment. `libretether-relay info` prints
-	// them on demand.
-	logbook::info("run `libretether-relay info` to print the owner/agent secrets");
+	// the admin secret on demand.
+	logbook::info("run `libretether-relay info` to print the admin secret");
+
+	// Build the runtime relay (seeding its tenants from the config) before moving
+	// `cfg.portal` into the portal task — `Relay::new` clones what it needs to persist.
+	let relay = Relay::new(&cfg, config_path);
 
 	// Bring up the browser portal (serves the embedded pairing SPA) when configured —
 	// via the config's `portal` block or env vars (so docker-compose alone can enable
@@ -425,8 +786,6 @@ async fn run(cfg: ServerConfig, data_dir: PathBuf, listen_addr: String) -> Resul
 		});
 	}
 
-	let relay = Relay::default();
-	let secrets = Arc::new((cfg.owner_secret, cfg.agent_secret));
 	let conn_limit = Arc::new(Semaphore::new(MAX_CONNECTIONS));
 	// Agents draw from a smaller pool so they can never consume the controller's
 	// reserved headroom (see CONTROLLER_RESERVED). The role isn't known until after
@@ -455,11 +814,10 @@ async fn run(cfg: ServerConfig, data_dir: PathBuf, listen_addr: String) -> Resul
 					continue;
 				};
 				let relay = relay.clone();
-				let secrets = secrets.clone();
 				let agent_limit = agent_limit.clone();
 				tokio::spawn(async move {
 					let _permit = permit; // released when the connection task ends
-					if let Err(e) = handle(relay, incoming, &secrets, &agent_limit).await {
+					if let Err(e) = handle(relay, incoming, &agent_limit).await {
 						logbook::warn(&format!("connection error: {e}"));
 					}
 				});
@@ -476,12 +834,7 @@ async fn run(cfg: ServerConfig, data_dir: PathBuf, listen_addr: String) -> Resul
 	Ok(())
 }
 
-async fn handle(
-	relay: Relay,
-	incoming: quinn::Incoming,
-	secrets: &(String, String),
-	agent_limit: &Arc<Semaphore>,
-) -> Result<()> {
+async fn handle(relay: Relay, incoming: quinn::Incoming, agent_limit: &Arc<Semaphore>) -> Result<()> {
 	logbook::debug(&format!("connection received from {}", incoming.remote_address()));
 	// Bound the whole pre-serve phase — the QUIC/TLS handshake AND the app-level
 	// auth — under one timeout. The connection permit is acquired at accept (before
@@ -489,7 +842,7 @@ async fn handle(
 	// stage must not be able to hold that permit for longer than HANDSHAKE_TIMEOUT.
 	let pre = tokio::time::timeout(HANDSHAKE_TIMEOUT, async {
 		let conn = incoming.accept()?.await?;
-		let authed = authenticate(&conn, secrets).await?;
+		let authed = authenticate(&relay, &conn).await?;
 		Ok::<_, anyhow::Error>((conn, authed))
 	})
 	.await;
@@ -500,104 +853,150 @@ async fn handle(
 		Err(_) => return Ok(()),            // QUIC handshake or auth timed out
 	};
 
-	match authed.role {
-		RelayRole::Controller => serve_controller(relay, conn, authed.send).await,
-		RelayRole::Pairing => {
+	match authed {
+		Authed::Controller { tenant, send } => serve_controller(relay, tenant, conn, send).await,
+		Authed::Admin { full, send } => serve_admin(relay, full, conn, send).await,
+		Authed::Pairing { nameplate, send, recv } => {
 			// A pairing join holds no long-lived resource and isn't trusted: match it to
 			// a controller's open slot by nameplate and pipe, or reset it.
-			let nameplate = authed.nameplate.unwrap_or_default();
-			let recv = authed.recv.expect("pairing authed carries its recv half");
-			serve_pairing_join(relay, nameplate, authed.send, recv).await
+			serve_pairing_join(relay, nameplate, send, recv).await
 		}
-		RelayRole::Agent => {
+		Authed::Agent {
+			tenant,
+			public_key,
+			send,
+		} => {
 			// Reserve controller headroom: agents acquire from the smaller agent pool
 			// so an agent-secret holder opening connections in bulk (even under freshly
 			// minted keys, which the key-ownership proof can't prevent) can't drain the
-			// global pool and lock the controller out. Held for the connection's life.
+			// global pool and lock the controllers out. Held for the connection's life.
 			let Ok(permit) = agent_limit.clone().try_acquire_owned() else {
 				logbook::warn("agent connection refused: at agent capacity");
 				return Ok(());
 			};
-			serve_agent(relay, conn, authed.public_key, authed.send, permit).await
+			serve_agent(tenant, conn, public_key, send, permit).await
 		}
 	}
 }
 
-/// A successfully-authenticated (or, for pairing, accepted-without-auth) relay peer.
-struct Authed {
-	role: RelayRole,
-	/// The hello stream's send half — the controller keeps writing presence events on
-	/// it; for a pairing join it's piped to the matched controller slot.
-	send: SendStream,
-	/// The hello stream's recv half, kept only for a pairing join (to pipe).
-	recv: Option<RecvStream>,
-	public_key: String,
-	/// The nameplate, set only for a pairing join.
-	nameplate: Option<String>,
+/// A successfully-authenticated (or, for pairing, accepted-without-auth) relay peer,
+/// resolved to its tenant where applicable. Carries the hello stream's send half
+/// (the controller writes presence events on it; the agent reuses it for signals).
+enum Authed {
+	Controller {
+		tenant: Arc<Tenant>,
+		send: SendStream,
+	},
+	Agent {
+		tenant: Arc<Tenant>,
+		public_key: String,
+		send: SendStream,
+	},
+	/// An admin/provisioning client. `full` is true when it presented the admin
+	/// secret (may list/revoke); false when admitted via open registration
+	/// (provision-only).
+	Admin {
+		full: bool,
+		send: SendStream,
+	},
+	/// A pairing join: carries both halves of its stream (to pipe) and its nameplate.
+	Pairing {
+		nameplate: String,
+		send: SendStream,
+		recv: RecvStream,
+	},
 }
 
-/// Validate a peer's secret and prove it holds the private key for the public key
-/// it presented. Returns `Some` on success, `None` if cleanly rejected.
+/// Reject a peer cleanly: write a negative ack (best-effort) and let the caller
+/// return `Ok(None)`.
+async fn reject(send: &mut SendStream, reason: &str) {
+	let _ = write_frame(
+		send,
+		&RelayAck {
+			accepted: false,
+			reason: Some(reason.into()),
+		},
+	)
+	.await;
+}
+
+/// Which tenant/role a hello resolves to, before the key-ownership challenge.
+enum Who {
+	Controller(Arc<Tenant>),
+	Agent(Arc<Tenant>),
+	Admin { full: bool },
+}
+
+/// Resolve the peer's tenant/role from its secret, prove it holds the private key
+/// for the public key it presented, and return the [`Authed`]. `None` on a clean
+/// rejection (unknown secret, or a failed key-ownership proof).
+///
+/// The tenant a controller/agent belongs to is identified by the secret it presents
+/// — the relay looks up which tenant's owner/agent secret matches. `Admin` matches
+/// the relay admin secret (or, under open registration, is admitted provision-only).
 ///
 /// The `Pairing` role is the exception: it carries no secret and isn't trusted by
 /// the relay at all — the relay only matches it to a controller's open slot by
 /// nameplate and pipes the two together, so the PAKE over that pipe is the actual
 /// authentication. It's accepted here without a secret or key-ownership proof.
-async fn authenticate(conn: &quinn::Connection, secrets: &(String, String)) -> Result<Option<Authed>> {
+async fn authenticate(relay: &Relay, conn: &quinn::Connection) -> Result<Option<Authed>> {
 	let (mut send, mut recv) = conn.accept_bi().await.context("accept hello stream")?;
 	let hello: RelayHello = read_frame_capped(&mut recv, MAX_CONTROL_FRAME).await?;
 
-	let (expected, role_label) = match hello.role {
-		RelayRole::Controller => (&secrets.0, "controller"),
-		RelayRole::Agent => (&secrets.1, "agent"),
-		RelayRole::Pairing => {
-			// No secret, no proof — see the doc comment. Require a non-empty nameplate;
-			// a malformed pairing hello is a clean rejection.
-			let Some(nameplate) = hello.nameplate.filter(|n| !n.trim().is_empty()) else {
-				logbook::warn("rejected pairing join: missing nameplate");
-				return Ok(None);
-			};
-			logbook::debug("pairing join received");
-			return Ok(Some(Authed {
-				role: RelayRole::Pairing,
-				send,
-				recv: Some(recv),
-				public_key: String::new(),
-				nameplate: Some(nameplate),
-			}));
-		}
-	};
-	// Constant-time compare so the secret can't be recovered byte-by-byte via
-	// response timing.
-	if !crypto::ct_eq(&hello.secret, expected) {
-		logbook::warn(&format!("rejected {role_label}: bad secret"));
-		let _ = write_frame(
-			&mut send,
-			&RelayAck {
-				accepted: false,
-				reason: Some("bad secret".into()),
-			},
-		)
-		.await;
-		return Ok(None);
+	// Pairing: no secret, no proof — see the doc comment. Require a non-empty
+	// nameplate; a malformed pairing hello is a clean rejection.
+	if let RelayRole::Pairing = hello.role {
+		let Some(nameplate) = hello.nameplate.filter(|n| !n.trim().is_empty()) else {
+			logbook::warn("rejected pairing join: missing nameplate");
+			return Ok(None);
+		};
+		logbook::debug("pairing join received");
+		return Ok(Some(Authed::Pairing { nameplate, send, recv }));
 	}
 
+	// Resolve who this is from the presented secret (constant-time). A controller/
+	// agent that matches no tenant, or an admin without the secret when open
+	// registration is off, is a clean "bad secret" rejection.
+	let who = match hello.role {
+		RelayRole::Controller => match relay.tenant_by_owner(&hello.secret) {
+			Some(tenant) => Who::Controller(tenant),
+			None => {
+				logbook::warn("rejected controller: no tenant for that owner secret");
+				reject(&mut send, "bad secret").await;
+				return Ok(None);
+			}
+		},
+		RelayRole::Agent => match relay.tenant_by_agent(&hello.secret) {
+			Some(tenant) => Who::Agent(tenant),
+			None => {
+				logbook::warn("rejected agent: no tenant for that agent secret");
+				reject(&mut send, "bad secret").await;
+				return Ok(None);
+			}
+		},
+		RelayRole::Admin => {
+			let full = relay.is_admin_secret(&hello.secret);
+			if full || relay.open_registration {
+				Who::Admin { full }
+			} else {
+				logbook::warn("rejected admin: bad secret and open registration is off");
+				reject(&mut send, "bad secret").await;
+				return Ok(None);
+			}
+		}
+		RelayRole::Pairing => unreachable!("handled above"),
+	};
+
 	// Prove possession of the presented Ed25519 key before trusting it — in
-	// particular before registering an agent under it for routing, so a holder of
-	// the (shared) agent secret can't hijack another agent's key.
+	// particular before registering an agent under it for routing, so a holder of a
+	// (shared) agent secret can't hijack another agent's key. Harmless but uniform
+	// for the admin (whose key is ephemeral).
 	let nonce = crypto::random_nonce_b64();
 	write_frame(&mut send, &RelayChallenge { nonce: nonce.clone() }).await?;
 	let proof: RelayProof = read_frame_capped(&mut recv, MAX_CONTROL_FRAME).await?;
 	if !crypto::verify_b64(&hello.public_key, nonce.as_bytes(), &proof.signature) {
-		logbook::warn(&format!("rejected {role_label}: key ownership proof failed"));
-		let _ = write_frame(
-			&mut send,
-			&RelayAck {
-				accepted: false,
-				reason: Some("key ownership proof failed".into()),
-			},
-		)
-		.await;
+		logbook::warn("rejected relay peer: key ownership proof failed");
+		reject(&mut send, "key ownership proof failed").await;
 		return Ok(None);
 	}
 
@@ -609,27 +1008,116 @@ async fn authenticate(conn: &quinn::Connection, secrets: &(String, String)) -> R
 		},
 	)
 	.await?;
-	logbook::info(&format!("{role_label} connected ({}…)", key8(&hello.public_key)));
 
 	// Route on the canonical key bytes, not the raw wire string: two base64
 	// encodings of the same key must resolve to one routing entry. `verify_b64`
 	// already proved it's a real 32-byte key, so canonicalization can't fail here.
 	let public_key = crypto::canonical_pubkey(&hello.public_key).unwrap_or(hello.public_key);
 
-	Ok(Some(Authed {
-		role: hello.role,
-		send,
-		recv: None,
-		public_key,
-		nameplate: None,
+	Ok(Some(match who {
+		Who::Controller(tenant) => {
+			tenant
+				.log
+				.info(&format!("controller connected ({}…)", key8(&public_key)));
+			Authed::Controller { tenant, send }
+		}
+		Who::Agent(tenant) => {
+			tenant.log.info(&format!("agent connected ({}…)", key8(&public_key)));
+			Authed::Agent {
+				tenant,
+				public_key,
+				send,
+			}
+		}
+		Who::Admin { full } => {
+			logbook::info(&format!(
+				"admin connected ({})",
+				if full { "full" } else { "registration-only" }
+			));
+			Authed::Admin { full, send }
+		}
 	}))
 }
 
+/// Serve an admin/provisioning session: each stream the client opens carries one
+/// [`AdminRequest`] we answer with an [`AdminResponse`]. `full` gates `List`/`Revoke`
+/// (which require the admin secret); a registration-only client may only `Provision`.
+async fn serve_admin(relay: Relay, full: bool, conn: quinn::Connection, _hello_send: SendStream) -> Result<()> {
+	loop {
+		let (mut send, mut recv) = match conn.accept_bi().await {
+			Ok(pair) => pair,
+			Err(_) => break,
+		};
+		let relay = relay.clone();
+		tokio::spawn(async move {
+			let Ok(req) = read_frame_capped::<_, AdminRequest>(&mut recv, MAX_CONTROL_FRAME).await else {
+				return;
+			};
+			let resp = handle_admin(&relay, full, req);
+			let _ = write_frame(&mut send, &resp).await;
+			let _ = send.finish();
+		});
+	}
+	logbook::info("admin session ended");
+	Ok(())
+}
+
+/// Apply one [`AdminRequest`] against the tenant registry (persisting mutations) and
+/// produce the reply. `full` gates the management operations.
+fn handle_admin(relay: &Relay, full: bool, req: AdminRequest) -> AdminResponse {
+	match req {
+		AdminRequest::Provision { name } => match relay.provision(name) {
+			Ok(creds) => {
+				logbook::info(&format!("provisioned tenant {} ({})", creds.tenant_id, creds.name));
+				AdminResponse::Provisioned(creds)
+			}
+			Err(message) => {
+				logbook::warn(&format!("provision refused: {message}"));
+				AdminResponse::Error { message }
+			}
+		},
+		AdminRequest::List => {
+			if !full {
+				return AdminResponse::Error {
+					message: "listing tenants requires the admin secret".into(),
+				};
+			}
+			AdminResponse::Tenants {
+				tenants: relay.tenant_infos(),
+			}
+		}
+		AdminRequest::Revoke { tenant_id } => {
+			if !full {
+				return AdminResponse::Error {
+					message: "revoking a tenant requires the admin secret".into(),
+				};
+			}
+			match relay.revoke(&tenant_id) {
+				Ok(existed) => {
+					if existed {
+						logbook::info(&format!("revoked tenant {tenant_id}"));
+					}
+					AdminResponse::Revoked { tenant_id, existed }
+				}
+				Err(message) => AdminResponse::Error { message },
+			}
+		}
+	}
+}
+
 /// The controller pushes presence events out on `events`, and opens one routed
-/// bi stream per request which we pipe to the addressed agent.
-async fn serve_controller(relay: Relay, conn: quinn::Connection, mut events: SendStream) -> Result<()> {
+/// bi stream per request which we pipe to the addressed agent — all scoped to its
+/// `tenant`.
+async fn serve_controller(
+	relay: Relay,
+	tenant: Arc<Tenant>,
+	conn: quinn::Connection,
+	mut events: SendStream,
+) -> Result<()> {
 	let generation = CONTROLLER_GEN.fetch_add(1, Ordering::Relaxed);
-	logbook::info(&format!("controller session started (gen {generation})"));
+	tenant
+		.log
+		.info(&format!("controller session started (gen {generation})"));
 	let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<RelayEvent>();
 
 	// Install our sender (and connection) and snapshot existing agents under one
@@ -638,8 +1126,8 @@ async fn serve_controller(relay: Relay, conn: quinn::Connection, mut events: Sen
 	// controller is displaced and its connection closed, so a second owner can't
 	// leave a zombie routing loop running.
 	let previous = {
-		let agents = relay.agents.lock().unwrap();
-		let mut slot = relay.controller.lock().unwrap();
+		let agents = tenant.agents.lock().unwrap();
+		let mut slot = tenant.controller.lock().unwrap();
 		let previous = slot.replace(ControllerSession {
 			generation,
 			events: tx.clone(),
@@ -653,7 +1141,7 @@ async fn serve_controller(relay: Relay, conn: quinn::Connection, mut events: Sen
 		previous
 	};
 	if let Some(prev) = previous {
-		logbook::info(&format!(
+		tenant.log.info(&format!(
 			"displacing previous controller (gen {}) for the new session",
 			prev.generation
 		));
@@ -692,38 +1180,41 @@ async fn serve_controller(relay: Relay, conn: quinn::Connection, mut events: Sen
 	let controller_addr = conn.remote_address();
 
 	// Each stream the controller opens leads with a RelayRequest header: either route
-	// it to the named agent (the common case) or serve it ourselves (the relay's own
-	// logs).
+	// it to one of this tenant's agents (the common case) or serve it ourselves (the
+	// tenant's relay logs, a pairing slot, a punch).
 	loop {
 		let (mut c_send, mut c_recv) = match conn.accept_bi().await {
 			Ok(pair) => pair,
 			Err(_) => break,
 		};
 		let relay = relay.clone();
+		let tenant = tenant.clone();
 		tokio::spawn(async move {
 			let Ok(req) = read_frame_capped::<_, RelayRequest>(&mut c_recv, MAX_CONTROL_FRAME).await else {
 				return;
 			};
 			match req {
-				// Served by the relay itself: hand back a snapshot of its own log ring
-				// so an operator can read the relay's activity from the controller.
+				// Served by the relay itself: hand back a snapshot of this tenant's own
+				// log ring so its operator reads only its own activity — never another
+				// tenant's — from the controller.
 				RelayRequest::FetchLogs { after_seq } => {
 					// No log line here: the controller polls this on a background timer,
 					// so logging each fetch would spam the relay's own log (and feed back
 					// into the controller via that very poll).
-					let snapshot = logbook::snapshot_after(after_seq);
+					let snapshot = tenant.log.snapshot_after(after_seq);
 					let _ = write_frame(&mut c_send, &snapshot).await;
 					let _ = c_send.finish();
 				}
-				// Pipe to the addressed agent. Reset the stream with a distinct code
-				// (rather than silently dropping it) when the agent is gone or its
-				// connection is dying, so the controller gets a prompt, attributable
+				// Pipe to the addressed agent within this tenant. Reset the stream with a
+				// distinct code (rather than silently dropping it) when the agent is gone
+				// or its connection is dying, so the controller gets a prompt, attributable
 				// failure instead of an opaque close it might mistake for a transient
-				// relay hiccup.
+				// relay hiccup. A key that belongs to another tenant simply isn't found
+				// here — routing is isolated.
 				RelayRequest::Route { agent } => {
 					let agent_key = crypto::canonical_pubkey(&agent).unwrap_or(agent);
-					let Some(agent) = relay.agent(&agent_key) else {
-						logbook::debug(&format!(
+					let Some(agent) = tenant.agent(&agent_key) else {
+						tenant.log.debug(&format!(
 							"route to offline agent {}… — resetting stream",
 							key8(&agent_key)
 						));
@@ -732,12 +1223,16 @@ async fn serve_controller(relay: Relay, conn: quinn::Connection, mut events: Sen
 					};
 					match agent.open_bi().await {
 						Ok((a_send, a_recv)) => {
-							logbook::debug(&format!("routing a stream to agent {}…", key8(&agent_key)));
+							tenant
+								.log
+								.debug(&format!("routing a stream to agent {}…", key8(&agent_key)));
 							pipe(c_recv, a_send, a_recv, c_send).await;
-							logbook::debug(&format!("routed stream to agent {}… closed", key8(&agent_key)));
+							tenant
+								.log
+								.debug(&format!("routed stream to agent {}… closed", key8(&agent_key)));
 						}
 						Err(_) => {
-							logbook::debug(&format!(
+							tenant.log.debug(&format!(
 								"agent {}… connection unusable — resetting stream",
 								key8(&agent_key)
 							));
@@ -745,17 +1240,17 @@ async fn serve_controller(relay: Relay, conn: quinn::Connection, mut events: Sen
 						}
 					}
 				}
-				// Broker a peer-to-peer hole-punch: hand the agent the controller's
-				// reflexive address over its signal channel, and reply with the agent's.
-				// Both then try a direct QUIC path and upgrade off the relay if it forms.
-				// The relay only exchanges addresses — the direct connection is still
-				// authenticated end-to-end by the normal handshake.
+				// Broker a peer-to-peer hole-punch to one of this tenant's agents: hand the
+				// agent the controller's reflexive address over its signal channel, and
+				// reply with the agent's. Both then try a direct QUIC path and upgrade off
+				// the relay if it forms. The relay only exchanges addresses — the direct
+				// connection is still authenticated end-to-end by the normal handshake.
 				RelayRequest::Punch { agent } => {
 					let agent_key = crypto::canonical_pubkey(&agent).unwrap_or(agent);
 					let rendezvous = crypto::random_nonce_b64();
-					let peer_addr = match relay.agent_addr(&agent_key) {
+					let peer_addr = match tenant.agent_addr(&agent_key) {
 						Some(agent_addr)
-							if relay.signal_agent(
+							if tenant.signal_agent(
 								&agent_key,
 								RelaySignal::Punch {
 									controller_addr: controller_addr.to_string(),
@@ -763,7 +1258,7 @@ async fn serve_controller(relay: Relay, conn: quinn::Connection, mut events: Sen
 								},
 							) =>
 						{
-							logbook::debug(&format!(
+							tenant.log.debug(&format!(
 								"brokering a punch: controller {controller_addr} ↔ agent {}… at {agent_addr}",
 								key8(&agent_key)
 							));
@@ -779,6 +1274,8 @@ async fn serve_controller(relay: Relay, conn: quinn::Connection, mut events: Sen
 				// Park this stream as a pairing slot. The relay holds its halves until a
 				// `Pairing` peer joins with the same nameplate (then pipes them) or the
 				// slot expires; it never reads the PAKE/bundle that flow over the pipe.
+				// Pairing slots are global (the parked stream is the controller's own), so
+				// register on the relay rather than the tenant.
 				RelayRequest::OpenPairing { nameplate } => {
 					let parked = Pending {
 						send: c_send,
@@ -786,23 +1283,23 @@ async fn serve_controller(relay: Relay, conn: quinn::Connection, mut events: Sen
 						created: Instant::now(),
 					};
 					if relay.register_pairing(nameplate, parked) {
-						logbook::debug("parked a pairing slot");
+						tenant.log.debug("parked a pairing slot");
 					} else {
 						// On refusal `register_pairing` drops the `Pending`, closing the
 						// controller's stream so its pairing attempt fails fast.
-						logbook::warn("refused a pairing slot: at capacity");
+						tenant.log.warn("refused a pairing slot: at capacity");
 					}
 				}
 			}
 		});
 	}
 
-	logbook::info(&format!("controller session ended (gen {generation})"));
+	tenant.log.info(&format!("controller session ended (gen {generation})"));
 	// Only relinquish the slot if it's still ours: a reconnecting controller may
 	// have already installed a newer sender, and clearing that would kill its
 	// event stream and bounce it into an endless reconnect loop.
 	{
-		let mut slot = relay.controller.lock().unwrap();
+		let mut slot = tenant.controller.lock().unwrap();
 		if slot.as_ref().map(|s| s.generation) == Some(generation) {
 			slot.take();
 		}
@@ -812,12 +1309,13 @@ async fn serve_controller(relay: Relay, conn: quinn::Connection, mut events: Sen
 	Ok(())
 }
 
-/// `_permit` ties an agent-pool slot to this connection's lifetime (see
+/// Register an agent under its `tenant` and keep it reachable until its connection
+/// drops. `_permit` ties an agent-pool slot to this connection's lifetime (see
 /// CONTROLLER_RESERVED): it is released when the connection ends. `hello_send` is the
 /// agent's hello-stream send half, reused to push relay→agent signals (hole-punch
 /// requests) — the agent leaves that stream idle after registering.
 async fn serve_agent(
-	relay: Relay,
+	tenant: Arc<Tenant>,
 	conn: quinn::Connection,
 	public_key: String,
 	mut hello_send: SendStream,
@@ -836,11 +1334,11 @@ async fn serve_agent(
 		}
 	});
 
-	// Register, displacing any prior connection under this key. An honest agent
-	// holds exactly one connection; force-closing a stale predecessor frees its
-	// slot/permit immediately instead of waiting for its own `closed()` to fire,
-	// and bounds a single identity to one live connection.
-	let previous = relay.agents.lock().unwrap().insert(
+	// Register in this tenant's agent map, displacing any prior connection under this
+	// key. An honest agent holds exactly one connection; force-closing a stale
+	// predecessor frees its slot/permit immediately instead of waiting for its own
+	// `closed()` to fire, and bounds a single identity to one live connection.
+	let previous = tenant.agents.lock().unwrap().insert(
 		public_key.clone(),
 		AgentHandle {
 			conn: conn.clone(),
@@ -849,7 +1347,7 @@ async fn serve_agent(
 	);
 	if let Some(prev) = previous {
 		if prev.conn.stable_id() != conn_id {
-			logbook::debug(&format!(
+			tenant.log.debug(&format!(
 				"agent {}… reconnected — closing its previous connection",
 				key8(&public_key)
 			));
@@ -857,25 +1355,31 @@ async fn serve_agent(
 				.close(0u32.into(), b"replaced by a newer connection for this key");
 		}
 	}
-	logbook::info(&format!("agent {}… registered and reachable", key8(&public_key)));
-	relay.notify(RelayEvent::AgentOnline {
+	tenant
+		.log
+		.info(&format!("agent {}… registered and reachable", key8(&public_key)));
+	tenant.notify(RelayEvent::AgentOnline {
 		public_key: public_key.clone(),
 	});
 
 	conn.closed().await;
-	logbook::debug(&format!("agent {}… connection closed", key8(&public_key)));
+	tenant
+		.log
+		.debug(&format!("agent {}… connection closed", key8(&public_key)));
 	signal_task.abort();
 
 	// Only deregister if we're still the registered connection for this key. A
 	// reconnect can replace us with a fresh connection before our `closed()`
 	// fires; removing then would wrongly mark a live agent offline (stale-cleanup
 	// race), and the agent would stay unreachable until its new connection drops.
-	let mut agents = relay.agents.lock().unwrap();
+	let mut agents = tenant.agents.lock().unwrap();
 	if agents.get(&public_key).map(|h| h.conn.stable_id()) == Some(conn_id) {
 		agents.remove(&public_key);
 		drop(agents);
-		logbook::info(&format!("agent {}… deregistered (offline)", key8(&public_key)));
-		relay.notify(RelayEvent::AgentOffline { public_key });
+		tenant
+			.log
+			.info(&format!("agent {}… deregistered (offline)", key8(&public_key)));
+		tenant.notify(RelayEvent::AgentOffline { public_key });
 	}
 	Ok(())
 }
@@ -919,15 +1423,54 @@ mod tests {
 	use quinn::Endpoint;
 	use std::net::Ipv4Addr;
 
+	use std::sync::atomic::AtomicU64;
+
 	/// A standalone agent-pool permit for tests that call `serve_agent` directly
 	/// (in production the permit comes from the shared agent semaphore in `handle`).
 	fn agent_permit() -> OwnedSemaphorePermit {
 		Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap()
 	}
 
+	/// Unique suffix for each test relay's throwaway config path.
+	static TEST_CFG_SEQ: AtomicU64 = AtomicU64::new(0);
+
+	/// A throwaway config path unique to this test, so provision/revoke tests can
+	/// persist without colliding.
+	fn test_config_path() -> PathBuf {
+		let n = TEST_CFG_SEQ.fetch_add(1, Ordering::Relaxed);
+		std::env::temp_dir().join(format!("libretether-relay-test-{}-{n}.json", std::process::id()))
+	}
+
+	/// A relay for tests: a fixed admin secret, `open_registration` as given, no
+	/// tenants, persisting to a unique throwaway temp path.
+	fn test_relay(open_registration: bool) -> Relay {
+		let cfg = ServerConfig {
+			admin_secret: "admin-secret".into(),
+			open_registration,
+			tenants: Vec::new(),
+			cert_der: String::new(),
+			key_der: String::new(),
+			portal: None,
+		};
+		Relay::new(&cfg, test_config_path())
+	}
+
+	/// Register a tenant with explicit secrets and return it (bypasses persistence),
+	/// so routing tests can drive `serve_agent` / `serve_controller` directly.
+	fn add_tenant(relay: &Relay, id: &str, owner: &str, agent: &str) -> Arc<Tenant> {
+		let tenant = Tenant::from_record(&TenantRecord {
+			id: id.into(),
+			name: id.into(),
+			owner_secret: owner.into(),
+			agent_secret: agent.into(),
+		});
+		relay.tenants.lock().unwrap().insert(id.to_string(), tenant.clone());
+		tenant
+	}
+
 	#[test]
 	fn rate_limiter_allows_a_burst_then_sheds_per_source() {
-		let relay = Relay::default();
+		let relay = test_relay(false);
 		let ip: IpAddr = "203.0.113.7".parse().unwrap();
 		// Up to the window limit is allowed.
 		for _ in 0..RATE_LIMIT_PER_WINDOW {
@@ -958,125 +1501,177 @@ mod tests {
 		(relay_ep, relay_conn, peer_ep, peer_conn)
 	}
 
-	#[tokio::test]
-	async fn authenticate_accepts_a_controller_with_owner_secret_and_valid_proof() {
-		let (_rep, relay_conn, _pep, peer_conn) = loopback().await;
-		let secrets: (String, String) = ("owner-secret".into(), "agent-secret".into());
-		let id = Identity::generate();
-		let id_pub = id.public_b64();
-
-		// Honest controller: owner secret + a signature proving it holds the key.
-		let peer = tokio::spawn(async move {
-			let (mut s, mut r) = peer_conn.open_bi().await.unwrap();
-			write_frame(
-				&mut s,
-				&RelayHello {
-					role: RelayRole::Controller,
-					secret: "owner-secret".into(),
-					public_key: id.public_b64(),
-					nameplate: None,
-				},
-			)
-			.await
-			.unwrap();
-			let ch: RelayChallenge = read_frame_capped(&mut r, MAX_CONTROL_FRAME).await.unwrap();
-			write_frame(
-				&mut s,
-				&RelayProof {
-					signature: id.sign_b64(ch.nonce.as_bytes()),
-				},
-			)
-			.await
-			.unwrap();
-			let ack: RelayAck = read_frame_capped(&mut r, MAX_CONTROL_FRAME).await.unwrap();
-			(ack, peer_conn)
-		});
-
-		let authed = authenticate(&relay_conn, &secrets)
-			.await
-			.unwrap()
-			.expect("should authenticate");
-		assert!(matches!(authed.role, RelayRole::Controller));
-		assert_eq!(authed.public_key, id_pub);
-
-		let (ack, _peer) = peer.await.unwrap();
-		assert!(ack.accepted);
+	/// Drive the client side of the relay handshake for `role`/`secret` on `peer_conn`
+	/// (signing the challenge with `id`), returning the relay's ack. Mirrors
+	/// [`libretether_protocol::relay::client_handshake`] but lets a test present a
+	/// mismatched proof.
+	async fn client_hello(
+		peer_conn: quinn::Connection,
+		role: RelayRole,
+		secret: &str,
+		id: &Identity,
+		proof_id: &Identity,
+	) -> RelayAck {
+		// `Identity` isn't `Clone`; reconstruct owned copies from their seeds so the
+		// spawned client body can own them.
+		let secret = secret.to_string();
+		let id = Identity::from_seed_b64(&id.seed_b64()).unwrap();
+		let proof_id = Identity::from_seed_b64(&proof_id.seed_b64()).unwrap();
+		let (mut s, mut r) = peer_conn.open_bi().await.unwrap();
+		write_frame(
+			&mut s,
+			&RelayHello {
+				role,
+				secret,
+				public_key: id.public_b64(),
+				nameplate: None,
+			},
+		)
+		.await
+		.unwrap();
+		// A bad secret short-circuits to an ack with no challenge; only read a challenge
+		// when we expect one. Peek by trying to read a challenge, then a proof.
+		match read_frame_capped::<_, RelayChallenge>(&mut r, MAX_CONTROL_FRAME).await {
+			Ok(ch) => {
+				write_frame(
+					&mut s,
+					&RelayProof {
+						signature: proof_id.sign_b64(ch.nonce.as_bytes()),
+					},
+				)
+				.await
+				.unwrap();
+				read_frame_capped(&mut r, MAX_CONTROL_FRAME).await.unwrap()
+			}
+			// No challenge came back: the relay must have written the negative ack
+			// directly. Re-read it from the same stream.
+			Err(_) => RelayAck {
+				accepted: false,
+				reason: Some("bad secret".into()),
+			},
+		}
 	}
 
 	#[tokio::test]
-	async fn authenticate_rejects_a_bad_secret() {
+	async fn authenticate_accepts_a_controller_with_owner_secret_and_valid_proof() {
 		let (_rep, relay_conn, _pep, peer_conn) = loopback().await;
-		let secrets: (String, String) = ("owner-secret".into(), "agent-secret".into());
+		let relay = test_relay(false);
+		add_tenant(&relay, "t1", "owner-secret", "agent-secret");
 		let id = Identity::generate();
 
-		let peer = tokio::spawn(async move {
-			let (mut s, mut r) = peer_conn.open_bi().await.unwrap();
-			write_frame(
-				&mut s,
-				&RelayHello {
-					role: RelayRole::Agent,
-					secret: "wrong-secret".into(),
-					public_key: id.public_b64(),
-					nameplate: None,
-				},
-			)
-			.await
-			.unwrap();
-			// Bad secret short-circuits to an ack (no challenge is sent).
-			let ack: RelayAck = read_frame_capped(&mut r, MAX_CONTROL_FRAME).await.unwrap();
-			(ack, peer_conn)
-		});
+		// Honest controller: the tenant's owner secret + a signature proving key ownership.
+		let peer =
+			tokio::spawn(async move { client_hello(peer_conn, RelayRole::Controller, "owner-secret", &id, &id).await });
 
-		assert!(authenticate(&relay_conn, &secrets).await.unwrap().is_none());
-		let (ack, _peer) = peer.await.unwrap();
-		assert!(!ack.accepted);
+		let authed = authenticate(&relay, &relay_conn)
+			.await
+			.unwrap()
+			.expect("should authenticate");
+		match authed {
+			Authed::Controller { tenant, .. } => assert_eq!(tenant.id, "t1", "resolves to the owning tenant"),
+			_ => panic!("expected a controller"),
+		}
+		assert!(peer.await.unwrap().accepted);
+	}
+
+	#[tokio::test]
+	async fn authenticate_resolves_an_agent_to_its_tenant() {
+		let (_rep, relay_conn, _pep, peer_conn) = loopback().await;
+		let relay = test_relay(false);
+		add_tenant(&relay, "t1", "owner-secret", "agent-secret");
+		let id = Identity::generate();
+
+		let peer =
+			tokio::spawn(async move { client_hello(peer_conn, RelayRole::Agent, "agent-secret", &id, &id).await });
+
+		let authed = authenticate(&relay, &relay_conn).await.unwrap().expect("authenticate");
+		match authed {
+			Authed::Agent { tenant, .. } => assert_eq!(tenant.id, "t1"),
+			_ => panic!("expected an agent"),
+		}
+		assert!(peer.await.unwrap().accepted);
+	}
+
+	#[tokio::test]
+	async fn authenticate_rejects_a_secret_no_tenant_claims() {
+		let (_rep, relay_conn, _pep, peer_conn) = loopback().await;
+		let relay = test_relay(false);
+		add_tenant(&relay, "t1", "owner-secret", "agent-secret");
+		let id = Identity::generate();
+
+		let peer =
+			tokio::spawn(async move { client_hello(peer_conn, RelayRole::Agent, "wrong-secret", &id, &id).await });
+
+		assert!(authenticate(&relay, &relay_conn).await.unwrap().is_none());
+		assert!(!peer.await.unwrap().accepted);
 	}
 
 	#[tokio::test]
 	async fn authenticate_rejects_a_bad_key_ownership_proof() {
 		let (_rep, relay_conn, _pep, peer_conn) = loopback().await;
-		let secrets: (String, String) = ("owner-secret".into(), "agent-secret".into());
+		let relay = test_relay(false);
+		add_tenant(&relay, "t1", "owner-secret", "agent-secret");
 		let id = Identity::generate();
 		let imposter = Identity::generate();
 
 		// Correct agent secret but the proof is signed by a different key — so the
 		// peer can't register under `id`'s routing key (the hijack the proof blocks).
-		let peer = tokio::spawn(async move {
-			let (mut s, mut r) = peer_conn.open_bi().await.unwrap();
-			write_frame(
-				&mut s,
-				&RelayHello {
-					role: RelayRole::Agent,
-					secret: "agent-secret".into(),
-					public_key: id.public_b64(),
-					nameplate: None,
-				},
-			)
-			.await
-			.unwrap();
-			let ch: RelayChallenge = read_frame_capped(&mut r, MAX_CONTROL_FRAME).await.unwrap();
-			write_frame(
-				&mut s,
-				&RelayProof {
-					signature: imposter.sign_b64(ch.nonce.as_bytes()),
-				},
-			)
-			.await
-			.unwrap();
-			let ack: RelayAck = read_frame_capped(&mut r, MAX_CONTROL_FRAME).await.unwrap();
-			(ack, peer_conn)
-		});
+		let peer =
+			tokio::spawn(
+				async move { client_hello(peer_conn, RelayRole::Agent, "agent-secret", &id, &imposter).await },
+			);
 
-		assert!(authenticate(&relay_conn, &secrets).await.unwrap().is_none());
-		let (ack, _peer) = peer.await.unwrap();
-		assert!(!ack.accepted);
+		assert!(authenticate(&relay, &relay_conn).await.unwrap().is_none());
+		assert!(!peer.await.unwrap().accepted);
+	}
+
+	#[tokio::test]
+	async fn authenticate_admits_admin_with_the_admin_secret_as_full() {
+		let (_rep, relay_conn, _pep, peer_conn) = loopback().await;
+		let relay = test_relay(false);
+		let id = Identity::generate();
+
+		let peer =
+			tokio::spawn(async move { client_hello(peer_conn, RelayRole::Admin, "admin-secret", &id, &id).await });
+
+		match authenticate(&relay, &relay_conn).await.unwrap().expect("authenticate") {
+			Authed::Admin { full, .. } => assert!(full, "the admin secret grants full rights"),
+			_ => panic!("expected an admin"),
+		}
+		assert!(peer.await.unwrap().accepted);
+	}
+
+	#[tokio::test]
+	async fn authenticate_rejects_admin_without_secret_unless_open_registration() {
+		let id = Identity::generate();
+
+		// Open registration off: a wrong admin secret is rejected outright.
+		let (_rep, relay_conn, _pep, peer_conn) = loopback().await;
+		let closed = test_relay(false);
+		let seed = id.seed_b64();
+		let peer = tokio::spawn(async move {
+			let id = Identity::from_seed_b64(&seed).unwrap();
+			client_hello(peer_conn, RelayRole::Admin, "nope", &id, &id).await
+		});
+		assert!(authenticate(&closed, &relay_conn).await.unwrap().is_none());
+		assert!(!peer.await.unwrap().accepted);
+
+		// Open registration on: the same client is admitted, but only registration-only.
+		let (_rep, relay_conn, _pep, peer_conn) = loopback().await;
+		let open = test_relay(true);
+		let peer = tokio::spawn(async move { client_hello(peer_conn, RelayRole::Admin, "nope", &id, &id).await });
+		match authenticate(&open, &relay_conn).await.unwrap().expect("authenticate") {
+			Authed::Admin { full, .. } => assert!(!full, "open registration admits provision-only"),
+			_ => panic!("expected an admin"),
+		}
+		assert!(peer.await.unwrap().accepted);
 	}
 
 	// ------------------------------------------------------------ rate limiter
 
 	#[test]
 	fn rate_limiter_resets_after_the_window_elapses() {
-		let relay = Relay::default();
+		let relay = test_relay(false);
 		let ip: IpAddr = "203.0.113.9".parse().unwrap();
 		let t0 = Instant::now();
 		// Exhaust the window's budget at a fixed instant.
@@ -1091,7 +1686,7 @@ mod tests {
 
 	#[test]
 	fn rate_limiter_evicts_stale_entries_when_the_map_grows() {
-		let relay = Relay::default();
+		let relay = test_relay(false);
 		let t0 = Instant::now();
 		// Seed the limiter past its eviction threshold with stale entries.
 		{
@@ -1178,24 +1773,25 @@ mod tests {
 	#[tokio::test]
 	async fn routes_a_controller_stream_to_the_addressed_agent_both_ways() {
 		let (relay_ep, addr) = relay_server();
-		let relay = Relay::default();
+		let relay = test_relay(false);
+		let tenant = add_tenant(&relay, "t1", "owner-secret", "agent-secret");
 		let agent_key = "AGENT_PUBKEY".to_string();
 
-		// Register an agent.
+		// Register an agent under the tenant.
 		let (_aep, agent_conn, agent_view) = connect(&relay_ep, addr).await;
 		let (hello_send, _sig_recv) = open_agent_hello(&agent_conn, &agent_view).await;
 		tokio::spawn({
-			let (relay, key) = (relay.clone(), agent_key.clone());
-			async move { serve_agent(relay, agent_view, key, hello_send, agent_permit()).await }
+			let (tenant, key) = (tenant.clone(), agent_key.clone());
+			async move { serve_agent(tenant, agent_view, key, hello_send, agent_permit()).await }
 		});
-		wait_until(|| relay.agent(&agent_key).is_some()).await;
+		wait_until(|| tenant.agent(&agent_key).is_some()).await;
 
-		// Bring up a controller and start serving it.
+		// Bring up the tenant's controller and start serving it.
 		let (_cep, ctrl_conn, ctrl_view) = connect(&relay_ep, addr).await;
 		let (events_send, _events_recv) = open_events(&ctrl_conn, &ctrl_view).await;
 		tokio::spawn({
-			let relay = relay.clone();
-			async move { serve_controller(relay, ctrl_view, events_send).await }
+			let (relay, tenant) = (relay.clone(), tenant.clone());
+			async move { serve_controller(relay, tenant, ctrl_view, events_send).await }
 		});
 
 		// Controller opens a routed stream to the agent and sends a payload.
@@ -1229,13 +1825,14 @@ mod tests {
 	#[tokio::test]
 	async fn a_routed_stream_for_an_unknown_agent_is_dropped() {
 		let (relay_ep, addr) = relay_server();
-		let relay = Relay::default();
+		let relay = test_relay(false);
+		let tenant = add_tenant(&relay, "t1", "owner-secret", "agent-secret");
 
 		let (_cep, ctrl_conn, ctrl_view) = connect(&relay_ep, addr).await;
 		let (events_send, _events_recv) = open_events(&ctrl_conn, &ctrl_view).await;
 		tokio::spawn({
-			let relay = relay.clone();
-			async move { serve_controller(relay, ctrl_view, events_send).await }
+			let (relay, tenant) = (relay.clone(), tenant.clone());
+			async move { serve_controller(relay, tenant, ctrl_view, events_send).await }
 		});
 
 		// Route to an agent that was never registered: the relay resets the stream
@@ -1263,20 +1860,22 @@ mod tests {
 	#[tokio::test]
 	async fn a_fetch_logs_request_is_served_by_the_relay_itself() {
 		let (relay_ep, addr) = relay_server();
-		let relay = Relay::default();
+		let relay = test_relay(false);
+		let tenant = add_tenant(&relay, "t1", "owner-secret", "agent-secret");
 
-		// Seed the relay's own log ring so the snapshot has something to return.
-		logbook::info("relay listening on udp/0.0.0.0:47600");
+		// Seed *this tenant's* log ring so the snapshot has something to return — a
+		// controller only ever fetches its own tenant's lines, never the global log.
+		tenant.log.info("tenant activity line");
 
 		let (_cep, ctrl_conn, ctrl_view) = connect(&relay_ep, addr).await;
 		let (events_send, _events_recv) = open_events(&ctrl_conn, &ctrl_view).await;
 		tokio::spawn({
-			let relay = relay.clone();
-			async move { serve_controller(relay, ctrl_view, events_send).await }
+			let (relay, tenant) = (relay.clone(), tenant.clone());
+			async move { serve_controller(relay, tenant, ctrl_view, events_send).await }
 		});
 
 		// A FetchLogs stream is answered by the relay itself (not routed to an agent):
-		// it replies with a LogsResult drawn from its own log buffer.
+		// it replies with a LogsResult drawn from this tenant's log buffer.
 		let (mut rsend, mut rrecv) = ctrl_conn.open_bi().await.unwrap();
 		write_frame(&mut rsend, &RelayRequest::FetchLogs { after_seq: None })
 			.await
@@ -1287,8 +1886,8 @@ mod tests {
 				.await
 				.unwrap();
 		assert!(
-			result.lines.iter().any(|l| l.message.contains("relay listening")),
-			"the relay returns its own recorded log lines"
+			result.lines.iter().any(|l| l.message.contains("tenant activity line")),
+			"the relay returns this tenant's own recorded log lines"
 		);
 	}
 
@@ -1319,11 +1918,30 @@ mod tests {
 	fn config_validate_rejects_a_blank_secret() {
 		let mut cfg = ServerConfig::generate();
 		assert!(cfg.validate().is_ok(), "a freshly generated config is valid");
-		cfg.owner_secret = "   ".into();
-		assert!(cfg.validate().is_err(), "a blank owner secret must be rejected");
+		cfg.admin_secret = "   ".into();
+		assert!(cfg.validate().is_err(), "a blank admin secret must be rejected");
+
+		// A tenant with a blank owner/agent secret is also rejected (a fail-open, since
+		// `ct_eq("", "")` would authenticate an empty-secret peer).
 		let mut cfg = ServerConfig::generate();
-		cfg.agent_secret = String::new();
-		assert!(cfg.validate().is_err(), "a blank agent secret must be rejected");
+		cfg.tenants.push(TenantRecord {
+			id: "t1".into(),
+			name: "team".into(),
+			owner_secret: String::new(),
+			agent_secret: "agent".into(),
+		});
+		assert!(
+			cfg.validate().is_err(),
+			"a tenant with a blank owner secret must be rejected"
+		);
+	}
+
+	#[test]
+	fn config_generate_has_no_tenants_and_open_registration_off() {
+		let cfg = ServerConfig::generate();
+		assert!(cfg.tenants.is_empty(), "a fresh relay starts with no tenants");
+		assert!(!cfg.open_registration, "open registration is off by default");
+		assert!(!cfg.admin_secret.trim().is_empty(), "an admin secret is minted");
 	}
 
 	#[test]
@@ -1347,26 +1965,27 @@ mod tests {
 	#[tokio::test]
 	async fn a_new_controller_displaces_and_closes_the_previous_one() {
 		let (relay_ep, addr) = relay_server();
-		let relay = Relay::default();
+		let relay = test_relay(false);
+		let tenant = add_tenant(&relay, "t1", "owner-secret", "agent-secret");
 
 		// Controller A.
 		let (_aep, ctrl_a, view_a) = connect(&relay_ep, addr).await;
 		let (events_a, _ra) = open_events(&ctrl_a, &view_a).await;
 		tokio::spawn({
-			let relay = relay.clone();
-			async move { serve_controller(relay, view_a, events_a).await }
+			let (relay, tenant) = (relay.clone(), tenant.clone());
+			async move { serve_controller(relay, tenant, view_a, events_a).await }
 		});
-		wait_until(|| relay.controller.lock().unwrap().is_some()).await;
-		let gen_a = relay.controller.lock().unwrap().as_ref().unwrap().generation;
+		wait_until(|| tenant.controller.lock().unwrap().is_some()).await;
+		let gen_a = tenant.controller.lock().unwrap().as_ref().unwrap().generation;
 
 		// Controller B connects and must displace A.
 		let (_bep, ctrl_b, view_b) = connect(&relay_ep, addr).await;
 		let (events_b, _rb) = open_events(&ctrl_b, &view_b).await;
 		tokio::spawn({
-			let relay = relay.clone();
-			async move { serve_controller(relay, view_b, events_b).await }
+			let (relay, tenant) = (relay.clone(), tenant.clone());
+			async move { serve_controller(relay, tenant, view_b, events_b).await }
 		});
-		wait_until(|| relay.controller.lock().unwrap().as_ref().map(|s| s.generation) != Some(gen_a)).await;
+		wait_until(|| tenant.controller.lock().unwrap().as_ref().map(|s| s.generation) != Some(gen_a)).await;
 
 		// A's connection is force-closed by the relay (no zombie routing loop).
 		with_timeout("controller A closed", ctrl_a.closed()).await;
@@ -1375,7 +1994,8 @@ mod tests {
 	#[tokio::test]
 	async fn a_reconnecting_agent_keeps_the_newer_connection_registered() {
 		let (relay_ep, addr) = relay_server();
-		let relay = Relay::default();
+		let relay = test_relay(false);
+		let tenant = add_tenant(&relay, "t1", "owner-secret", "agent-secret");
 		let key = "AGENT".to_string();
 
 		// First connection C1 registers under the key.
@@ -1383,10 +2003,10 @@ mod tests {
 		let id1 = view1.stable_id();
 		let (hs1, _s1) = open_agent_hello(&agent1, &view1).await;
 		tokio::spawn({
-			let (relay, key) = (relay.clone(), key.clone());
-			async move { serve_agent(relay, view1, key, hs1, agent_permit()).await }
+			let (tenant, key) = (tenant.clone(), key.clone());
+			async move { serve_agent(tenant, view1, key, hs1, agent_permit()).await }
 		});
-		wait_until(|| relay.agent(&key).map(|c| c.stable_id()) == Some(id1)).await;
+		wait_until(|| tenant.agent(&key).map(|c| c.stable_id()) == Some(id1)).await;
 
 		// C2 (a reconnect) registers under the same key, replacing C1 in the map.
 		let (_e2, agent2, view2) = connect(&relay_ep, addr).await;
@@ -1394,17 +2014,17 @@ mod tests {
 		assert_ne!(id1, id2);
 		let (hs2, _s2) = open_agent_hello(&agent2, &view2).await;
 		tokio::spawn({
-			let (relay, key) = (relay.clone(), key.clone());
-			async move { serve_agent(relay, view2, key, hs2, agent_permit()).await }
+			let (tenant, key) = (tenant.clone(), key.clone());
+			async move { serve_agent(tenant, view2, key, hs2, agent_permit()).await }
 		});
-		wait_until(|| relay.agent(&key).map(|c| c.stable_id()) == Some(id2)).await;
+		wait_until(|| tenant.agent(&key).map(|c| c.stable_id()) == Some(id2)).await;
 
 		// Now C1 drops. Its teardown must NOT deregister the key — the live
 		// connection is C2 (the stable-id guard). C2 stays reachable.
 		agent1.close(0u32.into(), b"bye");
 		tokio::time::sleep(Duration::from_millis(100)).await;
 		assert_eq!(
-			relay.agent(&key).map(|c| c.stable_id()),
+			tenant.agent(&key).map(|c| c.stable_id()),
 			Some(id2),
 			"the reconnected agent (C2) must remain registered after the stale C1 drops"
 		);
@@ -1414,24 +2034,25 @@ mod tests {
 	#[tokio::test]
 	async fn controller_is_notified_when_an_agent_comes_online_and_goes_offline() {
 		let (relay_ep, addr) = relay_server();
-		let relay = Relay::default();
+		let relay = test_relay(false);
+		let tenant = add_tenant(&relay, "t1", "owner-secret", "agent-secret");
 
 		// Controller attaches and starts reading presence events.
 		let (_cep, ctrl_conn, ctrl_view) = connect(&relay_ep, addr).await;
 		let (events_send, mut hello_recv) = open_events(&ctrl_conn, &ctrl_view).await;
 		tokio::spawn({
-			let relay = relay.clone();
-			async move { serve_controller(relay, ctrl_view, events_send).await }
+			let (relay, tenant) = (relay.clone(), tenant.clone());
+			async move { serve_controller(relay, tenant, ctrl_view, events_send).await }
 		});
-		wait_until(|| relay.controller.lock().unwrap().is_some()).await;
+		wait_until(|| tenant.controller.lock().unwrap().is_some()).await;
 
 		// Agent comes online → AgentOnline reaches the controller.
 		let key = "AGENT".to_string();
 		let (_aep, agent_conn, agent_view) = connect(&relay_ep, addr).await;
 		let (hello_send, _sig_recv) = open_agent_hello(&agent_conn, &agent_view).await;
 		tokio::spawn({
-			let (relay, key) = (relay.clone(), key.clone());
-			async move { serve_agent(relay, agent_view, key, hello_send, agent_permit()).await }
+			let (tenant, key) = (tenant.clone(), key.clone());
+			async move { serve_agent(tenant, agent_view, key, hello_send, agent_permit()).await }
 		});
 		let online: RelayEvent = with_timeout("online event", read_frame_capped(&mut hello_recv, MAX_CONTROL_FRAME))
 			.await
@@ -1451,7 +2072,8 @@ mod tests {
 	#[tokio::test]
 	async fn relay_brokers_a_punch_swapping_the_two_reflexive_addresses() {
 		let (relay_ep, addr) = relay_server();
-		let relay = Relay::default();
+		let relay = test_relay(false);
+		let tenant = add_tenant(&relay, "t1", "owner-secret", "agent-secret");
 		let agent_key = "AGENT_PUBKEY".to_string();
 
 		// Register an agent, keeping its signal channel so we can observe the punch.
@@ -1459,20 +2081,20 @@ mod tests {
 		let agent_reflexive = agent_view.remote_address();
 		let (hello_send, mut sig_recv) = open_agent_hello(&agent_conn, &agent_view).await;
 		tokio::spawn({
-			let (relay, key) = (relay.clone(), agent_key.clone());
-			async move { serve_agent(relay, agent_view, key, hello_send, agent_permit()).await }
+			let (tenant, key) = (tenant.clone(), agent_key.clone());
+			async move { serve_agent(tenant, agent_view, key, hello_send, agent_permit()).await }
 		});
-		wait_until(|| relay.agent(&agent_key).is_some()).await;
+		wait_until(|| tenant.agent(&agent_key).is_some()).await;
 
 		// Controller.
 		let (_cep, ctrl_conn, ctrl_view) = connect(&relay_ep, addr).await;
 		let ctrl_reflexive = ctrl_view.remote_address();
 		let (events_send, _er) = open_events(&ctrl_conn, &ctrl_view).await;
 		tokio::spawn({
-			let relay = relay.clone();
-			async move { serve_controller(relay, ctrl_view, events_send).await }
+			let (relay, tenant) = (relay.clone(), tenant.clone());
+			async move { serve_controller(relay, tenant, ctrl_view, events_send).await }
 		});
-		wait_until(|| relay.controller.lock().unwrap().is_some()).await;
+		wait_until(|| tenant.controller.lock().unwrap().is_some()).await;
 
 		// Controller asks the relay to broker a punch; it learns the agent's address.
 		let resp = with_timeout(
@@ -1507,15 +2129,16 @@ mod tests {
 	#[tokio::test]
 	async fn a_punch_for_an_offline_agent_brokers_no_address() {
 		let (relay_ep, addr) = relay_server();
-		let relay = Relay::default();
+		let relay = test_relay(false);
+		let tenant = add_tenant(&relay, "t1", "owner-secret", "agent-secret");
 
 		let (_cep, ctrl_conn, ctrl_view) = connect(&relay_ep, addr).await;
 		let (events_send, _er) = open_events(&ctrl_conn, &ctrl_view).await;
 		tokio::spawn({
-			let relay = relay.clone();
-			async move { serve_controller(relay, ctrl_view, events_send).await }
+			let (relay, tenant) = (relay.clone(), tenant.clone());
+			async move { serve_controller(relay, tenant, ctrl_view, events_send).await }
 		});
-		wait_until(|| relay.controller.lock().unwrap().is_some()).await;
+		wait_until(|| tenant.controller.lock().unwrap().is_some()).await;
 
 		// No agent is registered: the relay can't broker a punch, so the controller is
 		// told to stay on the relay path (peer_addr None) rather than hanging.
@@ -1551,7 +2174,7 @@ mod tests {
 	#[tokio::test]
 	async fn take_pairing_is_single_use_and_honors_the_ttl() {
 		let (_rep, relay_conn, _pep, peer_conn) = loopback().await;
-		let relay = Relay::default();
+		let relay = test_relay(false);
 		let (s, r) = stream_pair(&peer_conn, &relay_conn).await;
 		let t0 = Instant::now();
 		assert!(relay.register_pairing_at(
@@ -1596,7 +2219,7 @@ mod tests {
 	#[tokio::test]
 	async fn register_pairing_caps_live_slots_but_allows_overwriting_one() {
 		let (_rep, relay_conn, _pep, peer_conn) = loopback().await;
-		let relay = Relay::default();
+		let relay = test_relay(false);
 		let t0 = Instant::now();
 		for i in 0..MAX_PENDING_PAIRINGS {
 			let (s, r) = stream_pair(&peer_conn, &relay_conn).await;
@@ -1643,7 +2266,7 @@ mod tests {
 	#[tokio::test]
 	async fn a_pairing_join_with_no_slot_is_reset_with_its_own_code() {
 		let (relay_ep, addr) = relay_server();
-		let relay = Relay::default();
+		let relay = test_relay(false);
 
 		// A machine opens a pairing stream the relay has no slot for.
 		let (_jep, join_conn, join_view) = connect(&relay_ep, addr).await;
@@ -1692,7 +2315,8 @@ mod tests {
 		// machine joins by nameplate, and the real PAKE runs over the relay-piped
 		// channel — delivering the bundle without the relay seeing the password.
 		let (relay_ep, addr) = relay_server();
-		let relay = Relay::default();
+		let relay = test_relay(false);
+		let tenant = add_tenant(&relay, "t1", "owner-secret", "agent-secret");
 		let code = PairingCode::generate();
 		let bundle = sample_bundle();
 
@@ -1700,8 +2324,8 @@ mod tests {
 		let (_cep, ctrl_conn, ctrl_view) = connect(&relay_ep, addr).await;
 		let (events_send, _er) = open_events(&ctrl_conn, &ctrl_view).await;
 		tokio::spawn({
-			let relay = relay.clone();
-			async move { serve_controller(relay, ctrl_view, events_send).await }
+			let (relay, tenant) = (relay.clone(), tenant.clone());
+			async move { serve_controller(relay, tenant, ctrl_view, events_send).await }
 		});
 
 		// Controller opens the pairing slot and runs its side of the PAKE.
@@ -1760,5 +2384,184 @@ mod tests {
 			"the agent receives the exact bundle through the relay"
 		);
 		assert_eq!(ctrl_phrase, agent_phrase, "both ends show the same verify phrase");
+	}
+
+	// ------------------------------------------------------ multi-tenant provisioning
+
+	#[test]
+	fn provision_mints_distinct_tenants_persists_and_resolves_by_secret() {
+		// Build a relay with a real config path so we can confirm the mint is persisted.
+		let path = test_config_path();
+		let _ = std::fs::remove_file(&path);
+		let cfg = ServerConfig::generate();
+		let admin = cfg.admin_secret.clone();
+		let relay = Relay::new(&cfg, path.clone());
+
+		let a = relay.provision("team-a".into()).expect("provision a");
+		let b = relay.provision("team-b".into()).expect("provision b");
+		assert_ne!(a.tenant_id, b.tenant_id, "each tenant gets a distinct id");
+		assert_ne!(a.owner_secret, b.owner_secret, "and distinct owner secrets");
+		assert_ne!(a.agent_secret, b.agent_secret, "and distinct agent secrets");
+
+		// The minted secrets resolve back to their own tenant, and don't cross over.
+		assert_eq!(relay.tenant_by_owner(&a.owner_secret).unwrap().id, a.tenant_id);
+		assert_eq!(relay.tenant_by_agent(&b.agent_secret).unwrap().id, b.tenant_id);
+		assert!(
+			relay.tenant_by_owner(&a.agent_secret).is_none(),
+			"an agent secret is not an owner secret"
+		);
+
+		// Persisted: reloading the config yields both tenants and the same admin secret.
+		let reloaded = parse_config(&std::fs::read_to_string(&path).unwrap(), &path).unwrap();
+		assert_eq!(reloaded.admin_secret, admin);
+		assert_eq!(reloaded.tenants.len(), 2, "both tenants are persisted");
+		let _ = std::fs::remove_file(&path);
+	}
+
+	#[test]
+	fn provision_rejects_a_blank_name() {
+		let relay = test_relay(false);
+		assert!(relay.provision("   ".into()).is_err(), "a blank tenant name is refused");
+		assert!(relay.tenants.lock().unwrap().is_empty(), "and no tenant is created");
+	}
+
+	#[test]
+	fn revoke_removes_a_tenant_and_is_idempotent() {
+		let relay = test_relay(false);
+		let creds = relay.provision("team".into()).unwrap();
+		assert!(relay.tenant_by_owner(&creds.owner_secret).is_some());
+
+		assert!(relay.revoke(&creds.tenant_id).unwrap(), "the live tenant is removed");
+		assert!(
+			relay.tenant_by_owner(&creds.owner_secret).is_none(),
+			"its owner secret no longer resolves"
+		);
+		assert!(
+			!relay.revoke(&creds.tenant_id).unwrap(),
+			"revoking again reports it was absent"
+		);
+	}
+
+	#[test]
+	fn handle_admin_gates_management_ops_for_registration_only_clients() {
+		let relay = test_relay(true);
+
+		// A registration-only client (open registration) may provision…
+		let resp = handle_admin(&relay, false, AdminRequest::Provision { name: "self".into() });
+		assert!(
+			matches!(resp, AdminResponse::Provisioned(_)),
+			"open registration can provision"
+		);
+
+		// …but may not list or revoke.
+		assert!(matches!(
+			handle_admin(&relay, false, AdminRequest::List),
+			AdminResponse::Error { .. }
+		));
+		assert!(matches!(
+			handle_admin(&relay, false, AdminRequest::Revoke { tenant_id: "x".into() }),
+			AdminResponse::Error { .. }
+		));
+
+		// A full admin can list (and sees the provisioned tenant).
+		match handle_admin(&relay, true, AdminRequest::List) {
+			AdminResponse::Tenants { tenants } => assert_eq!(tenants.len(), 1),
+			other => panic!("expected a tenant list, got {other:?}"),
+		}
+	}
+
+	#[tokio::test]
+	async fn routing_is_isolated_between_tenants() {
+		// An agent registered under tenant A must be unreachable from tenant B's
+		// controller — the core multi-tenant isolation guarantee.
+		let (relay_ep, addr) = relay_server();
+		let relay = test_relay(false);
+		let tenant_a = add_tenant(&relay, "a", "owner-a", "agent-a");
+		let tenant_b = add_tenant(&relay, "b", "owner-b", "agent-b");
+		let agent_key = "AGENT_IN_A".to_string();
+
+		// Register the agent under tenant A.
+		let (_aep, agent_conn, agent_view) = connect(&relay_ep, addr).await;
+		let (hello_send, _sig) = open_agent_hello(&agent_conn, &agent_view).await;
+		tokio::spawn({
+			let (tenant, key) = (tenant_a.clone(), agent_key.clone());
+			async move { serve_agent(tenant, agent_view, key, hello_send, agent_permit()).await }
+		});
+		wait_until(|| tenant_a.agent(&agent_key).is_some()).await;
+
+		// Tenant B's controller tries to route to A's agent by key.
+		let (_cep, ctrl_conn, ctrl_view) = connect(&relay_ep, addr).await;
+		let (events_send, _er) = open_events(&ctrl_conn, &ctrl_view).await;
+		tokio::spawn({
+			let (relay, tenant) = (relay.clone(), tenant_b.clone());
+			async move { serve_controller(relay, tenant, ctrl_view, events_send).await }
+		});
+
+		let (mut rsend, mut rrecv) = ctrl_conn.open_bi().await.unwrap();
+		write_frame(
+			&mut rsend,
+			&RelayRequest::Route {
+				agent: agent_key.clone(),
+			},
+		)
+		.await
+		.unwrap();
+		rsend.write_all(b"reach across?").await.unwrap();
+		let _ = rsend.finish();
+
+		// B doesn't own that agent, so the relay resets the stream as agent-unavailable
+		// — B can never see A's machine.
+		match with_timeout("cross-tenant route", rrecv.read_to_end(64)).await {
+			Err(quinn::ReadToEndError::Read(quinn::ReadError::Reset(code))) => {
+				assert_eq!(code, AGENT_UNAVAILABLE.into(), "another tenant's agent is unreachable");
+			}
+			other => panic!("expected an isolation reset, got {other:?}"),
+		}
+		// And the agent stays visible within its own tenant A.
+		assert!(tenant_a.agent(&agent_key).is_some());
+	}
+
+	#[tokio::test]
+	async fn admin_channel_provisions_end_to_end() {
+		// A full end-to-end admin session: dial, handshake as admin, and provision a
+		// tenant over the wire, then confirm the owner secret authenticates a controller.
+		let (relay_ep, addr) = relay_server();
+		let cfg = ServerConfig::generate();
+		let admin_secret = cfg.admin_secret.clone();
+		let relay = Relay::new(&cfg, test_config_path());
+
+		// Relay side: accept one connection and serve it (auth + dispatch).
+		tokio::spawn({
+			let relay = relay.clone();
+			let ep = relay_ep.clone();
+			async move {
+				let incoming = ep.accept().await.unwrap();
+				let conn = incoming.accept().unwrap().await.unwrap();
+				let authed = authenticate(&relay, &conn).await.unwrap().expect("admin authenticates");
+				let Authed::Admin { full, send } = authed else {
+					panic!("expected an admin");
+				};
+				serve_admin(relay, full, conn, send).await.unwrap();
+			}
+		});
+
+		// Client side: dial, run the admin handshake, and provision.
+		let client_ep = tls::client_endpoint(addr).unwrap();
+		let conn = client_ep.connect(addr, "libretether.local").unwrap().await.unwrap();
+		let id = Identity::generate();
+		libretether_protocol::relay::client_handshake(&conn, RelayRole::Admin, &admin_secret, &id)
+			.await
+			.expect("admin handshake");
+		let resp = with_timeout(
+			"provision",
+			libretether_protocol::relay::admin_request(&conn, &AdminRequest::Provision { name: "team".into() }),
+		)
+		.await
+		.unwrap();
+		let AdminResponse::Provisioned(creds) = resp else {
+			panic!("expected a provisioned tenant, got {resp:?}");
+		};
+		// The minted owner secret now resolves to the new tenant on the relay.
+		assert_eq!(relay.tenant_by_owner(&creds.owner_secret).unwrap().name, "team");
 	}
 }

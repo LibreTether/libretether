@@ -16,7 +16,9 @@ import type {
 	ScreenshotResult,
 	SessionConfig,
 	SessionMeta,
-	Settings
+	Settings,
+	TenantCredentials,
+	TenantInfo
 } from "./types"
 
 // The packaged app always runs inside Tauri (which defines `__TAURI_INTERNALS__`)
@@ -78,6 +80,18 @@ export const createController = (name: string, kind: ControllerKind) =>
 export const updateController = (id: string, name: string, kind: ControllerKind) =>
 	call<ControllerSummary>("update_controller", { id, kind, name })
 export const deleteController = (id: string) => call<void>("delete_controller", { id })
+
+// ---------------------------------------------------------------- relay tenants
+/** Provision a new tenant on a relay, minting its owner + agent secrets. Pass the
+ *  relay's admin secret (or "" for a relay with open registration). */
+export const provisionRelayTenant = (address: string, adminSecret: string, name: string) =>
+	call<TenantCredentials>("provision_relay_tenant", { address, adminSecret, name })
+/** List a relay's tenants (needs the admin secret). */
+export const listRelayTenants = (address: string, adminSecret: string) =>
+	call<TenantInfo[]>("list_relay_tenants", { address, adminSecret })
+/** Revoke a relay tenant by id (needs the admin secret). Resolves to whether it existed. */
+export const revokeRelayTenant = (address: string, adminSecret: string, tenantId: string) =>
+	call<boolean>("revoke_relay_tenant", { address, adminSecret, tenantId })
 export const selectController = (id: string) => call<ActiveInfo>("select_controller", { id })
 export const exitController = () => call<void>("exit_controller")
 export const activeController = () => call<ActiveInfo | null>("active_controller")

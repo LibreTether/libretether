@@ -45,7 +45,9 @@ the client to log in.
   every client dial *out* to it, so nothing on either side is exposed. The relay routes between
   them and carries the control plane, live session, and tunneled RDP/SSH. Sessions **upgrade to a
   direct peer-to-peer path** whenever a NAT hole-punch succeeds (see below), so the relay carries
-  only the hard-NAT minority. See [RELAY.md](RELAY.md).
+  only the hard-NAT minority. It's **multi-tenant** — one host serves many controllers, each a
+  separate tenant (its own owner/agent secrets, isolated routing), provisioned via the relay's
+  admin secret. See [RELAY.md](RELAY.md).
 
 ### Peer-to-peer NAT traversal
 
@@ -155,7 +157,7 @@ byte.
   controller's key is **required** at enrollment (`--controller-key` in the deploy command) —
   there is **no trust-on-first-use**; an agent without a pinned key must be re-enrolled.
 - **No trust in the network.** Because both directions are verified at the application layer, a
-  man-in-the-middle on a Direct-mode port-forward — or a party holding only the relay's owner
+  man-in-the-middle on a Direct-mode port-forward — or a party holding only a tenant's owner
   secret — cannot impersonate the controller and drive an agent. After the handshake the agent
   issues a per-connection **capability token** that every control/screen/tunnel stream must
   carry, so unauthenticated streams (e.g. injected through the relay) are rejected.
@@ -180,9 +182,12 @@ byte.
   burned. Both ends show a matching verify phrase as a final cross-check.
 - **Transport.** QUIC encrypts everything with TLS 1.3, and on a tailnet WireGuard sits underneath
   as well. Confidentiality no longer rests on the transport in relay mode — the end-to-end AEAD
-  above does that — so a **trusted relay host is no longer assumed for confidentiality**. The owner
-  secret is a single controller-slot credential, so treat it as sensitive for *availability* (a
-  holder can deny or disrupt service), but it grants no view into the session.
+  above does that — so a **trusted relay host is no longer assumed for confidentiality**. A relay is
+  multi-tenant: each tenant has its own owner secret (its controller slot) and agent secret (its
+  agents), with isolated routing, and provisioning a tenant is gated by the relay's admin secret.
+  A tenant's owner secret is a single controller-slot credential, so treat it as sensitive for
+  *availability* (a holder can deny or disrupt that tenant's service), but it grants no view into
+  the session.
 
 ### End-to-end record layer
 

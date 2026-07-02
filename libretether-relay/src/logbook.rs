@@ -1,12 +1,19 @@
-//! In-memory ring of the relay's own log lines.
+//! In-memory rings of the relay's own log lines.
 //!
 //! The relay runs headless on a public host, so its diagnostics normally only
 //! reach stderr (journald / `docker logs`). This keeps that stderr output *and*
-//! retains a bounded ring the connected controller can pull over the control
+//! retains bounded rings the connected controllers can pull over the control
 //! connection ([`libretether_protocol::relay::RelayRequest::FetchLogs`]), so an
 //! operator can read the relay's activity from the desktop app's Logs page without
 //! shelling into the relay host. Lines reuse the protocol's [`LogLine`] /
 //! [`LogsResult`] shape, so the controller normalises them exactly like agent logs.
+//!
+//! Because the relay is multi-tenant, logs are **scoped**: server-wide lines
+//! (startup, capacity shedding, the portal) go to the process-global [`Log`] via the
+//! free [`info`]/[`warn`]/[`debug`] functions, while per-connection lines that would
+//! reveal a tenant's agents go to that tenant's own [`Log`]. A tenant's controller
+//! only ever fetches its own tenant's ring, so one tenant never sees another's
+//! activity. Every line is still mirrored to stderr for the operator.
 
 use std::collections::VecDeque;
 use std::sync::{Mutex, OnceLock};
@@ -29,41 +36,85 @@ struct Ring {
 	next_seq: u64,
 }
 
-fn ring() -> &'static Mutex<Ring> {
-	static RING: OnceLock<Mutex<Ring>> = OnceLock::new();
-	RING.get_or_init(|| Mutex::new(Ring::default()))
+/// A bounded, fetchable log ring with a stderr `tag`. There is one process-global
+/// `Log` (untagged, for server-wide lines) and one per tenant (tagged with a short
+/// tenant label, so `docker logs` attributes each line, and fetchable only by that
+/// tenant's controller).
+pub struct Log {
+	ring: Mutex<Ring>,
+	tag: String,
 }
 
-/// Record a line at `level`: mirror it to stderr (so journald / `docker logs` still
-/// show it) and push it onto the ring the controller can fetch.
-pub fn record(level: LogLevel, message: &str) {
-	eprintln!("[libretether-relay] {message}");
-	let mut ring = ring().lock().unwrap();
-	if ring.lines.len() >= CAP {
-		ring.lines.pop_front();
-		ring.dropped = true;
+impl Log {
+	/// A fresh, empty log. `tag` is prefixed to stderr lines (e.g. a tenant label);
+	/// pass an empty string for the untagged server-wide log.
+	pub fn new(tag: impl Into<String>) -> Self {
+		Self {
+			ring: Mutex::new(Ring::default()),
+			tag: tag.into(),
+		}
 	}
-	ring.lines.push_back(LogLine {
-		ts_secs: now_secs(),
-		level,
-		message: message.to_string(),
-	});
-	ring.next_seq += 1;
+
+	/// Record a line at `level`: mirror it to stderr (so journald / `docker logs`
+	/// still show it) and push it onto the ring the controller can fetch.
+	pub fn record(&self, level: LogLevel, message: &str) {
+		if self.tag.is_empty() {
+			eprintln!("[libretether-relay] {message}");
+		} else {
+			eprintln!("[libretether-relay] [{}] {message}", self.tag);
+		}
+		let mut ring = self.ring.lock().unwrap();
+		if ring.lines.len() >= CAP {
+			ring.lines.pop_front();
+			ring.dropped = true;
+		}
+		ring.lines.push_back(LogLine {
+			ts_secs: now_secs(),
+			level,
+			message: message.to_string(),
+		});
+		ring.next_seq += 1;
+	}
+
+	pub fn info(&self, message: &str) {
+		self.record(LogLevel::Info, message);
+	}
+
+	pub fn warn(&self, message: &str) {
+		self.record(LogLevel::Warn, message);
+	}
+
+	/// Record a debug-level line: fine-grained per-connection/per-stream detail
+	/// (connection accepted, stream routed, peer rejected) that the controller's
+	/// Logs page can filter out. Reach for [`Log::info`] for higher-level milestones.
+	pub fn debug(&self, message: &str) {
+		self.record(LogLevel::Debug, message);
+	}
+
+	/// See [`Ring::snapshot_after`].
+	pub fn snapshot_after(&self, after_seq: Option<u64>) -> LogsResult {
+		self.ring.lock().unwrap().snapshot_after(after_seq)
+	}
+}
+
+/// The process-global, server-wide log. Server lifecycle and cross-tenant lines go
+/// here (and to stderr); it is never exposed over a tenant's control connection.
+fn global() -> &'static Log {
+	static GLOBAL: OnceLock<Log> = OnceLock::new();
+	GLOBAL.get_or_init(|| Log::new(""))
 }
 
 pub fn info(message: &str) {
-	record(LogLevel::Info, message);
+	global().info(message);
 }
 
 pub fn warn(message: &str) {
-	record(LogLevel::Warn, message);
+	global().warn(message);
 }
 
-/// Record a debug-level line: fine-grained per-connection/per-stream detail
-/// (connection accepted, stream routed, peer rejected) that the controller's
-/// Logs page can filter out. Reach for [`info`] for higher-level milestones.
+/// Record a server-wide debug line on the global log (see [`Log::debug`]).
 pub fn debug(message: &str) {
-	record(LogLevel::Debug, message);
+	global().debug(message);
 }
 
 impl Ring {
@@ -106,11 +157,6 @@ impl Ring {
 			next_seq: total,
 		}
 	}
-}
-
-/// See [`Ring::snapshot_after`]: snapshots the process-global relay log ring.
-pub fn snapshot_after(after_seq: Option<u64>) -> LogsResult {
-	ring().lock().unwrap().snapshot_after(after_seq)
 }
 
 #[cfg(test)]
